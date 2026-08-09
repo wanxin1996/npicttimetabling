@@ -67,6 +67,20 @@ export type CourseSectionRecord = {
   studentGroupCodes: string[];
 };
 
+export type ScheduledLessonRecord = {
+  id: string;
+  sectionId: string;
+  sectionLabel: string;
+  courseCode: string;
+  teacherName: string | null;
+  dayOfWeek: number;
+  startHour: number;
+  durationHours: number;
+  roomId: string | null;
+  roomCode: string | null;
+  warnings: string[];
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -158,6 +172,16 @@ function initializeTables(db: DatabaseInstance) {
       section_id TEXT NOT NULL REFERENCES course_sections(id) ON DELETE CASCADE,
       student_group_id TEXT NOT NULL REFERENCES student_groups(id) ON DELETE CASCADE,
       PRIMARY KEY (section_id, student_group_id)
+    );
+    CREATE TABLE IF NOT EXISTS scheduled_lessons (
+      id TEXT PRIMARY KEY,
+      section_id TEXT NOT NULL REFERENCES course_sections(id) ON DELETE CASCADE,
+      occurrence INTEGER NOT NULL DEFAULT 1,
+      day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
+      start_hour INTEGER NOT NULL CHECK (start_hour BETWEEN 8 AND 17),
+      duration_hours INTEGER NOT NULL CHECK (duration_hours BETWEEN 1 AND 4),
+      room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
+      UNIQUE(section_id, occurrence)
     );
   `);
 
@@ -349,6 +373,36 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
     return true;
   });
   return transaction();
+}
+
+export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
+  // The master timetable is filtered by the course's primary year, while each lesson
+  // still retains its cross-year student groups for conflict checks.
+  const rows = database().prepare(`
+    SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.name AS teacher_name,
+      lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id, rooms.code AS room_code
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    JOIN courses ON courses.id = sections.course_id
+    LEFT JOIN teachers ON teachers.id = sections.teacher_id
+    LEFT JOIN rooms ON rooms.id = lessons.room_id
+    WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: [] }));
+}
+
+export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
+  const db = database();
+  const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
+  if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
+  if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new Error("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
+  const conflicts: string[] = [];
+  const overlaps = db.prepare(`SELECT lessons.section_id, courses.code, teachers.id AS teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(input.dayOfWeek, input.startHour + section.duration_hours, input.startHour) as Array<{ section_id: string; code: string; teacher_id: string | null; room_id: string | null }>;
+  if (overlaps.some((row) => row.teacher_id && row.teacher_id === section.teacher_id)) conflicts.push("Teacher conflict");
+  if (input.roomId && overlaps.some((row) => row.room_id === input.roomId)) conflicts.push("Room conflict");
+  const id = crypto.randomUUID();
+  db.prepare("INSERT INTO scheduled_lessons (id, section_id, day_of_week, start_hour, duration_hours, room_id) VALUES (?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId);
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, courseCode: section.code, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, warnings: conflicts };
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {

@@ -1,9 +1,9 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, Fragment, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
-type View = "Teachers" | "Student groups" | "Rooms" | "Courses";
+type View = "Year timetables" | "Teachers" | "Student groups" | "Rooms" | "Courses";
 
 type Teacher = {
   id: string;
@@ -44,6 +44,7 @@ type Course = {
 };
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
+type ScheduledLesson = { id: string; sectionLabel: string; courseCode: string; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomCode: string | null; warnings: string[] };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -69,6 +70,8 @@ export default function Home() {
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
   const [sections, setSections] = useState<CourseSection[]>([]);
+  const [timetableYear, setTimetableYear] = useState(1);
+  const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -99,6 +102,16 @@ export default function Home() {
     setEditingCourse(null);
     setSelectedCourse(null);
     setSections([]);
+  }
+
+  async function openTimetable(year: number) {
+    // Load one year at a time because the department maintains three separate master tables.
+    const response = await fetch(`/api/schedule/lessons?year=${year}`);
+    if (!response.ok) return setNotice("The year timetable could not be loaded.");
+    setTimetableYear(year);
+    setLessons(await response.json());
+    setView("Year timetables");
+    setShowForm(false);
   }
 
   function toggleForm() {
@@ -306,7 +319,7 @@ export default function Home() {
         {/* Navigation reflects the future scheduling modules; only data management is active today. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
-          <button className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50" type="button">
+          <button onClick={() => void openTimetable(timetableYear)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Year timetables" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
             <span className="text-base">▦</span> Year timetables
           </button>
           <button onClick={() => openView("Courses")} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Courses" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
@@ -342,6 +355,8 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Student groups</p><p className="mt-1 text-2xl font-black">{groups.length}</p><p className="mt-1 text-xs text-slate-500">Across Years 1–3</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>
+
+          {view === "Year timetables" && <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-5 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-14 rounded-lg border border-dashed border-slate-200 p-1">{lesson && <div className="rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-bold">{lesson.sectionLabel}</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div>}
 
           <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}
