@@ -202,9 +202,18 @@ function database() {
   const db = new Database(databasePath);
   db.pragma("foreign_keys = ON");
   initializeTables(db);
-  seed(db);
+  // Demo records help local development, but a deployed empty database must start
+  // clean so real staff never see invented teachers, classes or rooms.
+  if (process.env.NODE_ENV !== "production") seed(db);
   globalForDatabase.timetableDatabase = db;
   return db;
+}
+
+export function databaseHealth() {
+  // A constant query verifies that the configured file can be opened and queried
+  // without exposing timetable counts, account details or the server file path.
+  const row = database().prepare("SELECT 1 AS healthy").get() as { healthy: number };
+  return row.healthy === 1;
 }
 
 function initializeTables(db: DatabaseInstance) {

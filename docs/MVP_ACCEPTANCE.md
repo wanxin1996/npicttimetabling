@@ -28,7 +28,7 @@
 ### 3.1 应用检查
 
 - `npm run lint` 通过。
-- `npm run build` 通过，全部页面和 28 个 API Route Handler 成功生成。
+- `npm run build` 通过，全部页面和 29 个 API Route Handler 成功生成。
 - `npx prisma validate` 通过。
 - 未登录访问受保护资料返回 HTTP 401。
 - 管理员设置、教师、学生班级、教室、课程、禁排、问题、规则、新周期、账号、Year 1–3 已排/未排、三类个人课表、课程班次、分配偏差和候选位置 API 均通过。
