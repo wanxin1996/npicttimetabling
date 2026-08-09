@@ -93,6 +93,22 @@ export type UnscheduledSectionRecord = {
 
 export type UnavailableWindowRecord = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 
+export type ScheduleIssueRecord = {
+  id: string;
+  lessonId: string;
+  sectionLabel: string;
+  primaryYear: number;
+  dayOfWeek: number;
+  startHour: number;
+  endHour: number;
+  teacherName: string | null;
+  roomCode: string | null;
+  studentGroups: string[];
+  category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload";
+  severity: "High" | "Warning" | "Advisory";
+  message: string;
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -590,6 +606,73 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     if (hasBackToBackBlockChange(existing, proposed)) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
   }
   return warnings;
+}
+
+function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | "severity"> {
+  // The summary labels help staff scan a long list without changing the underlying
+  // rule behaviour: every issue remains a warning and never blocks saving.
+  if (message.includes("not assigned")) return { category: "Assignment", severity: "High" };
+  if (message.includes("unavailable")) return { category: "Availability", severity: "High" };
+  if (message.includes("conflict")) return { category: "Conflict", severity: "High" };
+  if (message.includes("required") || message.includes("capacity too small")) return { category: "Room", severity: "High" };
+  if (message.includes("different blocks")) return { category: "Travel", severity: "Advisory" };
+  if (message.includes("discouraged")) return { category: "Preference", severity: "Advisory" };
+  if (message.includes("sections should not")) return { category: "Course rule", severity: "Warning" };
+  return { category: "Workload", severity: "Warning" };
+}
+
+export function listScheduleIssues(): ScheduleIssueRecord[] {
+  const db = database();
+  // Recalculate every saved lesson when the issue screen opens. This keeps the list
+  // current after restrictions or neighbouring lessons change, even when the lesson
+  // itself has not been opened in the editor again.
+  const rows = db.prepare(`
+    SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
+      lessons.duration_hours, lessons.room_id, sections.teacher_id, sections.sequence,
+      courses.code, courses.primary_year, teachers.name AS teacher_name,
+      rooms.code AS room_code,
+      (SELECT GROUP_CONCAT(groups.code, ', ')
+        FROM section_student_groups links
+        JOIN student_groups groups ON groups.id = links.student_group_id
+        WHERE links.section_id = sections.id) AS student_groups
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    JOIN courses ON courses.id = sections.course_id
+    LEFT JOIN teachers ON teachers.id = sections.teacher_id
+    LEFT JOIN rooms ON rooms.id = lessons.room_id
+    WHERE courses.primary_year IS NOT NULL
+    ORDER BY courses.primary_year, lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
+  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; teacher_id: string | null; sequence: number; code: string; primary_year: number; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
+
+  const issues: ScheduleIssueRecord[] = [];
+  const saveWarnings = db.prepare("UPDATE scheduled_lessons SET warnings_json = ? WHERE id = ?");
+  const refresh = db.transaction(() => {
+    for (const row of rows) {
+      const warnings = calculatePlacementWarnings(db, { sectionId: row.section_id, lessonId: row.id, teacherId: row.teacher_id, roomId: row.room_id, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours });
+      saveWarnings.run(JSON.stringify(warnings), row.id);
+
+      // Flatten one lesson with several warnings into independently filterable issue rows.
+      warnings.forEach((message, index) => {
+        const description = describeIssue(message);
+        issues.push({
+          id: `${row.id}:${index}`,
+          lessonId: row.id,
+          sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`,
+          primaryYear: row.primary_year,
+          dayOfWeek: row.day_of_week,
+          startHour: row.start_hour,
+          endHour: row.start_hour + row.duration_hours,
+          teacherName: row.teacher_name,
+          roomCode: row.room_code,
+          studentGroups: row.student_groups ? row.student_groups.split(", ") : [],
+          ...description,
+          message,
+        });
+      });
+    }
+  });
+  refresh();
+  return issues;
 }
 
 export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
