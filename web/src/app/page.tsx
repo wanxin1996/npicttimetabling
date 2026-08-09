@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-type View = "Teachers" | "Student groups" | "Rooms";
+type View = "Teachers" | "Student groups" | "Rooms" | "Courses";
 
 type Teacher = {
   id: string;
@@ -27,6 +27,14 @@ type Room = {
   status: "Active" | "Inactive";
 };
 
+type Course = {
+  id: string;
+  code: string;
+  catalog: string | null;
+  allocatedSections: number;
+  configuredSections: number;
+};
+
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   const tones = {
     slate: "bg-slate-100 text-slate-700",
@@ -45,6 +53,8 @@ export default function Home() {
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [groups, setGroups] = useState<StudentGroup[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -60,6 +70,10 @@ export default function Home() {
     () => rooms.filter((room) => `${room.code} ${room.features.join(" ")}`.toLowerCase().includes(query.toLowerCase())),
     [query, rooms],
   );
+  const filteredCourses = useMemo(
+    () => courses.filter((course) => `${course.code} ${course.catalog ?? ""}`.toLowerCase().includes(query.toLowerCase())),
+    [courses, query],
+  );
 
   function openView(nextView: View) {
     setView(nextView);
@@ -68,24 +82,26 @@ export default function Home() {
   }
 
   async function fetchData() {
-    const [teacherResponse, groupResponse, roomResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms")]);
-    if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok) throw new Error("Could not load data.");
-    return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>]);
+    const [teacherResponse, groupResponse, roomResponse, courseResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms"), fetch("/api/courses")]);
+    if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok || !courseResponse.ok) throw new Error("Could not load data.");
+    return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>, courseResponse.json() as Promise<Course[]>]);
   }
 
   async function loadData() {
-    const [nextTeachers, nextGroups, nextRooms] = await fetchData();
+    const [nextTeachers, nextGroups, nextRooms, nextCourses] = await fetchData();
     setTeachers(nextTeachers);
     setGroups(nextGroups);
     setRooms(nextRooms);
+    setCourses(nextCourses);
   }
 
   useEffect(() => {
     void fetchData()
-      .then(([nextTeachers, nextGroups, nextRooms]) => {
+      .then(([nextTeachers, nextGroups, nextRooms, nextCourses]) => {
         setTeachers(nextTeachers);
         setGroups(nextGroups);
         setRooms(nextRooms);
+        setCourses(nextCourses);
         setNotice("Local data is saved and ready for scheduling setup.");
       })
       .catch(() => setNotice("Unable to load the local scheduling database. Please refresh and try again."))
@@ -160,7 +176,26 @@ export default function Home() {
     }
   }
 
-  const actionLabel = view === "Student groups" ? "Add student group" : `Add ${view.slice(0, -1).toLowerCase()}`;
+  async function importTeachingMembers(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const file = formData.get("file");
+    if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.");
+    setImporting(true);
+    const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
+    const body = await response.json();
+    setImporting(false);
+    if (!response.ok) return setNotice(body.error ?? "Teaching allocation import failed.");
+    event.currentTarget.reset();
+    try {
+      await loadData();
+      setNotice(`Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${body.ignoredZeroRows} zero-allocation rows were ignored.`);
+    } catch {
+      setNotice("Import completed, but the latest data could not be loaded.");
+    }
+  }
+
+  const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import teaching allocation" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
   return (
     <main className="min-h-screen bg-[#f6f8fb] text-slate-900">
@@ -186,7 +221,7 @@ export default function Home() {
           <button className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50" type="button">
             <span className="text-base">▦</span> Year timetables
           </button>
-          <button className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50" type="button">
+          <button onClick={() => openView("Courses")} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Courses" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
             <span className="text-base">◫</span> Courses
           </button>
           <button className="flex w-full items-center gap-3 rounded-xl bg-blue-50 px-3 py-2.5 text-left text-sm font-bold text-blue-800" type="button">
@@ -215,20 +250,28 @@ export default function Home() {
           <div className="mb-6 grid gap-4 sm:grid-cols-3">
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Teachers</p><p className="mt-1 text-2xl font-black">{teachers.length}</p><p className="mt-1 text-xs text-amber-700">{teachers.filter((teacher) => teacher.staffType === "PT").length} PT priority teachers</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Student groups</p><p className="mt-1 text-2xl font-black">{groups.length}</p><p className="mt-1 text-xs text-slate-500">Across Years 1–3</p></div>
-            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Active rooms</p><p className="mt-1 text-2xl font-black">{rooms.filter((room) => room.status === "Active").length}</p><p className="mt-1 text-xs text-slate-500">Capacity & facilities tracked</p></div>
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
-                {(["Teachers", "Student groups", "Rooms"] as View[]).map((item) => (
+                {(["Teachers", "Student groups", "Rooms", "Courses"] as View[]).map((item) => (
                   <button key={item} onClick={() => openView(item)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${view === item ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`} type="button">{item}</button>
                 ))}
               </div>
               <label className="relative block sm:w-64"><span className="sr-only">Search data</span><input value={query} onChange={(event) => setQuery(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:bg-white" placeholder={`Search ${view.toLowerCase()}...`} /></label>
             </div>
 
-            {showForm && (
+            {showForm && view === "Courses" && (
+              <form onSubmit={importTeachingMembers} className="border-b border-blue-100 bg-blue-50/60 p-4">
+                <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
+                <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center"><input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" /><button disabled={importing} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">{importing ? "Importing..." : "Import allocation"}</button></div>
+              </form>
+            )}
+
+            {showForm && view !== "Courses" && (
               <form onSubmit={addRecord} className="border-b border-blue-100 bg-blue-50/60 p-4">
                 <p className="mb-3 text-sm font-bold text-blue-950">New {view.slice(0, -1)}</p>
                 {view === "Teachers" && <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]"><input name="name" required placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="staffType" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Save teacher</button></div>}
@@ -242,6 +285,7 @@ export default function Home() {
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
               {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
+              {!isLoading && view === "Courses" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Generated sections</th><th className="px-5 py-3 font-bold">Next setup</th></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><Pill tone="blue">{course.allocatedSections}</Pill></td><td className="px-5 py-4"><Pill tone="green">{course.configuredSections}</Pill></td><td className="px-5 py-4 text-slate-500">Set duration and room needs</td></tr>)}</tbody></table>}
             </div>
           </div>
 

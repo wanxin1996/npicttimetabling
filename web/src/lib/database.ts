@@ -25,6 +25,30 @@ export type RoomRecord = {
   status: "Active" | "Inactive";
 };
 
+export type CourseRecord = {
+  id: string;
+  code: string;
+  catalog: string | null;
+  allocatedSections: number;
+  configuredSections: number;
+};
+
+export type TeachingMembersImportRow = {
+  mod: string;
+  catalog: string | null;
+  lecturer: string;
+  staffType: "FT" | "PT";
+  groupCount: number;
+};
+
+export type TeachingMembersImportSummary = {
+  courses: number;
+  teachers: number;
+  allocations: number;
+  sections: number;
+  ignoredZeroRows: number;
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 const globalForDatabase = globalThis as unknown as {
@@ -32,12 +56,22 @@ const globalForDatabase = globalThis as unknown as {
 };
 
 function database() {
-  if (globalForDatabase.timetableDatabase) return globalForDatabase.timetableDatabase;
+  if (globalForDatabase.timetableDatabase) {
+    initializeTables(globalForDatabase.timetableDatabase);
+    return globalForDatabase.timetableDatabase;
+  }
 
   const dataDirectory = path.join(process.cwd(), "data");
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(path.join(dataDirectory, "timetabling.db"));
   db.pragma("foreign_keys = ON");
+  initializeTables(db);
+  seed(db);
+  globalForDatabase.timetableDatabase = db;
+  return db;
+}
+
+function initializeTables(db: DatabaseInstance) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS teachers (
       id TEXT PRIMARY KEY,
@@ -67,10 +101,34 @@ function database() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS courses (
+      id TEXT PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      catalog TEXT,
+      duration_hours INTEGER,
+      sessions_per_week INTEGER NOT NULL DEFAULT 1 CHECK (sessions_per_week > 0),
+      minimum_room_capacity INTEGER,
+      requires_lab INTEGER NOT NULL DEFAULT 0,
+      requires_multi_projector INTEGER NOT NULL DEFAULT 0,
+      requires_smart_classroom INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS teaching_allocations (
+      id TEXT PRIMARY KEY,
+      course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      teacher_id TEXT NOT NULL REFERENCES teachers(id) ON DELETE RESTRICT,
+      assigned_group_count INTEGER NOT NULL CHECK (assigned_group_count > 0),
+      UNIQUE(course_id, teacher_id)
+    );
+    CREATE TABLE IF NOT EXISTS course_sections (
+      id TEXT PRIMARY KEY,
+      course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      sequence INTEGER NOT NULL CHECK (sequence > 0),
+      teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
+      UNIQUE(course_id, sequence)
+    );
   `);
-  seed(db);
-  globalForDatabase.timetableDatabase = db;
-  return db;
 }
 
 function seed(db: DatabaseInstance) {
@@ -101,8 +159,15 @@ function activeStatus(isActive: number) {
 }
 
 export function listTeachers(): TeacherRecord[] {
-  const rows = database().prepare("SELECT id, name, staff_type, is_active FROM teachers ORDER BY staff_type DESC, name ASC").all() as Array<{ id: string; name: string; staff_type: "FT" | "PT"; is_active: number }>;
-  return rows.map((row) => ({ id: row.id, name: row.name, staffType: row.staff_type, status: activeStatus(row.is_active), sections: 0 }));
+  const rows = database().prepare(`
+    SELECT teachers.id, teachers.name, teachers.staff_type, teachers.is_active,
+      COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
+    FROM teachers
+    LEFT JOIN teaching_allocations ON teaching_allocations.teacher_id = teachers.id
+    GROUP BY teachers.id
+    ORDER BY teachers.staff_type DESC, teachers.name ASC
+  `).all() as Array<{ id: string; name: string; staff_type: "FT" | "PT"; is_active: number; sections: number }>;
+  return rows.map((row) => ({ id: row.id, name: row.name, staffType: row.staff_type, status: activeStatus(row.is_active), sections: row.sections }));
 }
 
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
@@ -149,4 +214,83 @@ export function createRoom(input: { code: string; capacity: number; hasLab: bool
 export function setRoomStatus(id: string, isActive: boolean) {
   const result = database().prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   return result.changes > 0;
+}
+
+export function listCourses(): CourseRecord[] {
+  const rows = database().prepare(`
+    SELECT courses.id, courses.code, courses.catalog,
+      (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
+      (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
+    FROM courses
+    ORDER BY courses.code ASC
+  `).all() as Array<{ id: string; code: string; catalog: string | null; configured_sections: number; allocated_sections: number }>;
+  return rows.map((row) => ({ id: row.id, code: row.code, catalog: row.catalog, allocatedSections: row.allocated_sections, configuredSections: row.configured_sections }));
+}
+
+export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
+  const db = database();
+  const teachers = new Map<string, { name: string; staffType: "FT" | "PT" }>();
+  const courses = new Map<string, { code: string; catalog: string | null }>();
+  const allocations = new Map<string, TeachingMembersImportRow>();
+
+  for (const row of rows) {
+    teachers.set(row.lecturer, { name: row.lecturer, staffType: row.staffType });
+    courses.set(row.mod, { code: row.mod, catalog: row.catalog });
+    const key = `${row.mod}\u0000${row.lecturer}`;
+    const existing = allocations.get(key);
+    allocations.set(key, existing ? { ...existing, groupCount: existing.groupCount + row.groupCount } : row);
+  }
+
+  const transaction = db.transaction(() => {
+    const findTeacher = db.prepare("SELECT id FROM teachers WHERE name = ?");
+    const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
+    const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const findCourse = db.prepare("SELECT id FROM courses WHERE code = ?");
+    const insertCourse = db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)");
+    const updateCourse = db.prepare("UPDATE courses SET catalog = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const courseIds = new Map<string, string>();
+    const teacherIds = new Map<string, string>();
+
+    for (const teacher of teachers.values()) {
+      const existing = findTeacher.get(teacher.name) as { id: string } | undefined;
+      const id = existing?.id ?? crypto.randomUUID();
+      if (existing) updateTeacher.run(teacher.staffType, id);
+      else insertTeacher.run(id, teacher.name, teacher.staffType);
+      teacherIds.set(teacher.name, id);
+    }
+    for (const course of courses.values()) {
+      const existing = findCourse.get(course.code) as { id: string } | undefined;
+      const id = existing?.id ?? crypto.randomUUID();
+      if (existing) updateCourse.run(course.catalog, id);
+      else insertCourse.run(id, course.code, course.catalog);
+      courseIds.set(course.code, id);
+    }
+
+    db.prepare("DELETE FROM course_sections").run();
+    db.prepare("DELETE FROM teaching_allocations").run();
+    const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
+    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, ?)");
+    const sequenceByCourse = new Map<string, number>();
+    for (const allocation of allocations.values()) {
+      const courseId = courseIds.get(allocation.mod);
+      const teacherId = teacherIds.get(allocation.lecturer);
+      if (!courseId || !teacherId) continue;
+      insertAllocation.run(crypto.randomUUID(), courseId, teacherId, allocation.groupCount);
+      let sequence = sequenceByCourse.get(allocation.mod) ?? 0;
+      for (let group = 0; group < allocation.groupCount; group += 1) {
+        sequence += 1;
+        insertSection.run(crypto.randomUUID(), courseId, sequence, teacherId);
+      }
+      sequenceByCourse.set(allocation.mod, sequence);
+    }
+  });
+  transaction();
+
+  return {
+    courses: courses.size,
+    teachers: teachers.size,
+    allocations: allocations.size,
+    sections: [...allocations.values()].reduce((total, allocation) => total + allocation.groupCount, 0),
+    ignoredZeroRows,
+  };
 }

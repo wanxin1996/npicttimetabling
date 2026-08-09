@@ -32,6 +32,8 @@
 - `GET`/`POST /api/teachers`、`PATCH /api/teachers/:id`
 - `GET`/`POST /api/student-groups`
 - `GET`/`POST /api/rooms`、`PATCH /api/rooms/:id`
+- `GET /api/courses`
+- `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；按正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
 本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建，并插入最小示例资料；后续真实资料会保留在该文件中。
 
