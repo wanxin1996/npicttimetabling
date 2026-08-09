@@ -3,7 +3,7 @@
 import { DragEvent, FormEvent, Fragment, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
-type View = "Year timetables" | "Teachers" | "Student groups" | "Rooms" | "Courses";
+type View = "Year timetables" | "Rules & issues" | "Teachers" | "Student groups" | "Rooms" | "Courses";
 
 type Teacher = {
   id: string;
@@ -46,6 +46,7 @@ type Course = {
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; warnings: string[] };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; durationHours: number; studentGroups: string[] };
+type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -75,6 +76,7 @@ export default function Home() {
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
+  const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -115,6 +117,15 @@ export default function Home() {
     setLessons(await lessonResponse.json());
     setUnscheduledSections(await unscheduledResponse.json());
     setView("Year timetables");
+    setShowForm(false);
+  }
+
+  async function openRules() {
+    // Rules are loaded on demand because staff visit this screen less often than the timetable.
+    const response = await fetch("/api/unavailability");
+    if (!response.ok) return setNotice("Unavailable-time rules could not be loaded.");
+    setUnavailableWindows(await response.json());
+    setView("Rules & issues");
     setShowForm(false);
   }
 
@@ -164,6 +175,26 @@ export default function Home() {
     setEditingLesson(null);
     await openTimetable(timetableYear);
     setNotice(`${label} returned to the unscheduled tray.`);
+  }
+
+  async function saveUnavailableWindow(event: FormEvent<HTMLFormElement>, kind: "Teacher" | "Year") {
+    // Teacher and year forms share one API while keeping their owner selectors easy to understand.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Unavailable time could not be saved.");
+    event.currentTarget.reset();
+    await openRules();
+    setNotice(`${kind} unavailable time saved.`);
+  }
+
+  async function removeUnavailableWindow(window: UnavailableWindow) {
+    // Deleting a window immediately changes future checks; existing lesson warnings refresh when edited.
+    const response = await fetch(`/api/unavailability?id=${window.id}&kind=${window.kind}`, { method: "DELETE" });
+    if (!response.ok) return setNotice("Unavailable time could not be removed.");
+    await openRules();
+    setNotice(`${window.ownerLabel} unavailable time removed.`);
   }
 
   function toggleForm() {
@@ -380,7 +411,7 @@ export default function Home() {
           <button className="flex w-full items-center gap-3 rounded-xl bg-blue-50 px-3 py-2.5 text-left text-sm font-bold text-blue-800" type="button">
             <span className="text-base">▤</span> Data management
           </button>
-          <button className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50" type="button">
+          <button onClick={() => void openRules()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Rules & issues" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
             <span className="text-base">◌</span> Rules & issues
           </button>
           <div className="my-3 border-t border-slate-100" />
@@ -392,11 +423,11 @@ export default function Home() {
           {/* Page title and the single action that applies to the selected data view. */}
           <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
-              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : "Data management"}</p>
-              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : "Build the scheduling foundation"}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
+              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Rules & issues" ? "Rules & issues" : "Data management"}</p>
+              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Rules & issues" ? "Maintain scheduling restrictions" : "Build the scheduling foundation"}</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Rules & issues" ? "Set teacher and year-level unavailable windows used by real-time warnings." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
-            {view !== "Year timetables" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
+            {view !== "Year timetables" && view !== "Rules & issues" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
             </button>}
           </div>
@@ -412,7 +443,9 @@ export default function Home() {
 
           {view === "Year timetables" && <div className="mb-6 grid gap-4 xl:grid-cols-[240px_1fr]"><aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-3"><p className="font-bold text-slate-950">Unscheduled sections</p><p className="text-xs text-slate-500">{unscheduledSections.length} ready to place</p></div><div className="grid max-h-[650px] gap-2 overflow-y-auto">{unscheduledSections.map((section) => <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className="cursor-grab rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950 active:cursor-grabbing"><p className="font-black">{section.label}</p><p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p><p className="mt-1 text-blue-700">{section.studentGroups.join(", ") || "Student group pending"}</p></div>)}{unscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No configured sections waiting for this year.</p>}</div></aside><div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-6 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">{lesson && <div draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className="cursor-pointer rounded-md bg-blue-50 p-2 text-blue-900 ring-blue-300 hover:ring-2"><p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div></div>}
 
-          {view !== "Year timetables" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          {view === "Rules & issues" && <div className="mb-6 grid gap-4 lg:grid-cols-2"><form onSubmit={(event) => saveUnavailableWindow(event, "Teacher")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Teacher unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: a PT teacher can only teach on selected days.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" required className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Choose teacher</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name}</option>)}</select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add teacher restriction</button></form><form onSubmit={(event) => saveUnavailableWindow(event, "Year")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Year unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: Year 1 has no classes on Wednesday.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add year restriction</button></form><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="border-b border-slate-200 p-4"><p className="font-black">Current unavailable windows</p></div>{unavailableWindows.length === 0 ? <p className="p-4 text-sm text-slate-500">No unavailable windows have been added.</p> : <div className="divide-y divide-slate-100">{unavailableWindows.map((window) => <div key={window.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><Pill tone={window.kind === "Teacher" ? "amber" : "blue"}>{window.kind}</Pill><span className="ml-3 font-bold">{window.ownerLabel}</span><span className="ml-3 text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][window.dayOfWeek - 1]} {window.startHour}:00–{window.endHour}:00</span></div><button onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700" type="button">Remove</button></div>)}</div>}</div></div>}
+
+          {view !== "Year timetables" && view !== "Rules & issues" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">

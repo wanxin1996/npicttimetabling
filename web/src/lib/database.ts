@@ -90,6 +90,8 @@ export type UnscheduledSectionRecord = {
   studentGroups: string[];
 };
 
+export type UnavailableWindowRecord = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -192,6 +194,20 @@ function initializeTables(db: DatabaseInstance) {
       room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
       warnings_json TEXT NOT NULL DEFAULT '[]',
       UNIQUE(section_id, occurrence)
+    );
+    CREATE TABLE IF NOT EXISTS teacher_unavailable_windows (
+      id TEXT PRIMARY KEY,
+      teacher_id TEXT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+      day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
+      start_hour INTEGER NOT NULL,
+      end_hour INTEGER NOT NULL CHECK (end_hour > start_hour)
+    );
+    CREATE TABLE IF NOT EXISTS year_blocked_windows (
+      id TEXT PRIMARY KEY,
+      year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
+      day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
+      start_hour INTEGER NOT NULL,
+      end_hour INTEGER NOT NULL CHECK (end_hour > start_hour)
     );
   `);
 
@@ -302,6 +318,27 @@ export function createRoom(input: { code: string; capacity: number; hasLab: bool
 export function setRoomStatus(id: string, isActive: boolean) {
   const result = database().prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   return result.changes > 0;
+}
+
+export function listUnavailableWindows(): UnavailableWindowRecord[] {
+  // Combine teacher and year restrictions into one UI list while retaining their kind.
+  const teachers = database().prepare(`SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label, windows.day_of_week, windows.start_hour, windows.end_hour FROM teacher_unavailable_windows windows JOIN teachers ON teachers.id = windows.teacher_id ORDER BY teachers.name, windows.day_of_week, windows.start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
+  const years = database().prepare(`SELECT id, CAST(year AS TEXT) AS owner_id, 'Year ' || year AS owner_label, day_of_week, start_hour, end_hour FROM year_blocked_windows ORDER BY year, day_of_week, start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
+  return [...teachers.map((row) => ({ id: row.id, kind: "Teacher" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour })), ...years.map((row) => ({ id: row.id, kind: "Year" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour }))];
+}
+
+export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; ownerId: string; dayOfWeek: number; startHour: number; endHour: number }) {
+  // Restrictions use half-open time ranges [start, end), matching lesson overlap logic.
+  const id = crypto.randomUUID();
+  if (input.kind === "Teacher") database().prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
+  else database().prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+  return id;
+}
+
+export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
+  // The kind selects the exact table, preventing a coincidental id match elsewhere.
+  const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
+  return database().prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
 }
 
 export function listCourses(): CourseRecord[] {
@@ -474,7 +511,11 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
 
   // Missing assignments are allowed during drafting, but remain visible as warnings.
   if (!input.teacherId) warnings.push("Teacher not assigned");
-  else if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
+  else {
+    if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
+    const unavailable = db.prepare("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?").get(input.teacherId, input.dayOfWeek, endHour, input.startHour);
+    if (unavailable) warnings.push("Teacher is unavailable at this time");
+  }
   if (!input.roomId) warnings.push("Room not assigned");
   else if (overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
 
@@ -491,6 +532,11 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   if (groupConflicts.length) warnings.push(`Student group conflict (${groupConflicts.map((group) => group.code).join(", ")})`);
   const groupCount = db.prepare("SELECT COUNT(*) AS count FROM section_student_groups WHERE section_id = ?").get(input.sectionId) as { count: number };
   if (groupCount.count === 0) warnings.push("Student group not assigned");
+  const affectedYears = db.prepare(`SELECT DISTINCT year FROM student_groups JOIN section_student_groups ON section_student_groups.student_group_id = student_groups.id WHERE section_student_groups.section_id = ? UNION SELECT primary_year AS year FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ? AND primary_year IS NOT NULL`).all(input.sectionId, input.sectionId) as Array<{ year: number }>;
+  for (const affected of affectedYears) {
+    const blocked = db.prepare("SELECT 1 FROM year_blocked_windows WHERE year = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?").get(affected.year, input.dayOfWeek, endHour, input.startHour);
+    if (blocked) warnings.push(`Year ${affected.year} is unavailable at this time`);
+  }
 
   // A selected room must satisfy every course requirement; Smart Classroom already
   // implies Multi Projector when room master data is saved.
