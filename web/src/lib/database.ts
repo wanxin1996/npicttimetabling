@@ -182,10 +182,13 @@ function database() {
     return globalForDatabase.timetableDatabase;
   }
 
-  // Store development data inside the project, rather than in a temporary folder.
-  const dataDirectory = path.join(process.cwd(), "data");
+  // Store normal development data inside the project. A dedicated path may be
+  // supplied for isolated regression runs so tests never touch the real timetable.
+  const configuredPath = process.env.TIMETABLING_DATABASE_PATH?.trim();
+  const databasePath = configuredPath || path.join(process.cwd(), "data", "timetabling.db");
+  const dataDirectory = path.dirname(databasePath);
   mkdirSync(dataDirectory, { recursive: true });
-  const db = new Database(path.join(dataDirectory, "timetabling.db"));
+  const db = new Database(databasePath);
   db.pragma("foreign_keys = ON");
   initializeTables(db);
   seed(db);
@@ -1302,7 +1305,12 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   const allocations = new Map<string, TeachingMembersImportRow>();
 
   for (const row of rows) {
+    // Every valid workbook row contributes to the teacher master list, including a
+    // teacher whose current allocation values are all zero.
     teachers.set(row.lecturer, { name: row.lecturer, staffType: row.staffType });
+    // A confirmed zero means this teacher does not teach the module: do not create
+    // the course-teacher allocation, the course, or an unscheduled section from it.
+    if (row.groupCount === 0) continue;
     courses.set(row.mod, { code: row.mod, catalog: row.catalog });
     // The null separator cannot occur in normal course codes or names, so it makes
     // a safe composite key for repeated rows of the same allocation.

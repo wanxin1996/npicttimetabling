@@ -52,20 +52,20 @@ export async function POST(request: Request) {
       const type = staffType(source["Staff Type"]);
       // Empty trailing rows are normal in exported Excel files.
       if (!mod && !lecturer && !groupCount) return;
-      if (groupCount === 0) {
-        // The user confirmed that 0 means no allocation, not one unassigned section.
-        ignoredZeroRows += 1;
-        return;
-      }
+      // Zero is a valid allocation value, but its teacher details must still be
+      // complete because the workbook is also the agreed teacher-list source.
       if (!mod || !lecturer || !type || !Number.isInteger(groupCount) || groupCount < 0) {
-        errors.push(`Row ${index + 2}: Mod, Lecturer, Staff Type and a positive whole group count are required.`);
+        errors.push(`Row ${index + 2}: Mod, Lecturer, Staff Type and a non-negative whole group count are required.`);
         return;
       }
+      // Retain a zero row for teacher maintenance; the database importer will skip
+      // its course allocation and section generation later.
+      if (groupCount === 0) ignoredZeroRows += 1;
       rows.push({ mod, catalog: text(source.Catalog) || null, lecturer, staffType: type, groupCount });
     });
     // Show a short, actionable sample of validation errors instead of overwhelming staff.
     if (errors.length) return NextResponse.json({ error: errors.slice(0, 3).join(" ") }, { status: 400 });
-    if (!rows.length) return NextResponse.json({ error: "No positive teaching allocations were found in this file." }, { status: 400 });
+    if (!rows.some((row) => row.groupCount > 0)) return NextResponse.json({ error: "No positive teaching allocations were found in this file." }, { status: 400 });
 
     return NextResponse.json(importTeachingMembers(rows, ignoredZeroRows));
   } catch (error) {

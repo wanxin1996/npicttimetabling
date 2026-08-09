@@ -41,7 +41,7 @@
 - `GET`/`POST`/`DELETE /api/unavailability`：维护教师个人和 Year 1–3 的不可上课时段。
 
 排课写入与编辑共用同一警告引擎，当前检查教师／教室／学生班级重叠、资料缺失、教室容量和设施、08:00 开课、午餐时段、连续课时、每日总时数以及跨 Block 连堂。警告会保存到排课记录，且不会阻止用户保存或导出。
-- `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；按正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
+- `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；所有有效行维护教师清单，只有正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
 本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建，并插入最小示例资料；后续真实资料会保留在该文件中。
 
