@@ -43,6 +43,8 @@ type Course = {
   configuredSections: number;
 };
 
+type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
+
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
   const tones = {
@@ -65,6 +67,8 @@ export default function Home() {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [courses, setCourses] = useState<Course[]>([]);
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
+  const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
+  const [sections, setSections] = useState<CourseSection[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -93,6 +97,8 @@ export default function Home() {
     setQuery("");
     setShowForm(false);
     setEditingCourse(null);
+    setSelectedCourse(null);
+    setSections([]);
   }
 
   function toggleForm() {
@@ -253,6 +259,27 @@ export default function Home() {
     setNotice(`${editingCourse.code} setup saved. Its generated sections will use these requirements.`);
   }
 
+  async function openSections(course: Course) {
+    // Fetch sections only when requested so the page stays quick with a full department import.
+    const response = await fetch(`/api/courses/${course.id}/sections`);
+    if (!response.ok) return setNotice("Course sections could not be loaded.");
+    setSections(await response.json());
+    setSelectedCourse(course);
+    setShowForm(false);
+    setEditingCourse(null);
+  }
+
+  async function saveSection(event: FormEvent<HTMLFormElement>, section: CourseSection) {
+    // The checked group list becomes the section's future student-conflict scope.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const response = await fetch(`/api/course-sections/${section.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teacherId: String(data.get("teacherId") ?? "") || null, studentGroupIds: data.getAll("studentGroupIds").map(String) }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Section could not be saved.");
+    if (selectedCourse) await openSections(selectedCourse);
+    setNotice(`${section.label} assignment saved.`);
+  }
+
   // The primary button stays contextual so staff do not need to learn separate screens.
   const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import teaching allocation" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
@@ -362,8 +389,13 @@ export default function Home() {
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
               {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
-              {!isLoading && view === "Courses" && <table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Sections</th><th className="px-5 py-3 font-bold">Setup</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><Pill tone="blue">{course.configuredSections}</Pill></td><td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"}` : "Not configured"}</td><td className="px-5 py-4 text-right"><button onClick={() => { setEditingCourse(course); setShowForm(true); }} className="font-semibold text-blue-700 hover:text-blue-900" type="button">Configure</button></td></tr>)}</tbody></table>}
+              {!isLoading && view === "Courses" && <table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Sections</th><th className="px-5 py-3 font-bold">Setup</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><Pill tone="blue">{course.configuredSections}</Pill></td><td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"}` : "Not configured"}</td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Sections</button><button onClick={() => { setEditingCourse(course); setShowForm(true); }} className="font-semibold text-blue-700 hover:text-blue-900" type="button">Configure</button></div></td></tr>)}</tbody></table>}
             </div>
+
+            {selectedCourse && (
+              /* Section assignment is separate from course setup because each class can differ. */
+              <div className="border-t border-slate-200 bg-slate-50 p-4"><div className="mb-3 flex items-center justify-between"><div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div><button onClick={() => { setSelectedCourse(null); setSections([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button></div><div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div></div>
+            )}
           </div>
 
           <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">System status:</span> {notice}</p>

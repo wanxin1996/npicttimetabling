@@ -58,6 +58,15 @@ export type TeachingMembersImportSummary = {
   ignoredZeroRows: number;
 };
 
+export type CourseSectionRecord = {
+  id: string;
+  label: string;
+  teacherId: string | null;
+  teacherName: string | null;
+  studentGroupIds: string[];
+  studentGroupCodes: string[];
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -144,6 +153,11 @@ function initializeTables(db: DatabaseInstance) {
       sequence INTEGER NOT NULL CHECK (sequence > 0),
       teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
       UNIQUE(course_id, sequence)
+    );
+    CREATE TABLE IF NOT EXISTS section_student_groups (
+      section_id TEXT NOT NULL REFERENCES course_sections(id) ON DELETE CASCADE,
+      student_group_id TEXT NOT NULL REFERENCES student_groups(id) ON DELETE CASCADE,
+      PRIMARY KEY (section_id, student_group_id)
     );
   `);
 
@@ -289,6 +303,52 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
       requires_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
   `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, id);
   return result.changes > 0;
+}
+
+export function listCourseSections(courseId: string): CourseSectionRecord[] {
+  // Aggregate student groups into one row per section so the browser can show its
+  // complete conflict scope beside the teacher assignment.
+  const rows = database().prepare(`
+    SELECT course_sections.id, courses.code, course_sections.sequence, teachers.id AS teacher_id,
+      teachers.name AS teacher_name, student_groups.id AS group_id, student_groups.code AS group_code
+    FROM course_sections
+    JOIN courses ON courses.id = course_sections.course_id
+    LEFT JOIN teachers ON teachers.id = course_sections.teacher_id
+    LEFT JOIN section_student_groups ON section_student_groups.section_id = course_sections.id
+    LEFT JOIN student_groups ON student_groups.id = section_student_groups.student_group_id
+    WHERE course_sections.course_id = ?
+    ORDER BY course_sections.sequence ASC, student_groups.code ASC
+  `).all(courseId) as Array<{ id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; group_id: string | null; group_code: string | null }>;
+  const sections = new Map<string, CourseSectionRecord>();
+  for (const row of rows) {
+    const section = sections.get(row.id) ?? { id: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}`, teacherId: row.teacher_id, teacherName: row.teacher_name, studentGroupIds: [], studentGroupCodes: [] };
+    if (row.group_id && row.group_code) {
+      section.studentGroupIds.push(row.group_id);
+      section.studentGroupCodes.push(row.group_code);
+    }
+    sections.set(row.id, section);
+  }
+  return [...sections.values()];
+}
+
+export function updateCourseSection(id: string, teacherId: string | null, studentGroupIds: string[]) {
+  const db = database();
+  // Replacing the join records in one transaction makes an edited cross-level class
+  // immediately consistent for future conflict checks.
+  const transaction = db.transaction(() => {
+    const section = db.prepare("SELECT id FROM course_sections WHERE id = ?").get(id) as { id: string } | undefined;
+    if (!section) return false;
+    if (teacherId) {
+      const teacher = db.prepare("SELECT id FROM teachers WHERE id = ? AND is_active = 1").get(teacherId);
+      if (!teacher) throw new Error("Teacher not found");
+    }
+    db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(teacherId, id);
+    db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(id);
+    const addGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
+    for (const groupId of [...new Set(studentGroupIds)]) addGroup.run(id, groupId);
+    return true;
+  });
+  return transaction();
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
