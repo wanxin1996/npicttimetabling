@@ -430,15 +430,55 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   return [...sections.values()];
 }
 
+function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: string; lessonId?: string; teacherId: string | null; roomId: string | null; dayOfWeek: number; startHour: number; durationHours: number }) {
+  // Every placement path uses this single warning engine, ensuring drag, edit and
+  // future candidate suggestions all apply the same conflict definitions.
+  const warnings: string[] = [];
+  const lessonId = input.lessonId ?? "";
+  const endHour = input.startHour + input.durationHours;
+  const overlaps = db.prepare(`SELECT lessons.id, sections.teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(lessonId, input.dayOfWeek, endHour, input.startHour) as Array<{ id: string; teacher_id: string | null; room_id: string | null }>;
+
+  // Missing assignments are allowed during drafting, but remain visible as warnings.
+  if (!input.teacherId) warnings.push("Teacher not assigned");
+  else if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
+  if (!input.roomId) warnings.push("Room not assigned");
+  else if (overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
+
+  // Match shared student-group ids across overlapping sections, including cross-level classes.
+  const groupConflicts = db.prepare(`
+    SELECT DISTINCT groups.code FROM scheduled_lessons lessons
+    JOIN section_student_groups occupied ON occupied.section_id = lessons.section_id
+    JOIN section_student_groups proposed ON proposed.student_group_id = occupied.student_group_id
+    JOIN student_groups groups ON groups.id = occupied.student_group_id
+    WHERE proposed.section_id = ? AND lessons.id <> ? AND lessons.day_of_week = ?
+      AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?
+    ORDER BY groups.code
+  `).all(input.sectionId, lessonId, input.dayOfWeek, endHour, input.startHour) as Array<{ code: string }>;
+  if (groupConflicts.length) warnings.push(`Student group conflict (${groupConflicts.map((group) => group.code).join(", ")})`);
+  const groupCount = db.prepare("SELECT COUNT(*) AS count FROM section_student_groups WHERE section_id = ?").get(input.sectionId) as { count: number };
+  if (groupCount.count === 0) warnings.push("Student group not assigned");
+
+  // A selected room must satisfy every course requirement; Smart Classroom already
+  // implies Multi Projector when room master data is saved.
+  if (input.roomId) {
+    const suitability = db.prepare(`SELECT rooms.code, rooms.capacity, rooms.has_multi_projector, rooms.is_lab, rooms.is_smart_classroom, rooms.is_active, courses.minimum_room_capacity, courses.requires_multi_projector, courses.requires_lab, courses.requires_smart_classroom FROM rooms JOIN course_sections sections ON sections.id = ? JOIN courses ON courses.id = sections.course_id WHERE rooms.id = ?`).get(input.sectionId, input.roomId) as { code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number; minimum_room_capacity: number | null; requires_multi_projector: number; requires_lab: number; requires_smart_classroom: number } | undefined;
+    if (!suitability || !suitability.is_active) warnings.push("Room is unavailable");
+    else {
+      if (suitability.minimum_room_capacity && suitability.capacity < suitability.minimum_room_capacity) warnings.push(`Room capacity too small (${suitability.capacity}/${suitability.minimum_room_capacity})`);
+      if (suitability.requires_lab && !suitability.is_lab) warnings.push("Lab room required");
+      if (suitability.requires_multi_projector && !suitability.has_multi_projector) warnings.push("Multi Projector required");
+      if (suitability.requires_smart_classroom && !suitability.is_smart_classroom) warnings.push("Smart Classroom required");
+    }
+  }
+  return warnings;
+}
+
 export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
   const db = database();
   const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
   if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new Error("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
-  const conflicts: string[] = [];
-  const overlaps = db.prepare(`SELECT lessons.section_id, courses.code, teachers.id AS teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(input.dayOfWeek, input.startHour + section.duration_hours, input.startHour) as Array<{ section_id: string; code: string; teacher_id: string | null; room_id: string | null }>;
-  if (overlaps.some((row) => row.teacher_id && row.teacher_id === section.teacher_id)) conflicts.push("Teacher conflict");
-  if (input.roomId && overlaps.some((row) => row.room_id === input.roomId)) conflicts.push("Room conflict");
+  const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
   const id = crypto.randomUUID();
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
   return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, warnings: conflicts };
@@ -453,10 +493,7 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
   const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
   if (input.teacherId && !teacher) throw new Error("Choose an active teacher.");
-  const overlaps = db.prepare(`SELECT sections.teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(id, input.dayOfWeek, input.startHour + lesson.duration_hours, input.startHour) as Array<{ teacher_id: string | null; room_id: string | null }>;
-  const warnings: string[] = [];
-  if (input.teacherId && overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
-  if (input.roomId && overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
+  const warnings = calculatePlacementWarnings(db, { sectionId: lesson.section_id, lessonId: id, teacherId: input.teacherId, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours });
   db.transaction(() => {
     db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
     db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ? WHERE id = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id);
