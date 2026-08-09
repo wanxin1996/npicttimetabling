@@ -811,6 +811,11 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
   // Course requirements apply to every generated section, so they are saved once
   // on the course rather than duplicated 18 times for a course such as LEAD.
   const db = database();
+  // Keep the business rule at the persistence boundary as well as the API, because
+  // maintenance scripts may call this shared function directly in future releases.
+  if (!Number.isInteger(input.durationHours) || input.durationHours < 2 || input.durationHours > 4) {
+    throw new Error("Course duration must be 2 to 4 whole hours.");
+  }
   // Do not silently hide a second weekly meeting that staff have already scheduled.
   const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
   if (scheduledExtra) throw new Error("Return the extra weekly sessions to the tray before reducing sessions per week.");

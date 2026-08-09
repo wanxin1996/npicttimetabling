@@ -14,8 +14,10 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   const minimumRoomCapacity = body.minimumRoomCapacity === null ? null : Number(body.minimumRoomCapacity);
   const weekPattern = body.weekPattern;
 
-  if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 1 || durationHours > 4 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || sessionsPerWeek > 2 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
-    return Response.json({ error: "Duration, weekly sessions, year and room capacity must use valid whole numbers." }, { status: 400 });
+  // The department confirmed that every class lasts 2, 3 or 4 whole hours.
+  // Enforce that business boundary on the server even if a custom client bypasses HTML.
+  if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 2 || durationHours > 4 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || sessionsPerWeek > 2 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
+    return Response.json({ error: "Duration must be 2 to 4 whole hours; weekly sessions, year and room capacity must also use valid whole numbers." }, { status: 400 });
   }
   if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom, body.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) {
     return Response.json({ error: "Room requirements must be true or false." }, { status: 400 });
