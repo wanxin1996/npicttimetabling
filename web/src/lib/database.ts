@@ -430,6 +430,40 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   return [...sections.values()];
 }
 
+type DailyInterval = { startHour: number; durationHours: number; block: string | null };
+
+function longestContinuousHours(intervals: DailyInterval[]) {
+  // Adjacent lessons count as one continuous block; overlapping lessons are merged
+  // so a warning reflects elapsed time rather than double-counting a conflict.
+  const ordered = [...intervals].sort((left, right) => left.startHour - right.startHour);
+  let longest = 0;
+  let blockStart = ordered[0]?.startHour ?? 0;
+  let blockEnd = blockStart;
+  for (const interval of ordered) {
+    const endHour = interval.startHour + interval.durationHours;
+    if (interval.startHour > blockEnd) {
+      longest = Math.max(longest, blockEnd - blockStart);
+      blockStart = interval.startHour;
+    }
+    blockEnd = Math.max(blockEnd, endHour);
+  }
+  return Math.max(longest, blockEnd - blockStart);
+}
+
+function hasLunchHour(intervals: DailyInterval[]) {
+  // With whole-hour lessons, the 12:00–14:00 lunch window has a free hour when
+  // either 12:00–13:00 or 13:00–14:00 is not covered by any lesson.
+  const occupied = (hour: number) => intervals.some((interval) => interval.startHour <= hour && interval.startHour + interval.durationHours >= hour + 1);
+  return !occupied(12) || !occupied(13);
+}
+
+function hasBackToBackBlockChange(intervals: DailyInterval[], proposed: DailyInterval) {
+  // Travel is only checked for immediately adjacent lessons and when both rooms have blocks.
+  if (!proposed.block) return false;
+  const proposedEnd = proposed.startHour + proposed.durationHours;
+  return intervals.some((interval) => interval.block && interval.block !== proposed.block && (interval.startHour + interval.durationHours === proposed.startHour || interval.startHour === proposedEnd));
+}
+
 function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: string; lessonId?: string; teacherId: string | null; roomId: string | null; dayOfWeek: number; startHour: number; durationHours: number }) {
   // Every placement path uses this single warning engine, ensuring drag, edit and
   // future candidate suggestions all apply the same conflict definitions.
@@ -469,6 +503,34 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
       if (suitability.requires_multi_projector && !suitability.has_multi_projector) warnings.push("Multi Projector required");
       if (suitability.requires_smart_classroom && !suitability.is_smart_classroom) warnings.push("Smart Classroom required");
     }
+  }
+
+  // The department prefers 09:00 starts; 08:00 remains available when needed.
+  if (input.startHour === 8) warnings.push("08:00 start is discouraged");
+
+  const proposedRoom = input.roomId ? db.prepare("SELECT block FROM rooms WHERE id = ?").get(input.roomId) as { block: string | null } | undefined : undefined;
+  const proposed = { startHour: input.startHour, durationHours: input.durationHours, block: proposedRoom?.block ?? null };
+  if (input.teacherId) {
+    const teacherDay = db.prepare(`SELECT lessons.start_hour, lessons.duration_hours, rooms.block FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id LEFT JOIN rooms ON rooms.id = lessons.room_id WHERE lessons.id <> ? AND sections.teacher_id = ? AND lessons.day_of_week = ?`).all(lessonId, input.teacherId, input.dayOfWeek) as Array<{ start_hour: number; duration_hours: number; block: string | null }>;
+    const existing = teacherDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
+    const combined = [...existing, proposed];
+    if (!hasLunchHour(combined)) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
+    if (longestContinuousHours(combined) > 4) warnings.push("Teacher has more than 4 continuous hours");
+    if (combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 7) warnings.push("Teacher exceeds 7 teaching hours in one day");
+    if (hasBackToBackBlockChange(existing, proposed)) warnings.push("Teacher has back-to-back lessons in different blocks");
+  }
+
+  // Evaluate each associated student group separately because cross-level sections
+  // can affect several year timetables through one placement.
+  const proposedGroups = db.prepare("SELECT student_groups.id, student_groups.code FROM section_student_groups JOIN student_groups ON student_groups.id = section_student_groups.student_group_id WHERE section_id = ?").all(input.sectionId) as Array<{ id: string; code: string }>;
+  for (const group of proposedGroups) {
+    const groupDay = db.prepare(`SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block FROM scheduled_lessons lessons JOIN section_student_groups links ON links.section_id = lessons.section_id LEFT JOIN rooms ON rooms.id = lessons.room_id WHERE lessons.id <> ? AND links.student_group_id = ? AND lessons.day_of_week = ?`).all(lessonId, group.id, input.dayOfWeek) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null }>;
+    const existing = groupDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
+    const combined = [...existing, proposed];
+    if (!hasLunchHour(combined)) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
+    if (longestContinuousHours(combined) > 4) warnings.push(`${group.code} has more than 4 continuous hours`);
+    if (combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 6) warnings.push(`${group.code} exceeds 6 class hours in one day`);
+    if (hasBackToBackBlockChange(existing, proposed)) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
   }
   return warnings;
 }

@@ -39,7 +39,7 @@
 - `PATCH`/`DELETE /api/schedule/lessons/:id`：编辑已排课程的时间、教师、教室，或将班次退回未排清单。
 - `GET /api/schedule/unscheduled?year=:year`：返回指定年级已完成课程配置、但尚未放入总表的班次，用于拖拽清单。
 
-排课写入与编辑共用同一警告引擎，当前检查教师重叠、教室重叠、学生班级重叠、缺少教师／教室／学生班级，以及教室容量和 Lab／Multi Projector／Smart Classroom 要求。警告会保存到排课记录，且不会阻止用户保存或导出。
+排课写入与编辑共用同一警告引擎，当前检查教师／教室／学生班级重叠、资料缺失、教室容量和设施、08:00 开课、午餐时段、连续课时、每日总时数以及跨 Block 连堂。警告会保存到排课记录，且不会阻止用户保存或导出。
 - `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；按正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
 本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建，并插入最小示例资料；后续真实资料会保留在该文件中。
