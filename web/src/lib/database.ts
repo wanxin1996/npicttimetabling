@@ -109,6 +109,16 @@ export type ScheduleIssueRecord = {
   message: string;
 };
 
+export type CandidateSlotRecord = {
+  dayOfWeek: number;
+  startHour: number;
+  endHour: number;
+  roomId: string;
+  roomCode: string;
+  roomCapacity: number;
+  roomFeatures: string[];
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -673,6 +683,47 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   });
   refresh();
   return issues;
+}
+
+export function listCandidateSlots(sectionId: string): { sectionLabel: string; slots: CandidateSlotRecord[] } {
+  const db = database();
+  // Candidate search uses the section's saved teacher, student groups, duration and
+  // course requirements. Incomplete sections therefore return no misleading options.
+  const section = db.prepare(`
+    SELECT sections.id, sections.sequence, sections.teacher_id, courses.code, courses.duration_hours
+    FROM course_sections sections
+    JOIN courses ON courses.id = sections.course_id
+    WHERE sections.id = ?
+  `).get(sectionId) as { id: string; sequence: number; teacher_id: string | null; code: string; duration_hours: number | null } | undefined;
+  if (!section) throw new Error("Course section not found.");
+  if (!section.duration_hours) throw new Error("Configure the course duration before finding candidate slots.");
+  const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ?").get(sectionId);
+  if (alreadyScheduled) throw new Error("Candidate slots are only available for unscheduled sections.");
+
+  // Try every active room at every valid whole-hour placement. The existing warning
+  // engine is the single source of truth, and only placements with zero messages pass.
+  const rooms = db.prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom FROM rooms WHERE is_active = 1 ORDER BY code").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
+  const slots: CandidateSlotRecord[] = [];
+  for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
+    // 08:00 is intentionally omitted because it always carries the department's
+    // discouraged-start advisory and candidates must be completely warning-free.
+    for (let startHour = 9; startHour + section.duration_hours <= 18; startHour += 1) {
+      for (const room of rooms) {
+        const warnings = calculatePlacementWarnings(db, { sectionId, teacherId: section.teacher_id, roomId: room.id, dayOfWeek, startHour, durationHours: section.duration_hours });
+        if (warnings.length > 0) continue;
+        slots.push({
+          dayOfWeek,
+          startHour,
+          endHour: startHour + section.duration_hours,
+          roomId: room.id,
+          roomCode: room.code,
+          roomCapacity: room.capacity,
+          roomFeatures: [room.is_lab ? "Lab" : "", room.has_multi_projector ? "Multi projector" : "", room.is_smart_classroom ? "Smart classroom" : ""].filter(Boolean),
+        });
+      }
+    }
+  }
+  return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, slots };
 }
 
 export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
