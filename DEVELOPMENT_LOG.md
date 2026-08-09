@@ -971,3 +971,29 @@
 
 1. 由项目负责人确认 Railway + SQLite（推荐）或直接 PostgreSQL。
 2. 确认 Railway 后增加平台配置清单并执行真实持久卷备份恢复验收。
+
+## 2026-08-10｜公网登录与上传安全加固
+
+### 已完成
+
+- 会话 Cookie 从 SameSite=Lax 收紧为 SameSite=Strict，并增加 High priority；生产环境继续要求 Secure 和 HttpOnly。
+- 新增进程级登录失败限流：同一来源地址与用户名组合 15 分钟内失败 5 次后暂停 15 分钟；同一来源轮换用户名累计 25 次也会暂停。
+- 限流同时避免共享办公室误锁：一个用户名达到 5 次不会立即阻止同一地址尝试另一个用户名；成功登录会清除相关失败记录。
+- 登录 API 对非法 JSON 返回可控的 HTTP 400；限流返回 HTTP 429、`Retry-After` 和统一错误，不暴露账号是否存在。
+- 全站新增 HSTS、`nosniff`、禁止 iframe、无 Referrer 和浏览器权限限制；所有 API 禁止浏览器或共享代理缓存。
+- Teaching Members 上传增加 20 MB 文件上限和 5,000 行上限，在建立额外内存副本或进入数据库导入前拒绝异常输入。
+- 更新技术架构文档，记录密码、会话、限流、响应头、上传和 HTTPS 的上线安全基线。
+
+### 本次验证
+
+- `npm run lint`、包含 standalone 资源整理的 `npm run build` 与 `npx prisma validate` 全部通过。
+- 隔离生产实例实际响应包含 Secure、HttpOnly、SameSite=Strict、Priority=High Cookie，以及 HSTS、DENY、nosniff、no-referrer、Permissions-Policy 和 API `no-store`。
+- 同一来源/用户名的错误登录前 5 次返回 HTTP 401，第 6 次返回 HTTP 429 与 `Retry-After: 900`；非法 JSON 返回 HTTP 400。
+- 同一来源改用另一个用户名返回正常的 HTTP 401 而非 429；有效会话访问教师 API 返回 HTTP 200。
+- 20 MB + 1 字节临时 `.xlsx` 返回 HTTP 413；5,001 行有效格式工作簿返回 HTTP 400，均未建立课程或教师。
+- 隔离账号、会话、工作簿、数据库、响应文件和服务器已删除；正式本机数据库未被测试触碰。
+
+### 下一步
+
+1. 由项目负责人确认 Railway + SQLite（推荐）或直接 PostgreSQL。
+2. 确认后把安全头、健康检查、持久卷和备份要求写入实际托管配置并做公网验收。

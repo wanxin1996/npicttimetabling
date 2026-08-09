@@ -52,6 +52,15 @@
 
 生产构建启用 Next.js standalone 输出。构建完成后，`scripts/prepare-standalone.mjs` 会把 `public/` 和 `.next/static/` 复制到自包含目录，避免部署后出现页面有 HTML 但缺少图标、CSS 或浏览器脚本的问题。
 
+## 上线安全基线
+
+- 密码使用带独立随机盐的 scrypt 哈希；数据库不保存明文密码，会话也只保存随机 token 的 SHA-256 摘要。
+- 生产会话 Cookie 使用 Secure、HttpOnly、SameSite=Strict 与 12 小时过期时间；改密、重置密码或停用账号会撤销相关会话。
+- 登录同时按“来源地址 + 用户名”限制 5 次失败，并按来源地址限制 25 次失败；达到上限后暂停 15 分钟。计数只存在单实例内存中，重新部署会清空，符合当前单实例路线。
+- 全站返回 HSTS、`nosniff`、禁止 iframe、无 Referrer 和禁用摄像头/麦克风/定位权限；所有 API 返回 `Cache-Control: no-store`。
+- Teaching Members 仅接受 `.xlsx`，文件最大 20 MB、工作表最多 5,000 行，并继续校验固定工作表、必需列和每行资料。
+- 公网环境必须由托管平台提供 HTTPS；否则生产模式的 Secure Cookie 不会通过普通 HTTP 发送。
+
 ## 后续基础设施决策
 
 首版的多人协作、跨设备访问和正式账号认证需要公网运行环境与持久数据存储。该线上环境尚未创建；当前推荐 Railway 单实例 + SQLite 持久卷，保留现有 5 秒同步与 revision 防覆盖机制。若项目负责人选择 PostgreSQL，则需先把当前同步 SQLite 数据访问层改写为异步 PostgreSQL 查询。两条路线的依据与上线条件见 `docs/DEPLOYMENT_DECISION.md`。

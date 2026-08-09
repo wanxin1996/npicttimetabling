@@ -10,10 +10,12 @@ export function sessionToken(request: NextRequest) {
 
 export function attachSessionCookie(response: NextResponse, token: string, expiresAt: string) {
   // HttpOnly blocks client-side scripts from reading the bearer token; SameSite
-  // protects normal local use against cross-site form submissions.
-  response.cookies.set(SESSION_COOKIE, token, { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", expires: new Date(expiresAt) });
+  // Strict is safe because this internal tool has no cross-site sign-in flow.
+  response.cookies.set(SESSION_COOKIE, token, { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", priority: "high", path: "/", expires: new Date(expiresAt) });
 }
 
 export function clearSessionCookie(response: NextResponse) {
-  response.cookies.set(SESSION_COOKIE, "", { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", expires: new Date(0) });
+  // Clear with the same security attributes and path used when the cookie was set,
+  // ensuring every supported browser removes the correct credential.
+  response.cookies.set(SESSION_COOKIE, "", { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", priority: "high", path: "/", expires: new Date(0) });
 }

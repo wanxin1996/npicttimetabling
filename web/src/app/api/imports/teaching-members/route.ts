@@ -8,6 +8,8 @@ export const runtime = "nodejs";
 // Keep this contract explicit: a changed export template should fail clearly instead
 // of silently creating incorrect teaching allocations.
 const requiredColumns = ["Mod", "Catalog", "Lecturer", "Staff Type", "# of grps teaching"];
+const maximumWorkbookBytes = 20 * 1024 * 1024;
+const maximumWorkbookRows = 5_000;
 
 function text(value: unknown) {
   // Spreadsheet cells can be empty, numbers or text; convert all of them safely.
@@ -29,6 +31,11 @@ export async function POST(request: Request) {
   if (!file || typeof file === "string" || !file.name.toLowerCase().endsWith(".xlsx")) {
     return NextResponse.json({ error: "Please choose an .xlsx Teaching Members file." }, { status: 400 });
   }
+  // The known workbook is about 16 MB. Reject unexpectedly large files before
+  // allocating another full in-memory buffer or asking SheetJS to decompress them.
+  if (file.size > maximumWorkbookBytes) {
+    return NextResponse.json({ error: "The Teaching Members file must be 20 MB or smaller." }, { status: 413 });
+  }
 
   try {
     // Read only the approved worksheet; ignore the file's other sheets completely.
@@ -36,6 +43,9 @@ export async function POST(request: Request) {
     const worksheet = workbook.Sheets["Teaching Members"];
     if (!worksheet) return NextResponse.json({ error: "Sheet 'Teaching Members' was not found." }, { status: 400 });
     const sheetRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(worksheet, { defval: null });
+    // Department allocations are a few hundred rows. This generous ceiling catches
+    // an accidental or malicious expansion without constraining normal semesters.
+    if (sheetRows.length > maximumWorkbookRows) return NextResponse.json({ error: "The Teaching Members sheet must contain 5,000 rows or fewer." }, { status: 400 });
     // Check the headers before reading rows so an outdated template never imports wrongly.
     const headers = new Set(Object.keys(sheetRows[0] ?? {}));
     const missing = requiredColumns.filter((column) => !headers.has(column));
