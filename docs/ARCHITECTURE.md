@@ -7,7 +7,7 @@
 - 数据模型：Prisma ORM schema，与当前 SQLite 的真实表名、字段、关系和删除策略保持一致，用作后续迁移来源。
 - 本地开发数据访问：Node.js SQLite（`better-sqlite3`）及 Next.js Route Handlers。
 - 本地开发数据库：SQLite。
-- 生产数据库目标：PostgreSQL；切换时保留同一业务模型，通过 Prisma 迁移调整数据库提供方。
+- 生产数据存储待决策：当前规模推荐单实例 SQLite 持久卷；账号量或高可用要求增长时迁移 PostgreSQL。
 
 当前业务读写仍集中在 `src/lib/database.ts` 的同步 SQLite 查询中；Prisma Client 尚未接管 API 数据访问。迁移 PostgreSQL 时必须把这些查询改为异步数据访问，不能只修改 datasource provider。
 
@@ -50,4 +50,4 @@
 
 ## 后续基础设施决策
 
-首版的多人实时协作、跨设备访问和正式账号认证需要线上 PostgreSQL 及实时服务。该线上环境尚未创建；在取得部署平台/数据库账号后，将把当前本地 SQLite 数据访问层迁移至 PostgreSQL，并接入认证与实时同步。
+首版的多人协作、跨设备访问和正式账号认证需要公网运行环境与持久数据存储。该线上环境尚未创建；当前推荐 Railway 单实例 + SQLite 持久卷，保留现有 5 秒同步与 revision 防覆盖机制。若项目负责人选择 PostgreSQL，则需先把当前同步 SQLite 数据访问层改写为异步 PostgreSQL 查询。两条路线的依据与上线条件见 `docs/DEPLOYMENT_DECISION.md`。

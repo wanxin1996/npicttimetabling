@@ -903,3 +903,26 @@
 
 1. 根据当前系统规模比较“单实例 + SQLite 持久卷”和“托管 PostgreSQL”两条公网部署路线。
 2. 由项目负责人确认路线后，补齐部署配置、备份和共享环境验收。
+
+## 2026-08-10｜公网部署路线比较
+
+### 已完成
+
+- 新增 `docs/DEPLOYMENT_DECISION.md`，按当前少量账号、低频排课和现有同步 SQLite 数据访问评估两条公网路线。
+- 推荐首轮采用 Railway 单个 Next.js 服务 + SQLite 持久卷：老师仍可从任何地点登录同一公网系统，同时避免立即重写全部查询。
+- 记录持久卷单实例、发布短暂停机和卷删除风险，并把每日/每周备份、外部副本及实际恢复演练列为上线条件。
+- 记录 PostgreSQL 路线必须改写全部同步查询和 SQLite 专有语法，不能只更改连接字符串或 Prisma provider。
+- 明确 Vercel 的临时文件系统不能持久保存 SQLite；如果选择 Vercel，必须先接入 Neon、Prisma Postgres 等外部数据库。
+- 没有创建任何云资源、上传本机数据或产生费用，等待项目负责人确认路线。
+
+### 本次验证
+
+- 对照 Railway 官方 Next.js、Volumes 与 Backups 文档，确认其卷适用于 SQLite，并支持手动和每日/每周/月度备份。
+- 对照 Railway 官方限制，确认挂载卷的服务不能使用副本，重新部署会有短暂停机。
+- 对照 Vercel 官方说明，确认 SQLite 不能依赖其 serverless 本地文件系统持久化。
+- 对照 Prisma 官方 PostgreSQL 文档，确认 serverless PostgreSQL 需要连接池/适配器，并需要独立的运行时与迁移连接配置。
+
+### 下一步
+
+1. 由项目负责人确认 Railway + SQLite（推荐）或直接 PostgreSQL。
+2. 确认后立即完成对应部署配置、备份策略和共享环境验收。
