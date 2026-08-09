@@ -12,6 +12,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   const sessionsPerWeek = Number(body.sessionsPerWeek);
   const primaryYear = body.primaryYear === null ? null : Number(body.primaryYear);
   const minimumRoomCapacity = body.minimumRoomCapacity === null ? null : Number(body.minimumRoomCapacity);
+  const weekPattern = body.weekPattern;
 
   if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 1 || durationHours > 4 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || sessionsPerWeek > 2 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
     return Response.json({ error: "Duration, weekly sessions, year and room capacity must use valid whole numbers." }, { status: 400 });
@@ -19,9 +20,10 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom, body.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) {
     return Response.json({ error: "Room requirements must be true or false." }, { status: 400 });
   }
+  if (!["ALL", "W1_4", "W5_8"].includes(weekPattern)) return Response.json({ error: "Choose a valid teaching week pattern." }, { status: 400 });
 
   try {
-    const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays });
+    const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays, weekPattern });
     if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch (error) {
