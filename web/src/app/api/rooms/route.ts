@@ -12,7 +12,8 @@ export async function POST(request: Request) {
   const body = await request.json();
   const code = String(body.code ?? "").trim().toUpperCase();
   const capacity = Number(body.capacity);
-  if (!code || !Number.isInteger(capacity) || capacity < 1) return Response.json({ error: "A room code and positive whole-number capacity are required." }, { status: 400 });
+  const addressParts = code.split("-");
+  if (addressParts.length < 3 || addressParts.some((part) => !part) || !Number.isInteger(capacity) || capacity < 1) return Response.json({ error: "Use a Block-Level-Room code and a positive whole-number capacity." }, { status: 400 });
 
   try {
     // The database remains the final safeguard against duplicate room codes.

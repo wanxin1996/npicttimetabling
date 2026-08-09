@@ -506,6 +506,20 @@ export function createRoom(input: { code: string; capacity: number; hasLab: bool
   return { id, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
 }
 
+export function updateRoom(id: string, input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }) {
+  // Recalculate Block whenever the room address changes because back-to-back travel
+  // warnings must use the latest building rather than a stale imported value.
+  const block = input.code.split("-")[0] || null;
+  // Preserve the department rule that every Smart Classroom is also multi-projector.
+  const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
+  const result = database().prepare(`
+    UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
+      is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, id);
+  return result.changes > 0;
+}
+
 export function setRoomStatus(id: string, isActive: boolean) {
   const result = database().prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   return result.changes > 0;

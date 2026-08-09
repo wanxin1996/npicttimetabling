@@ -75,6 +75,7 @@ export default function Home() {
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [groups, setGroups] = useState<StudentGroup[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [editingRoom, setEditingRoom] = useState<Room | null>(null);
   const [courses, setCourses] = useState<Course[]>([]);
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
@@ -123,6 +124,7 @@ export default function Home() {
     setView(nextView);
     setQuery("");
     setShowForm(false);
+    setEditingRoom(null);
     setEditingCourse(null);
     setSelectedCourse(null);
     setSections([]);
@@ -283,9 +285,12 @@ export default function Home() {
   }
 
   function toggleForm() {
-    // Closing a form also clears its selected course, so the next action starts cleanly.
+    // Closing a form also clears its selected record, so the next action starts cleanly.
     setShowForm((current) => !current);
-    if (showForm) setEditingCourse(null);
+    if (showForm) {
+      setEditingRoom(null);
+      setEditingCourse(null);
+    }
   }
 
   const fetchData = useCallback(async () => {
@@ -453,6 +458,7 @@ export default function Home() {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     let endpoint = "";
+    let method = "POST";
     let payload: Record<string, unknown> = {};
 
     if (view === "Teachers") {
@@ -475,12 +481,13 @@ export default function Home() {
       // Room facilities are saved as flags for later room-requirement matching.
       const code = String(data.get("room") ?? "").trim().toUpperCase();
       if (!code) return;
-      endpoint = "/api/rooms";
+      endpoint = editingRoom ? `/api/rooms/${editingRoom.id}` : "/api/rooms";
+      method = editingRoom ? "PATCH" : "POST";
       payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
     }
 
     // Send the normalised form data to the API; database validation remains the final check.
-    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) {
       const body = await response.json();
       setNotice(body.error ?? "This record could not be saved.");
@@ -489,6 +496,7 @@ export default function Home() {
 
     event.currentTarget.reset();
     setShowForm(false);
+    setEditingRoom(null);
     try {
       await loadData();
       setNotice(`${view.slice(0, -1)} saved to the local database.`);
@@ -790,10 +798,21 @@ export default function Home() {
             {showForm && view !== "Courses" && (
               /* Manual forms only collect the minimum information required for this milestone. */
               <form onSubmit={addRecord} className="border-b border-blue-100 bg-blue-50/60 p-4">
-                <p className="mb-3 text-sm font-bold text-blue-950">New {view.slice(0, -1)}</p>
+                <p className="mb-3 text-sm font-bold text-blue-950">{view === "Rooms" && editingRoom ? `Edit ${editingRoom.code}` : `New ${view.slice(0, -1)}`}</p>
                 {view === "Teachers" && <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]"><input name="name" required placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="staffType" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Save teacher</button></div>}
                 {view === "Student groups" && <div className="grid gap-3 sm:grid-cols-[1fr_120px_130px_auto]"><input name="code" required placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="year" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><input name="program" required placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Save group</button></div>}
-                {view === "Rooms" && <div className="grid gap-3 lg:grid-cols-[1fr_110px_auto_auto_auto_auto]"><input name="room" required placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><input name="capacity" required min="1" type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><label className="flex items-center gap-2 text-sm"><input name="lab" type="checkbox" /> Lab</label><label className="flex items-center gap-2 text-sm"><input name="projector" type="checkbox" /> Projector</label><label className="flex items-center gap-2 text-sm"><input name="smart" type="checkbox" /> Smart</label><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Save room</button></div>}
+                {view === "Rooms" && (
+                  /* The same form creates or edits a room. Existing facility flags are
+                     filled from the selected table row to prevent accidental loss. */
+                  <div className="grid gap-3 lg:grid-cols-[1fr_110px_auto_auto_auto_auto]">
+                    <input name="room" required defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="capacity" required min="1" defaultValue={editingRoom?.capacity} type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <label className="flex items-center gap-2 text-sm"><input name="lab" defaultChecked={editingRoom?.features.includes("Lab")} type="checkbox" /> Lab</label>
+                    <label className="flex items-center gap-2 text-sm"><input name="projector" defaultChecked={editingRoom?.features.includes("Multi projector")} type="checkbox" /> Projector</label>
+                    <label className="flex items-center gap-2 text-sm"><input name="smart" defaultChecked={editingRoom?.features.includes("Smart classroom")} type="checkbox" /> Smart</label>
+                    <button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingRoom ? "Save changes" : "Save room"}</button>
+                  </div>
+                )}
               </form>
             )}
 
@@ -802,7 +821,7 @@ export default function Home() {
               {isLoading && <div className="p-8 text-sm text-slate-500">Loading data...</div>}
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
-              {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
+              {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => { setEditingRoom(room); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></div></td></tr>)}</tbody></table>}
               {!isLoading && view === "Courses" && <table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Sections</th><th className="px-5 py-3 font-bold">Setup</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><Pill tone="blue">{course.configuredSections}</Pill></td><td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"}` : "Not configured"}</td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Sections</button><button onClick={() => { setEditingCourse(course); setShowForm(true); }} className="font-semibold text-blue-700 hover:text-blue-900" type="button">Configure</button></div></td></tr>)}</tbody></table>}
             </div>
 

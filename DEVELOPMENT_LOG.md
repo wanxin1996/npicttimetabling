@@ -583,3 +583,24 @@
 
 1. 增加现有教室地址、容量和设施的编辑功能。
 2. 增加 Excel 遗漏后的课程与班次数量人工修正。
+
+## 2026-08-10｜教室资料编辑
+
+### 已完成
+
+- Rooms 清单新增 Edit，可修改现有教室的 Block-Level-Room 地址、容量、Lab、Multi Projector 和 Smart Classroom 标记。
+- 地址修改后自动重新解析 Block，确保不同 Block 连堂提醒使用最新建筑位置。
+- Smart Classroom 仍会自动包含 Multi Projector；重复地址返回明确冲突，错误地址格式和非正整数容量会被拒绝。
+- 编辑和启用／停用共用同一路由，但以明确请求类型分支处理，既保留旧排课引用，也不会混淆资料修改与状态修改。
+
+### 本次验证
+
+- `npm run lint` 与 `npm run build` 通过。
+- 通过真实受保护 API 将 `room-3` 临时修改为 `28-06-01`、Block 28、32 人、Lab + Smart，读取结果自动包含 Multi Projector。
+- 修改为已有地址返回 HTTP 409；修改为非 Block-Level-Room 地址返回 HTTP 400。
+- `room-3` 已恢复为原始 `27-03-08`、Block 27、20 人、Multi Projector；临时管理员、会话和 cookie 已清除。
+
+### 下一步
+
+1. 增加 Excel 遗漏后的课程与班次数量人工修正。
+2. 增加未排班次搜索和教师类型／学生班级／专业筛选。
