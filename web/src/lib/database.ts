@@ -72,6 +72,7 @@ export type ScheduledLessonRecord = {
   sectionId: string;
   sectionLabel: string;
   courseCode: string;
+  teacherId: string | null;
   teacherName: string | null;
   dayOfWeek: number;
   startHour: number;
@@ -189,6 +190,7 @@ function initializeTables(db: DatabaseInstance) {
       start_hour INTEGER NOT NULL CHECK (start_hour BETWEEN 8 AND 17),
       duration_hours INTEGER NOT NULL CHECK (duration_hours BETWEEN 1 AND 4),
       room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
+      warnings_json TEXT NOT NULL DEFAULT '[]',
       UNIQUE(section_id, occurrence)
     );
   `);
@@ -198,6 +200,10 @@ function initializeTables(db: DatabaseInstance) {
   const courseColumns = db.prepare("PRAGMA table_info(courses)").all() as Array<{ name: string }>;
   if (!courseColumns.some((column) => column.name === "primary_year")) {
     db.exec("ALTER TABLE courses ADD COLUMN primary_year INTEGER CHECK (primary_year IN (1, 2, 3))");
+  }
+  const lessonColumns = db.prepare("PRAGMA table_info(scheduled_lessons)").all() as Array<{ name: string }>;
+  if (!lessonColumns.some((column) => column.name === "warnings_json")) {
+    db.exec("ALTER TABLE scheduled_lessons ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
@@ -387,16 +393,17 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   // The master timetable is filtered by the course's primary year, while each lesson
   // still retains its cross-year student groups for conflict checks.
   const rows = database().prepare(`
-    SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.name AS teacher_name,
-      lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id, rooms.code AS room_code
+    SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.id AS teacher_id, teachers.name AS teacher_name,
+      lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
+      lessons.warnings_json, rooms.code AS room_code
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
-  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: [] }));
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
@@ -433,8 +440,34 @@ export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: numb
   if (overlaps.some((row) => row.teacher_id && row.teacher_id === section.teacher_id)) conflicts.push("Teacher conflict");
   if (input.roomId && overlaps.some((row) => row.room_id === input.roomId)) conflicts.push("Room conflict");
   const id = crypto.randomUUID();
-  db.prepare("INSERT INTO scheduled_lessons (id, section_id, day_of_week, start_hour, duration_hours, room_id) VALUES (?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId);
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, courseCode: section.code, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, warnings: conflicts };
+  db.prepare("INSERT INTO scheduled_lessons (id, section_id, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, warnings: conflicts };
+}
+
+export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null }): ScheduledLessonRecord {
+  const db = database();
+  // The editor updates the section teacher and lesson placement together so the card
+  // never briefly shows a teacher that differs from the conflict-check input.
+  const lesson = db.prepare(`SELECT lessons.section_id, courses.code, sections.sequence, courses.duration_hours FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; code: string; sequence: number; duration_hours: number } | undefined;
+  if (!lesson) throw new Error("Scheduled lesson not found.");
+  if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
+  const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
+  if (input.teacherId && !teacher) throw new Error("Choose an active teacher.");
+  const overlaps = db.prepare(`SELECT sections.teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(id, input.dayOfWeek, input.startHour + lesson.duration_hours, input.startHour) as Array<{ teacher_id: string | null; room_id: string | null }>;
+  const warnings: string[] = [];
+  if (input.teacherId && overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
+  if (input.roomId && overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
+  db.transaction(() => {
+    db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
+    db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ? WHERE id = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id);
+  })();
+  const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, warnings };
+}
+
+export function removeScheduledLesson(id: string) {
+  // Removing a lesson returns its section to the unscheduled tray through the normal query.
+  return database().prepare("DELETE FROM scheduled_lessons WHERE id = ?").run(id).changes > 0;
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {

@@ -44,7 +44,7 @@ type Course = {
 };
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
-type ScheduledLesson = { id: string; sectionLabel: string; courseCode: string; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomCode: string | null; warnings: string[] };
+type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; warnings: string[] };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; durationHours: number; studentGroups: string[] };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
@@ -74,6 +74,7 @@ export default function Home() {
   const [timetableYear, setTimetableYear] = useState(1);
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
+  const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -121,6 +122,17 @@ export default function Home() {
     // The dragged card carries only its section id; the server retrieves duration and
     // teacher data itself so browser-side changes cannot bypass validation.
     event.preventDefault();
+    const lessonId = event.dataTransfer.getData("application/x-scheduled-lesson");
+    if (lessonId) {
+      const lesson = lessons.find((item) => item.id === lessonId);
+      if (!lesson) return;
+      const response = await fetch(`/api/schedule/lessons/${lessonId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek, startHour, roomId: lesson.roomId, teacherId: lesson.teacherId }) });
+      const body = await response.json();
+      if (!response.ok) return setNotice(body.error ?? "The lesson could not be moved.");
+      setEditingLesson(null);
+      await openTimetable(timetableYear);
+      return setNotice(body.warnings.length ? `${body.sectionLabel} moved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} moved successfully.`);
+    }
     const sectionId = event.dataTransfer.getData("text/plain");
     if (!sectionId) return;
     const response = await fetch("/api/schedule/lessons", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionId, dayOfWeek, startHour, roomId: null }) });
@@ -128,6 +140,30 @@ export default function Home() {
     if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
     await openTimetable(timetableYear);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully. Assign its room next.`);
+  }
+
+  async function saveLesson(event: FormEvent<HTMLFormElement>) {
+    // The edit panel changes placement, teacher and room in one save and then reloads warnings.
+    event.preventDefault();
+    if (!editingLesson) return;
+    const data = new FormData(event.currentTarget);
+    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), teacherId: String(data.get("teacherId") ?? "") || null, roomId: String(data.get("roomId") ?? "") || null }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "The lesson could not be updated.");
+    setEditingLesson(null);
+    await openTimetable(timetableYear);
+    setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} updated successfully.`);
+  }
+
+  async function unscheduleLesson() {
+    // Unscheduling returns the section to the tray instead of deleting its course data.
+    if (!editingLesson) return;
+    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "DELETE" });
+    if (!response.ok) return setNotice("The lesson could not be returned to the tray.");
+    const label = editingLesson.sectionLabel;
+    setEditingLesson(null);
+    await openTimetable(timetableYear);
+    setNotice(`${label} returned to the unscheduled tray.`);
   }
 
   function toggleForm() {
@@ -372,7 +408,9 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>
 
-          {view === "Year timetables" && <div className="mb-6 grid gap-4 xl:grid-cols-[240px_1fr]"><aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-3"><p className="font-bold text-slate-950">Unscheduled sections</p><p className="text-xs text-slate-500">{unscheduledSections.length} ready to place</p></div><div className="grid max-h-[650px] gap-2 overflow-y-auto">{unscheduledSections.map((section) => <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className="cursor-grab rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950 active:cursor-grabbing"><p className="font-black">{section.label}</p><p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p><p className="mt-1 text-blue-700">{section.studentGroups.join(", ") || "Student group pending"}</p></div>)}{unscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No configured sections waiting for this year.</p>}</div></aside><div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-6 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">{lesson && <div className="rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div></div>}
+          {view === "Year timetables" && editingLesson && <form onSubmit={saveLesson} className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm"><div className="mb-3 flex items-center justify-between"><div><p className="text-sm font-black text-amber-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-amber-800">Update the placement, teacher and room, or return it to the tray.</p></div><button onClick={() => setEditingLesson(null)} className="text-sm font-semibold text-amber-800" type="button">Close</button></div><div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label></div><div className="mt-3 flex justify-end gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-amber-700 px-4 py-2 text-sm font-bold text-white" type="submit">Save changes</button></div></form>}
+
+          {view === "Year timetables" && <div className="mb-6 grid gap-4 xl:grid-cols-[240px_1fr]"><aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-3"><p className="font-bold text-slate-950">Unscheduled sections</p><p className="text-xs text-slate-500">{unscheduledSections.length} ready to place</p></div><div className="grid max-h-[650px] gap-2 overflow-y-auto">{unscheduledSections.map((section) => <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className="cursor-grab rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950 active:cursor-grabbing"><p className="font-black">{section.label}</p><p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p><p className="mt-1 text-blue-700">{section.studentGroups.join(", ") || "Student group pending"}</p></div>)}{unscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No configured sections waiting for this year.</p>}</div></aside><div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-6 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">{lesson && <div draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className="cursor-pointer rounded-md bg-blue-50 p-2 text-blue-900 ring-blue-300 hover:ring-2"><p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div></div>}
 
           {view !== "Year timetables" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}

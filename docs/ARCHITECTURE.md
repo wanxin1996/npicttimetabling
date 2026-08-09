@@ -36,6 +36,7 @@
 - `PATCH /api/courses/:id`：保存课程的时长、每周次数、主年级、最低容量和教室设施要求。
 - `GET /api/courses/:id/sections`、`PATCH /api/course-sections/:id`：读取并调整每个课程班次的授课教师及关联学生班级。
 - `GET`/`POST /api/schedule/lessons`：读取年级总表并放置课程；保存时返回教师和教室冲突警告，但不会阻止保存。
+- `PATCH`/`DELETE /api/schedule/lessons/:id`：编辑已排课程的时间、教师、教室，或将班次退回未排清单。
 - `GET /api/schedule/unscheduled?year=:year`：返回指定年级已完成课程配置、但尚未放入总表的班次，用于拖拽清单。
 - `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；按正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
