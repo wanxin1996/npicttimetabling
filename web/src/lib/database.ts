@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
 // These types describe the simplified data sent from the database to the browser.
 // They intentionally use friendly names instead of SQLite column names.
@@ -131,6 +132,8 @@ export type RuleSettingRecord = {
   enabled: boolean;
 };
 
+export type AppUserRecord = { id: string; username: string; isAdmin: boolean; isActive: boolean };
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 function weekPatternSuffix(pattern: "ALL" | "W1_4" | "W5_8") {
@@ -260,6 +263,20 @@ function initializeTables(db: DatabaseInstance) {
       rule_key TEXT PRIMARY KEY,
       is_enabled INTEGER NOT NULL DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS app_users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      password_hash TEXT NOT NULL,
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   // Policy rules are data-driven switches. Insert new defaults without overwriting a
@@ -314,6 +331,82 @@ function seed(db: DatabaseInstance) {
 function activeStatus(isActive: number) {
   // SQLite stores booleans as 0/1; the API exposes human-readable status text.
   return isActive ? "Active" : "Inactive";
+}
+
+function hashPassword(password: string) {
+  // Scrypt is deliberately slow for attackers. A unique random salt means equal
+  // passwords never produce equal stored values; plaintext is never persisted.
+  const salt = randomBytes(16).toString("hex");
+  return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
+}
+
+function passwordMatches(password: string, stored: string) {
+  const [salt, expectedHex] = stored.split(":");
+  if (!salt || !expectedHex) return false;
+  const actual = scryptSync(password, salt, 64);
+  const expected = Buffer.from(expectedHex, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function sessionHash(token: string) {
+  // Only a one-way digest of the bearer token is stored, limiting damage if the
+  // local database is copied while an account is logged in.
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function createSession(db: DatabaseInstance, userId: string) {
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+  db.prepare("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)").run(sessionHash(token), userId, expiresAt);
+  return { token, expiresAt };
+}
+
+export function authenticationStatus(token?: string): { setupRequired: boolean; user: AppUserRecord | null } {
+  const db = database();
+  const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
+  return { setupRequired: count.count === 0, user: token ? validateSession(token) : null };
+}
+
+export function validateSession(token: string): AppUserRecord | null {
+  const db = database();
+  db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(new Date().toISOString());
+  const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
+  return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) } : null;
+}
+
+export function createInitialAdmin(username: string, password: string) {
+  const db = database();
+  // The first-user check and insert share one transaction so two simultaneous setup
+  // requests cannot both become separate bootstrap administrators.
+  return db.transaction(() => {
+    const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
+    if (count.count > 0) throw new Error("Initial administrator has already been created.");
+    const id = crypto.randomUUID();
+    db.prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(id, username, hashPassword(password));
+    return { user: { id, username, isAdmin: true, isActive: true }, session: createSession(db, id) };
+  })();
+}
+
+export function loginUser(username: string, password: string) {
+  const db = database();
+  const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
+  if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
+  return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
+}
+
+export function logoutSession(token: string) {
+  return database().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(sessionHash(token)).changes > 0;
+}
+
+export function listAppUsers(): AppUserRecord[] {
+  const rows = database().prepare("SELECT id, username, is_admin, is_active FROM app_users ORDER BY username").all() as Array<{ id: string; username: string; is_admin: number; is_active: number }>;
+  return rows.map((row) => ({ id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) }));
+}
+
+export function createAppUser(username: string, password: string): AppUserRecord {
+  const id = crypto.randomUUID();
+  database().prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 0)").run(id, username, hashPassword(password));
+  return { id, username, isAdmin: false, isActive: true };
 }
 
 export function listTeachers(): TeacherRecord[] {

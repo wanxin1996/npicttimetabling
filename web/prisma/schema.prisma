@@ -10,14 +10,27 @@ datasource db {
 }
 
 model AppUser {
-  // Reserved for the simple local-login feature planned after core scheduling is complete.
+  // The first account is administrator; later scheduler accounts share timetable access.
   id           String   @id @default(cuid())
   username     String   @unique
   passwordHash String
-  role         String   @default("SCHEDULER")
+  isAdmin      Boolean  @default(false)
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+
+  sessions AuthSession[]
+}
+
+model AuthSession {
+  // Only a digest of the random cookie token is stored; sessions expire after 12 hours.
+  tokenHash String   @id
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  userId    String
+  user      AppUser  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
 }
 
 model Teacher {

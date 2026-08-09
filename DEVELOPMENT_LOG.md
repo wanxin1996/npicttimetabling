@@ -476,3 +476,27 @@
 
 1. 实现本地管理员首次设置、账号创建和独立登录。
 2. 评估线上 PostgreSQL 与实时协作部署方案，将本地原型迁移为多人共享系统。
+
+## 2026-08-10｜本地管理员与独立账号登录
+
+### 已完成
+
+- 首次打开系统时显示 Create the administrator，由实际使用者设置真实管理员用户名和密码；系统不会内置默认密码。
+- 密码使用 Node scrypt 加随机 salt 哈希，数据库不保存明文；登录使用随机 HttpOnly、SameSite 会话 cookie，并在 12 小时后过期。
+- 管理员可在 Accounts 页面创建普通 scheduler 账号；普通账号可使用全部排课功能，但不能查看或创建账号。
+- Sign out 同时删除服务器会话并清除浏览器 cookie。
+- Next.js 16 `proxy.ts` 统一保护所有非认证业务 API；未登录请求无法绕过页面直接读取或修改教师、课程和排课数据。
+- SQLite 自动初始化与 Prisma 模型均加入用户和会话表，业务代码继续包含面向维护者的区块注释。
+
+### 本次验证
+
+- `npm run lint`、`npm run build` 与 `npx prisma validate` 通过；生产构建识别 `Proxy (Middleware)` 和 5 个认证 API。
+- 未登录访问 `/api/teachers` 返回 401；临时管理员建立会话后可访问业务 API并创建普通账号。
+- 普通账号可访问 `/api/courses`（200），但访问账号管理返回 403。
+- 普通账号退出后旧 cookie 再访问业务 API 返回 401，证明服务器会话已失效。
+- 测试管理员、普通账号、会话和临时 cookie 已全部清除；`/api/auth/status` 恢复为 `setupRequired: true`，保留给用户自行设置真实管理员。
+
+### 下一步
+
+1. 增加账号停用和密码修改／重置能力。
+2. 评估并接入线上 PostgreSQL 与多人实时同步，替代单机 SQLite。

@@ -1,9 +1,10 @@
 "use client";
 
-import { DragEvent, FormEvent, Fragment, useEffect, useMemo, useState } from "react";
+import { DragEvent, FormEvent, Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
-type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Teachers" | "Student groups" | "Rooms" | "Courses";
+type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Accounts" | "Teachers" | "Student groups" | "Rooms" | "Courses";
+type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boolean };
 
 type Teacher = {
   id: string;
@@ -91,6 +92,9 @@ export default function Home() {
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
+  const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready">("checking");
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  const [accounts, setAccounts] = useState<AppUser[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -278,35 +282,77 @@ export default function Home() {
     if (showForm) setEditingCourse(null);
   }
 
-  async function fetchData() {
+  const fetchData = useCallback(async () => {
     // Load independent reference lists together, which keeps the first screen fast.
     const [teacherResponse, groupResponse, roomResponse, courseResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms"), fetch("/api/courses")]);
     if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok || !courseResponse.ok) throw new Error("Could not load data.");
     return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>, courseResponse.json() as Promise<Course[]>]);
-  }
+  }, []);
 
-  async function loadData() {
+  const loadData = useCallback(async () => {
     // Reuse one refresh routine after every successful edit or import.
     const [nextTeachers, nextGroups, nextRooms, nextCourses] = await fetchData();
     setTeachers(nextTeachers);
     setGroups(nextGroups);
     setRooms(nextRooms);
     setCourses(nextCourses);
-  }
+  }, [fetchData]);
 
   useEffect(() => {
-    // Load saved local data once when the page first opens.
-    void fetchData()
-      .then(([nextTeachers, nextGroups, nextRooms, nextCourses]) => {
-        setTeachers(nextTeachers);
-        setGroups(nextGroups);
-        setRooms(nextRooms);
-        setCourses(nextCourses);
-        setNotice("Local data is saved and ready for scheduling setup.");
-      })
-      .catch(() => setNotice("Unable to load the local scheduling database. Please refresh and try again."))
-      .finally(() => setIsLoading(false));
-  }, []);
+    // Authentication is checked before protected reference-data APIs are called.
+    void fetch("/api/auth/status").then(async (response) => {
+      const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
+      if (status.setupRequired) return setAuthScreen("setup");
+      if (!status.user) return setAuthScreen("login");
+      setCurrentUser(status.user);
+      setAuthScreen("ready");
+      await loadData();
+      setNotice("Local data is saved and ready for scheduling setup.");
+    }).catch(() => setNotice("Unable to check authentication. Please refresh and try again.")).finally(() => setIsLoading(false));
+  }, [loadData]);
+
+  async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
+    // The same compact form handles first-admin creation and later sign-in; the server
+    // decides the security-sensitive operation from the selected endpoint.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const endpoint = authScreen === "setup" ? "/api/auth/setup" : "/api/auth/login";
+    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Authentication failed.");
+    setCurrentUser(body.user);
+    setAuthScreen("ready");
+    await loadData();
+    setNotice(`Signed in as ${body.user.username}.`);
+  }
+
+  async function logout() {
+    // Logout invalidates the server-side session as well as clearing the browser cookie.
+    await fetch("/api/auth/logout", { method: "POST" });
+    setCurrentUser(null);
+    setAuthScreen("login");
+    setNotice("Signed out.");
+  }
+
+  async function openAccounts() {
+    const response = await fetch("/api/auth/accounts");
+    if (!response.ok) return setNotice("Only the administrator can manage accounts.");
+    setAccounts(await response.json());
+    setView("Accounts");
+    setShowForm(false);
+  }
+
+  async function createAccount(event: FormEvent<HTMLFormElement>) {
+    // New schedulers receive normal access; only the initial administrator can create them.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Account could not be created.");
+    event.currentTarget.reset();
+    await openAccounts();
+    setNotice(`${body.username} account created.`);
+  }
 
   async function toggleTeacher(teacher: Teacher) {
     // Status is toggled rather than deleting a teacher, protecting schedule history.
@@ -456,6 +502,11 @@ export default function Home() {
   // The primary button stays contextual so staff do not need to learn separate screens.
   const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import teaching allocation" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
+  if (authScreen !== "ready") {
+    // Logged-out users see no scheduling data; first launch becomes administrator setup.
+    return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
+  }
+
   return (
     <main className="min-h-screen bg-[#f6f8fb] text-slate-900">
       {/* Persistent identity header for the department workspace. */}
@@ -470,7 +521,8 @@ export default function Home() {
           </div>
           <div className="hidden items-center gap-2 md:flex">
             <Pill tone="amber">Draft workspace</Pill>
-            <div className="ml-2 grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">WX</div>
+            <span className="ml-2 text-sm font-bold text-slate-700">{currentUser?.username}</span>
+            <button onClick={() => void logout()} className="rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Sign out</button>
           </div>
         </div>
       </header>
@@ -494,6 +546,7 @@ export default function Home() {
           <button onClick={() => void openRules()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Rules & issues" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
             <span className="text-base">◌</span> Rules & issues
           </button>
+          {currentUser?.isAdmin && <button onClick={() => void openAccounts()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Accounts" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button"><span className="text-base">⚿</span> Accounts</button>}
           <div className="my-3 border-t border-slate-100" />
           <p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p>
           <div className="rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">No timetable is published yet. Start with the master data.</div>
@@ -503,11 +556,11 @@ export default function Home() {
           {/* Page title and the single action that applies to the selected data view. */}
           <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
-              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : "Data management"}</p>
-              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : "Build the scheduling foundation"}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher or student group." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
+              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Accounts" ? "Administration" : "Data management"}</p>
+              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Accounts" ? "Manage scheduler accounts" : "Build the scheduling foundation"}</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher or student group." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Accounts" ? "Create individual logins for the small scheduling team." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
-            {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
+            {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Accounts" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
             </button>}
           </div>
@@ -580,6 +633,8 @@ export default function Home() {
             </div>
           )}
 
+          {view === "Accounts" && <div className="mb-6 grid gap-4 lg:grid-cols-[360px_1fr]"><form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Create scheduler account</p><p className="mt-1 text-xs leading-5 text-slate-500">All scheduler accounts can use every timetable feature. Only the administrator can create accounts.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button></form><div className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div><div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill></div>)}</div></div></div>}
+
           {view === "Rules & issues" && (
             /* Optional policy rules are editable here; core collision checks remain fixed. */
             <div className="mb-4 rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -597,7 +652,7 @@ export default function Home() {
 
           {view === "Rules & issues" && <div className="mb-6 grid gap-4 lg:grid-cols-2"><form onSubmit={(event) => saveUnavailableWindow(event, "Teacher")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Teacher unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: a PT teacher can only teach on selected days.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" required className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Choose teacher</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name}</option>)}</select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add teacher restriction</button></form><form onSubmit={(event) => saveUnavailableWindow(event, "Year")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Year unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: Year 1 has no classes on Wednesday.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add year restriction</button></form><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="border-b border-slate-200 p-4"><p className="font-black">Current unavailable windows</p></div>{unavailableWindows.length === 0 ? <p className="p-4 text-sm text-slate-500">No unavailable windows have been added.</p> : <div className="divide-y divide-slate-100">{unavailableWindows.map((window) => <div key={window.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><Pill tone={window.kind === "Teacher" ? "amber" : "blue"}>{window.kind}</Pill><span className="ml-3 font-bold">{window.ownerLabel}</span><span className="ml-3 text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][window.dayOfWeek - 1]} {window.startHour}:00–{window.endHour}:00</span></div><button onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700" type="button">Remove</button></div>)}</div>}</div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4"><div><p className="font-black">Current timetable issues</p><p className="text-xs text-slate-500">Recalculated from every scheduled lesson and current rule.</p></div><div className="flex gap-2"><Pill tone="red">{scheduleIssues.filter((issue) => issue.severity === "High").length} high</Pill><Pill tone="amber">{scheduleIssues.filter((issue) => issue.severity === "Warning").length} warnings</Pill><Pill tone="blue">{scheduleIssues.filter((issue) => issue.severity === "Advisory").length} advisory</Pill></div></div>{scheduleIssues.length === 0 ? <p className="p-4 text-sm text-emerald-700">No issues found in scheduled lessons.</p> : <div className="max-h-[520px] divide-y divide-slate-100 overflow-y-auto">{scheduleIssues.map((issue) => <div key={issue.id} className="grid gap-2 p-4 text-sm md:grid-cols-[110px_1fr_auto]"><div><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill><p className="mt-2 text-xs font-semibold text-slate-500">{issue.category}</p></div><div><p className="font-black text-slate-950">{issue.sectionLabel} · Year {issue.primaryYear}</p><p className="mt-1 font-semibold text-slate-700">{issue.message}</p><p className="mt-1 text-xs text-slate-500">{issue.teacherName ?? "Teacher pending"} · {issue.studentGroups.join(", ") || "Student group pending"} · {issue.roomCode ?? "Room pending"}</p></div><p className="text-xs font-semibold text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00–{String(issue.endHour).padStart(2, "0")}:00</p></div>)}</div>}</div></div>}
 
-          {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Accounts" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
