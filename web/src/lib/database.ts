@@ -542,16 +542,20 @@ export function updateRoom(id: string, input: { code: string; capacity: number; 
   const block = input.code.split("-")[0] || null;
   // Preserve the department rule that every Smart Classroom is also multi-projector.
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
-  const result = database().prepare(`
+  const db = database();
+  const result = db.prepare(`
     UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
       is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, id);
+  if (result.changes > 0) refreshAllScheduleWarnings(db);
   return result.changes > 0;
 }
 
 export function setRoomStatus(id: string, isActive: boolean) {
-  const result = database().prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
+  const db = database();
+  const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
+  if (result.changes > 0) refreshAllScheduleWarnings(db);
   return result.changes > 0;
 }
 
@@ -565,15 +569,20 @@ export function listUnavailableWindows(): UnavailableWindowRecord[] {
 export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; ownerId: string; dayOfWeek: number; startHour: number; endHour: number }) {
   // Restrictions use half-open time ranges [start, end), matching lesson overlap logic.
   const id = crypto.randomUUID();
-  if (input.kind === "Teacher") database().prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
-  else database().prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+  const db = database();
+  if (input.kind === "Teacher") db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
+  else db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+  refreshAllScheduleWarnings(db);
   return id;
 }
 
 export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
   // The kind selects the exact table, preventing a coincidental id match elsewhere.
   const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
-  return database().prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
+  const db = database();
+  const removed = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
+  if (removed) refreshAllScheduleWarnings(db);
+  return removed;
 }
 
 const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
@@ -598,7 +607,10 @@ export function updateRuleSetting(key: string, enabled: boolean) {
   // Only registered policy keys can be changed; core collision checks deliberately
   // have no switch and therefore cannot be disabled by accident.
   if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
-  return database().prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
+  const db = database();
+  const changed = db.prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
+  if (changed) refreshAllScheduleWarnings(db);
+  return changed;
 }
 
 function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
@@ -678,6 +690,9 @@ export function restoreLastCycleBackup(): CycleStatusRecord {
     for (const row of snapshot.lessons) insertLesson.run(row.id, row.section_id, row.occurrence, row.day_of_week, row.start_hour, row.duration_hours, row.room_id, row.warnings_json, row.revision);
   });
   restore();
+  // Master data or policy settings may have changed since the emergency snapshot;
+  // restore placements exactly, then evaluate them against the current retained rules.
+  refreshAllScheduleWarnings(db);
   return cycleStatus();
 }
 
@@ -768,20 +783,30 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
   return resize();
 }
 
-export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections" | "allocationVarianceCount">) {
+export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "allocatedSections" | "configuredSections" | "allocationVarianceCount"> & { durationHours: number }) {
   // Course requirements apply to every generated section, so they are saved once
   // on the course rather than duplicated 18 times for a course such as LEAD.
   const db = database();
   // Do not silently hide a second weekly meeting that staff have already scheduled.
   const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
   if (scheduledExtra) throw new Error("Return the extra weekly sessions to the tray before reducing sessions per week.");
-  const result = db.prepare(`
-    UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
-      minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
-      requires_smart_classroom = ?, separate_sections_across_days = ?, week_pattern = ?,
-      updated_at = CURRENT_TIMESTAMP WHERE id = ?
-  `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, input.weekPattern, id);
-  return result.changes > 0;
+  const outsideGrid = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.start_hour + ? > 18 LIMIT 1`).get(id, input.durationHours);
+  if (outsideGrid) throw new Error("Move late lessons earlier before increasing this course duration.");
+  const save = db.transaction(() => {
+    const result = db.prepare(`
+      UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
+        minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
+        requires_smart_classroom = ?, separate_sections_across_days = ?, week_pattern = ?,
+        updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, input.weekPattern, id);
+    // Scheduled lessons copy duration for fast grid rendering; keep that denormalised
+    // value synchronized whenever the shared course requirement changes.
+    if (result.changes > 0) db.prepare("UPDATE scheduled_lessons SET duration_hours = ?, revision = revision + 1 WHERE section_id IN (SELECT id FROM course_sections WHERE course_id = ?)").run(input.durationHours, id);
+    return result.changes > 0;
+  });
+  const changed = save();
+  if (changed) refreshAllScheduleWarnings(db);
+  return changed;
 }
 
 export function listCourseSections(courseId: string): CourseSectionRecord[] {
@@ -848,9 +873,14 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
     db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(id);
     const addGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const groupId of [...new Set(studentGroupIds)]) addGroup.run(id, groupId);
+    // A timetable editor opened before this assignment change must not later
+    // overwrite it with a stale save, so invalidate every scheduled occurrence.
+    db.prepare("UPDATE scheduled_lessons SET revision = revision + 1 WHERE section_id = ?").run(id);
     return section.course_id;
   });
-  return transaction();
+  const courseId = transaction();
+  if (courseId) refreshAllScheduleWarnings(db);
+  return courseId;
 }
 
 export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
@@ -1060,6 +1090,30 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   return warnings;
 }
 
+function refreshAllScheduleWarnings(db: DatabaseInstance) {
+  // Any changed lesson, assignment, room or rule can affect neighbouring cards.
+  // Recalculate the small department timetable once after such a mutation so every
+  // year and personal view reads one consistent warning snapshot.
+  const lessons = db.prepare(`
+    SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
+      lessons.duration_hours, lessons.room_id, sections.teacher_id
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    ORDER BY lessons.id
+  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; teacher_id: string | null }>;
+  const warningsByLesson = new Map<string, string[]>();
+  const saveWarnings = db.prepare("UPDATE scheduled_lessons SET warnings_json = ? WHERE id = ?");
+  const refresh = db.transaction(() => {
+    for (const lesson of lessons) {
+      const warnings = calculatePlacementWarnings(db, { sectionId: lesson.section_id, lessonId: lesson.id, teacherId: lesson.teacher_id, roomId: lesson.room_id, dayOfWeek: lesson.day_of_week, startHour: lesson.start_hour, durationHours: lesson.duration_hours });
+      saveWarnings.run(JSON.stringify(warnings), lesson.id);
+      warningsByLesson.set(lesson.id, warnings);
+    }
+  });
+  refresh();
+  return warningsByLesson;
+}
+
 function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | "severity"> {
   // The summary labels help staff scan a long list without changing the underlying
   // rule behaviour: every issue remains a warning and never blocks saving.
@@ -1078,6 +1132,7 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   // Recalculate every saved lesson when the issue screen opens. This keeps the list
   // current after restrictions or neighbouring lessons change, even when the lesson
   // itself has not been opened in the editor again.
+  const warningsByLesson = refreshAllScheduleWarnings(db);
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
       lessons.duration_hours, lessons.room_id, lessons.occurrence,
@@ -1098,33 +1153,27 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; occurrence: number; teacher_id: string | null; sequence: number; code: string; primary_year: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
 
   const issues: ScheduleIssueRecord[] = [];
-  const saveWarnings = db.prepare("UPDATE scheduled_lessons SET warnings_json = ? WHERE id = ?");
-  const refresh = db.transaction(() => {
-    for (const row of rows) {
-      const warnings = calculatePlacementWarnings(db, { sectionId: row.section_id, lessonId: row.id, teacherId: row.teacher_id, roomId: row.room_id, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours });
-      saveWarnings.run(JSON.stringify(warnings), row.id);
-
-      // Flatten one lesson with several warnings into independently filterable issue rows.
-      warnings.forEach((message, index) => {
-        const description = describeIssue(message);
-        issues.push({
-          id: `${row.id}:${index}`,
-          lessonId: row.id,
-          sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`,
-          primaryYear: row.primary_year,
-          dayOfWeek: row.day_of_week,
-          startHour: row.start_hour,
-          endHour: row.start_hour + row.duration_hours,
-          teacherName: row.teacher_name,
-          roomCode: row.room_code,
-          studentGroups: row.student_groups ? row.student_groups.split(", ") : [],
-          ...description,
-          message,
-        });
+  for (const row of rows) {
+    const warnings = warningsByLesson.get(row.id) ?? [];
+    // Flatten one lesson with several warnings into independently filterable issue rows.
+    warnings.forEach((message, index) => {
+      const description = describeIssue(message);
+      issues.push({
+        id: `${row.id}:${index}`,
+        lessonId: row.id,
+        sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`,
+        primaryYear: row.primary_year,
+        dayOfWeek: row.day_of_week,
+        startHour: row.start_hour,
+        endHour: row.start_hour + row.duration_hours,
+        teacherName: row.teacher_name,
+        roomCode: row.room_code,
+        studentGroups: row.student_groups ? row.student_groups.split(", ") : [],
+        ...description,
+        message,
       });
-    }
-  });
-  refresh();
+    });
+  }
   return issues;
 }
 
@@ -1181,7 +1230,9 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
   const id = crypto.randomUUID();
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: conflicts };
+  const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
+  const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings };
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
@@ -1199,14 +1250,18 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
     db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
     db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ?, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id, input.revision);
   })();
+  const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? warnings;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings };
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings };
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
   // Removing one lesson returns only that weekly session to the tray; the section's
   // other occurrence remains scheduled when a course meets twice per week.
-  return database().prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
+  const db = database();
+  const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
+  if (removed) refreshAllScheduleWarnings(db);
+  return removed;
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
