@@ -95,6 +95,7 @@ export default function Home() {
   const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready">("checking");
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
   const [accounts, setAccounts] = useState<AppUser[]>([]);
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -311,6 +312,39 @@ export default function Home() {
     }).catch(() => setNotice("Unable to check authentication. Please refresh and try again.")).finally(() => setIsLoading(false));
   }, [loadData]);
 
+  useEffect(() => {
+    if (authScreen !== "ready") return;
+    let active = true;
+
+    async function refreshVisibleWorkspace() {
+      // Poll only the currently visible scheduling projection. This keeps multiple
+      // logged-in browsers current without repeatedly downloading unrelated tables.
+      let responses: Response[] = [];
+      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`)]);
+      if (view === "Personal timetables" && personalOwnerId) responses = [await fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`)];
+      if (view === "Rules & issues") responses = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
+      if (!active || responses.length === 0) return;
+      if (responses.some((response) => response.status === 401)) {
+        setCurrentUser(null);
+        setAuthScreen("login");
+        return setNotice("Your session expired. Please sign in again.");
+      }
+      if (responses.some((response) => !response.ok)) return;
+      const payloads = await Promise.all(responses.map((response) => response.json()));
+      if (!active) return;
+      if (view === "Year timetables") { setLessons(payloads[0]); setUnscheduledSections(payloads[1]); }
+      if (view === "Personal timetables") setPersonalLessons(payloads[0]);
+      if (view === "Rules & issues") { setUnavailableWindows(payloads[0]); setScheduleIssues(payloads[1]); setRuleSettings(payloads[2]); }
+      setLastSyncedAt(new Date());
+    }
+
+    // Five seconds feels immediate for a small scheduling team while avoiding a
+    // permanent WebSocket service during the local SQLite MVP stage.
+    void refreshVisibleWorkspace();
+    const interval = window.setInterval(() => void refreshVisibleWorkspace(), 5000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [authScreen, personalKind, personalOwnerId, timetableYear, view]);
+
   async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
     // The same compact form handles first-admin creation and later sign-in; the server
     // decides the security-sensitive operation from the selected endpoint.
@@ -521,6 +555,7 @@ export default function Home() {
           </div>
           <div className="hidden items-center gap-2 md:flex">
             <Pill tone="amber">Draft workspace</Pill>
+            <span className="text-xs text-slate-400">{lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Sync starting"}</span>
             <span className="ml-2 text-sm font-bold text-slate-700">{currentUser?.username}</span>
             <button onClick={() => void logout()} className="rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Sign out</button>
           </div>
