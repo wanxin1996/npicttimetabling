@@ -49,7 +49,7 @@ type Course = {
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
 type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
-type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[] };
+type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
@@ -68,6 +68,14 @@ function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: 
   };
 
   return <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
+}
+
+function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
+  // Match the agreed timetable colours: red for serious issues, yellow for daily
+  // limit warnings, blue for recommendations or incomplete assignments.
+  if (severity === "High") return { card: "bg-red-50 text-red-950 ring-red-300", message: "text-red-700" };
+  if (severity === "Warning") return { card: "bg-amber-50 text-amber-950 ring-amber-300", message: "text-amber-700" };
+  return { card: "bg-blue-50 text-blue-900 ring-blue-300", message: "text-blue-700" };
 }
 
 export default function Home() {
@@ -823,12 +831,12 @@ export default function Home() {
               </div>
               <div className="mb-3 flex items-center justify-between">
                 <div><p className="font-black text-slate-950">Weekly timetable</p><p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p></div>
-                <Pill tone={personalLessons.some((lesson) => lesson.warnings.length > 0) ? "amber" : "green"}>{personalLessons.some((lesson) => lesson.warnings.length > 0) ? "Has warnings" : "No saved warnings"}</Pill>
+                <Pill tone={personalLessons.some((lesson) => lesson.warningSeverity === "High") ? "red" : personalLessons.some((lesson) => lesson.warningSeverity === "Warning") ? "amber" : personalLessons.some((lesson) => lesson.warningSeverity === "Advisory") ? "blue" : "green"}>{personalLessons.some((lesson) => lesson.warningSeverity === "High") ? "Has serious issues" : personalLessons.some((lesson) => lesson.warningSeverity === "Warning") ? "Has warnings" : personalLessons.some((lesson) => lesson.warningSeverity === "Advisory") ? "Has advisories" : "No saved issues"}</Pill>
               </div>
               <div className="grid grid-cols-6 gap-2 text-xs">
                 <div className="pt-2 text-slate-400">Time</div>
                 {["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}
-                {[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const cellLessons = personalLessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-16 rounded-lg border border-slate-100 bg-slate-50/50 p-1">{cellLessons.map((lesson) => <div key={lesson.id} className="mb-1 rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.length} warning{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>)}</div>; })}</Fragment>)}
+                {[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const cellLessons = personalLessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-16 rounded-lg border border-slate-100 bg-slate-50/50 p-1">{cellLessons.map((lesson) => { const issueClasses = lessonIssueClasses(lesson.warningSeverity); return <div key={lesson.id} className={`mb-1 rounded-md p-2 ${issueClasses.card}`}><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>; })}</div>; })}</Fragment>)}
               </div>
             </div>
           )}
@@ -880,14 +888,17 @@ export default function Home() {
                         const cellLessons = lessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour);
                         return (
                           <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">
-                            {cellLessons.map((lesson) => (
-                              <div key={lesson.id} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className="mb-1 cursor-pointer rounded-md bg-blue-50 p-2 text-blue-900 ring-blue-300 hover:ring-2">
+                            {cellLessons.map((lesson) => {
+                              // Use the server's highest issue level for both the card
+                              // and its message, keeping the grid aligned with Issues.
+                              const issueClasses = lessonIssueClasses(lesson.warningSeverity);
+                              return <div key={lesson.id} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className={`mb-1 cursor-pointer rounded-md p-2 hover:ring-2 ${issueClasses.card}`}>
                                 <p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p>
                                 <p>{lesson.teacherName ?? "Teacher pending"}</p>
                                 <p>{lesson.roomCode ?? "Room pending"}</p>
-                                {lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}
-                              </div>
-                            ))}
+                                {lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.join(", ")}</p>}
+                              </div>;
+                            })}
                           </div>
                         );
                       })}

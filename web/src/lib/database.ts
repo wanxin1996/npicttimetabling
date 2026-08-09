@@ -94,6 +94,7 @@ export type ScheduledLessonRecord = {
   sessionsPerWeek: number;
   revision: number;
   warnings: string[];
+  warningSeverity: "High" | "Warning" | "Advisory" | null;
 };
 
 export type UnscheduledSectionRecord = {
@@ -930,7 +931,12 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
   `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings: JSON.parse(row.warnings_json) as string[] }));
+  return rows.map((row) => {
+    // Attach the highest issue level so the timetable card can use the same colour
+    // standard as the consolidated issue list without reimplementing rule text.
+    const warnings = JSON.parse(row.warnings_json) as string[];
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+  });
 }
 
 export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
@@ -956,7 +962,12 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     WHERE ${ownerFilter}
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
   `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings: JSON.parse(row.warnings_json) as string[] }));
+  return rows.map((row) => {
+    // Personal teacher, student and room views use the identical server-derived
+    // issue level as the year master table.
+    const warnings = JSON.parse(row.warnings_json) as string[];
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+  });
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
@@ -1149,14 +1160,25 @@ function refreshAllScheduleWarnings(db: DatabaseInstance) {
 function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | "severity"> {
   // The summary labels help staff scan a long list without changing the underlying
   // rule behaviour: every issue remains a warning and never blocks saving.
-  if (message.includes("not assigned")) return { category: "Assignment", severity: "High" };
+  if (message.includes("not assigned")) return { category: "Assignment", severity: "Advisory" };
   if (message.includes("unavailable")) return { category: "Availability", severity: "High" };
   if (message.includes("conflict")) return { category: "Conflict", severity: "High" };
   if (message.includes("required") || message.includes("capacity too small")) return { category: "Room", severity: "High" };
   if (message.includes("different blocks")) return { category: "Travel", severity: "Advisory" };
   if (message.includes("discouraged")) return { category: "Preference", severity: "Advisory" };
-  if (message.includes("sections should not")) return { category: "Course rule", severity: "Warning" };
+  if (message.includes("sections should not")) return { category: "Course rule", severity: "High" };
+  if (message.includes("no free lunch hour") || message.includes("more than 4 continuous hours")) return { category: "Workload", severity: "High" };
   return { category: "Workload", severity: "Warning" };
+}
+
+function highestIssueSeverity(messages: string[]): "High" | "Warning" | "Advisory" | null {
+  // Reduce several rule messages to the colour of the most urgent one: red beats
+  // yellow, yellow beats blue, and an empty message list has no issue colour.
+  const severities = messages.map((message) => describeIssue(message).severity);
+  if (severities.includes("High")) return "High";
+  if (severities.includes("Warning")) return "Warning";
+  if (severities.includes("Advisory")) return "Advisory";
+  return null;
 }
 
 export function listScheduleIssues(): ScheduleIssueRecord[] {
@@ -1264,7 +1286,7 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings };
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
@@ -1284,7 +1306,7 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   })();
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? warnings;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings };
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
