@@ -475,6 +475,29 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
+export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", ownerId: string): ScheduledLessonRecord[] {
+  const db = database();
+  // Teacher schedules span all three master years. Student-group schedules use the
+  // section link table so a cross-level course appears for every participating class.
+  const ownerFilter = kind === "Teacher"
+    ? "sections.teacher_id = ?"
+    : "EXISTS (SELECT 1 FROM section_student_groups personal_links WHERE personal_links.section_id = sections.id AND personal_links.student_group_id = ?)";
+  const rows = db.prepare(`
+    SELECT lessons.id, lessons.section_id, courses.code, sections.sequence,
+      teachers.id AS teacher_id, teachers.name AS teacher_name, lessons.day_of_week,
+      lessons.start_hour, lessons.duration_hours, lessons.room_id,
+      lessons.warnings_json, rooms.code AS room_code
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    JOIN courses ON courses.id = sections.course_id
+    LEFT JOIN teachers ON teachers.id = sections.teacher_id
+    LEFT JOIN rooms ON rooms.id = lessons.room_id
+    WHERE ${ownerFilter}
+    ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
+  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: JSON.parse(row.warnings_json) as string[] }));
+}
+
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
   // Only sections with a completed duration can be dragged to the grid. Sections
   // missing setup remain visible in Courses, where staff can finish configuring them.
