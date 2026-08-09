@@ -3,7 +3,7 @@
 import { DragEvent, FormEvent, Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
-type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
+type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
 type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boolean };
 
 type Teacher = {
@@ -55,6 +55,7 @@ type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
 type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
+type CycleStatus = { courses: number; sections: number; lessons: number; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" | "red" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -100,6 +101,7 @@ export default function Home() {
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
+  const [currentCycle, setCurrentCycle] = useState<CycleStatus | null>(null);
   const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready">("checking");
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
   const [accounts, setAccounts] = useState<AppUser[]>([]);
@@ -173,6 +175,16 @@ export default function Home() {
     setScheduleIssues(await issuesResponse.json());
     setRuleSettings(await settingsResponse.json());
     setView("Rules & issues");
+    setShowForm(false);
+  }
+
+  async function openCycle() {
+    // Cycle tools are loaded on demand because they are used only twice per year and
+    // contain destructive actions that should never share an accidental shortcut.
+    const response = await fetch("/api/cycle");
+    if (!response.ok) return setNotice("Cycle status could not be loaded.");
+    setCurrentCycle(await response.json());
+    setView("Cycle");
     setShowForm(false);
   }
 
@@ -450,6 +462,40 @@ export default function Home() {
     setNotice("Password reset. Existing sessions for that account were signed out.");
   }
 
+  async function beginNewCycle(event: FormEvent<HTMLFormElement>) {
+    // Two explicit acknowledgements plus an exact phrase form the agreed repeated
+    // confirmation. The server independently checks the phrase before clearing data.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.");
+    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? "") }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "A new cycle could not be started.");
+    setCurrentCycle(body);
+    setLessons([]);
+    setUnscheduledSections([]);
+    setSelectedCourse(null);
+    setSections([]);
+    await loadData();
+    event.currentTarget.reset();
+    setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.");
+  }
+
+  async function restoreCycle(event: FormEvent<HTMLFormElement>) {
+    // Restoring replaces any work created after the clear, so it requires its own
+    // acknowledgement and exact phrase rather than a one-click undo.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.");
+    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? "") }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "The emergency backup could not be restored.");
+    setCurrentCycle(body);
+    await loadData();
+    event.currentTarget.reset();
+    setNotice("The last emergency cycle backup was restored.");
+  }
+
   async function toggleTeacher(teacher: Teacher) {
     // Status is toggled rather than deleting a teacher, protecting schedule history.
     const isActive = teacher.status !== "Active";
@@ -679,6 +725,9 @@ export default function Home() {
           <button onClick={() => void openRules()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Rules & issues" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
             <span className="text-base">◌</span> Rules & issues
           </button>
+          <button onClick={() => void openCycle()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Cycle" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
+            <span className="text-base">↻</span> New cycle & recovery
+          </button>
           {currentUser?.isAdmin && <button onClick={() => void openAccounts()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Accounts" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button"><span className="text-base">⚿</span> Accounts</button>}
           <div className="my-3 border-t border-slate-100" />
           <p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p>
@@ -689,11 +738,11 @@ export default function Home() {
           {/* Page title and the single action that applies to the selected data view. */}
           <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
-              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Accounts" ? "Administration" : view === "Profile" ? "My account" : "Data management"}</p>
-              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Accounts" ? "Manage scheduler accounts" : view === "Profile" ? "Change my password" : "Build the scheduling foundation"}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
+              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Cycle" ? "Cycle safety" : view === "Accounts" ? "Administration" : view === "Profile" ? "My account" : "Data management"}</p>
+              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Cycle" ? "Start a new scheduling cycle safely" : view === "Accounts" ? "Manage scheduler accounts" : view === "Profile" ? "Change my password" : "Build the scheduling foundation"}</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Cycle" ? "Back up and clear only cycle data, or restore the latest emergency snapshot." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
-            {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Accounts" && view !== "Profile" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
+            {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Cycle" && view !== "Accounts" && view !== "Profile" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
             </button>}
           </div>
@@ -806,6 +855,32 @@ export default function Home() {
             </div>
           )}
 
+          {view === "Cycle" && currentCycle && (
+            /* Destructive cycle controls live on a dedicated screen, visually and
+               operationally separated from normal timetable editing. */
+            <div className="mb-6 grid gap-4 lg:grid-cols-2">
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-2">
+                <p className="font-black text-slate-950">Current cycle contents</p>
+                <div className="mt-3 flex flex-wrap gap-2"><Pill tone="blue">{currentCycle.courses} courses</Pill><Pill tone="blue">{currentCycle.sections} sections</Pill><Pill tone="blue">{currentCycle.lessons} scheduled lessons</Pill></div>
+                <p className="mt-3 text-xs leading-5 text-slate-500">Retained after a clear: teachers, rooms, student groups, unavailable times, rule settings and all accounts.</p>
+              </div>
+              <form onSubmit={beginNewCycle} className="rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
+                <p className="font-black text-red-950">Start a new cycle</p>
+                <p className="mt-1 text-xs leading-5 text-red-800">An emergency snapshot is saved first. The current courses, generated sections, section student groups and scheduled lessons are then cleared together.</p>
+                <div className="mt-4 grid gap-3 text-sm text-red-950">
+                  <label className="flex items-start gap-2"><input name="understandClear" type="checkbox" className="mt-1" /><span>I understand that all current course and timetable work will disappear from the active workspace.</span></label>
+                  <label className="flex items-start gap-2"><input name="understandBackup" type="checkbox" className="mt-1" /><span>I understand that only the latest emergency snapshot is retained.</span></label>
+                  <label className="font-semibold">Type START NEW CYCLE<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal" /></label>
+                </div>
+                <button disabled={currentCycle.courses === 0} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50" type="submit">Back up and start new cycle</button>
+              </form>
+              <form onSubmit={restoreCycle} className="rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
+                <p className="font-black text-amber-950">Restore latest emergency backup</p>
+                {currentCycle.backup ? <><p className="mt-1 text-xs leading-5 text-amber-800">Saved {new Date(currentCycle.backup.createdAt).toLocaleString()} · {currentCycle.backup.courses} courses · {currentCycle.backup.sections} sections · {currentCycle.backup.lessons} lessons.</p><div className="mt-4 grid gap-3 text-sm text-amber-950"><label className="flex items-start gap-2"><input name="understandRestore" type="checkbox" className="mt-1" /><span>I understand this replaces any course and timetable work currently in the active workspace.</span></label><label className="font-semibold">Type RESTORE LAST BACKUP<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-amber-200 bg-white px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-amber-700 px-4 py-2.5 text-sm font-bold text-white" type="submit">Restore emergency backup</button></> : <p className="mt-3 text-sm text-slate-500">No emergency cycle backup is available yet.</p>}
+              </form>
+            </div>
+          )}
+
           {view === "Profile" && <form onSubmit={changePassword} className="mb-6 max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Change password</p><p className="mt-1 text-xs text-slate-500">At least 10 characters. All logged-in browsers will be signed out.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Current password<input name="currentPassword" required autoComplete="current-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">New password<input name="newPassword" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Change password</button></form>}
 
           {view === "Accounts" && <div className="mb-6 grid gap-4 lg:grid-cols-[360px_1fr]"><div className="grid content-start gap-4"><form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Create scheduler account</p><p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button></form><form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Reset scheduler password</p><div className="mt-4 grid gap-3"><select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select><input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" /></div><button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button></form></div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div><div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div></div></div>}
@@ -827,7 +902,7 @@ export default function Home() {
 
           {view === "Rules & issues" && <div className="mb-6 grid gap-4 lg:grid-cols-2"><form onSubmit={(event) => saveUnavailableWindow(event, "Teacher")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Teacher unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: a PT teacher can only teach on selected days.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" required className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Choose teacher</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name}</option>)}</select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add teacher restriction</button></form><form onSubmit={(event) => saveUnavailableWindow(event, "Year")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Year unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: Year 1 has no classes on Wednesday.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add year restriction</button></form><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="border-b border-slate-200 p-4"><p className="font-black">Current unavailable windows</p></div>{unavailableWindows.length === 0 ? <p className="p-4 text-sm text-slate-500">No unavailable windows have been added.</p> : <div className="divide-y divide-slate-100">{unavailableWindows.map((window) => <div key={window.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><Pill tone={window.kind === "Teacher" ? "amber" : "blue"}>{window.kind}</Pill><span className="ml-3 font-bold">{window.ownerLabel}</span><span className="ml-3 text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][window.dayOfWeek - 1]} {window.startHour}:00–{window.endHour}:00</span></div><button onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700" type="button">Remove</button></div>)}</div>}</div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4"><div><p className="font-black">Current timetable issues</p><p className="text-xs text-slate-500">Recalculated from every scheduled lesson and current rule.</p></div><div className="flex gap-2"><Pill tone="red">{scheduleIssues.filter((issue) => issue.severity === "High").length} high</Pill><Pill tone="amber">{scheduleIssues.filter((issue) => issue.severity === "Warning").length} warnings</Pill><Pill tone="blue">{scheduleIssues.filter((issue) => issue.severity === "Advisory").length} advisory</Pill></div></div>{scheduleIssues.length === 0 ? <p className="p-4 text-sm text-emerald-700">No issues found in scheduled lessons.</p> : <div className="max-h-[520px] divide-y divide-slate-100 overflow-y-auto">{scheduleIssues.map((issue) => <div key={issue.id} className="grid gap-2 p-4 text-sm md:grid-cols-[110px_1fr_auto]"><div><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill><p className="mt-2 text-xs font-semibold text-slate-500">{issue.category}</p></div><div><p className="font-black text-slate-950">{issue.sectionLabel} · Year {issue.primaryYear}</p><p className="mt-1 font-semibold text-slate-700">{issue.message}</p><p className="mt-1 text-xs text-slate-500">{issue.teacherName ?? "Teacher pending"} · {issue.studentGroups.join(", ") || "Student group pending"} · {issue.roomCode ?? "Room pending"}</p></div><p className="text-xs font-semibold text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00–{String(issue.endHour).padStart(2, "0")}:00</p></div>)}</div>}</div></div>}
 
-          {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Accounts" && view !== "Profile" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Cycle" && view !== "Accounts" && view !== "Profile" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">

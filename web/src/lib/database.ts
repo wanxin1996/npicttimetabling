@@ -144,6 +144,22 @@ export type RuleSettingRecord = {
 
 export type AppUserRecord = { id: string; username: string; isAdmin: boolean; isActive: boolean };
 
+export type CycleStatusRecord = {
+  courses: number;
+  sections: number;
+  lessons: number;
+  backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number };
+};
+
+// The emergency snapshot covers only cycle data. Master records and account data are
+// intentionally excluded because starting a new cycle must retain them.
+type CourseSnapshotRow = { id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; created_at: string; updated_at: string };
+type AllocationSnapshotRow = { id: string; course_id: string; teacher_id: string; assigned_group_count: number };
+type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null };
+type SectionGroupSnapshotRow = { section_id: string; student_group_id: string };
+type LessonSnapshotRow = { id: string; section_id: string; occurrence: number; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; revision: number };
+type CycleSnapshot = { courses: CourseSnapshotRow[]; allocations: AllocationSnapshotRow[]; sections: SectionSnapshotRow[]; sectionGroups: SectionGroupSnapshotRow[]; lessons: LessonSnapshotRow[] };
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 function weekPatternSuffix(pattern: "ALL" | "W1_4" | "W5_8") {
@@ -286,6 +302,11 @@ function initializeTables(db: DatabaseInstance) {
       token_hash TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
       expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS schedule_backups (
+      id TEXT PRIMARY KEY,
+      snapshot_json TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
@@ -578,6 +599,86 @@ export function updateRuleSetting(key: string, enabled: boolean) {
   // have no switch and therefore cannot be disabled by accident.
   if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
   return database().prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
+}
+
+function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
+  // Explicit table lists make the backup boundary reviewable: only data cleared by
+  // a new cycle enters the snapshot, never accounts or retained master data.
+  return {
+    courses: db.prepare("SELECT id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, created_at, updated_at FROM courses ORDER BY id").all() as CourseSnapshotRow[],
+    allocations: db.prepare("SELECT id, course_id, teacher_id, assigned_group_count FROM teaching_allocations ORDER BY id").all() as AllocationSnapshotRow[],
+    sections: db.prepare("SELECT id, course_id, sequence, teacher_id FROM course_sections ORDER BY id").all() as SectionSnapshotRow[],
+    sectionGroups: db.prepare("SELECT section_id, student_group_id FROM section_student_groups ORDER BY section_id, student_group_id").all() as SectionGroupSnapshotRow[],
+    lessons: db.prepare("SELECT id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision FROM scheduled_lessons ORDER BY id").all() as LessonSnapshotRow[],
+  };
+}
+
+function backupSummary(id: string, createdAt: string, snapshot: CycleSnapshot) {
+  return { id, createdAt, courses: snapshot.courses.length, sections: snapshot.sections.length, lessons: snapshot.lessons.length };
+}
+
+export function cycleStatus(): CycleStatusRecord {
+  const db = database();
+  // Only the newest emergency backup is exposed; this is not a browsable version
+  // history and therefore stays aligned with the agreed first-release scope.
+  const current = db.prepare("SELECT (SELECT COUNT(*) FROM courses) AS courses, (SELECT COUNT(*) FROM course_sections) AS sections, (SELECT COUNT(*) FROM scheduled_lessons) AS lessons").get() as { courses: number; sections: number; lessons: number };
+  const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
+  if (!backup) return { ...current, backup: null };
+  try {
+    return { ...current, backup: backupSummary(backup.id, backup.created_at, JSON.parse(backup.snapshot_json) as CycleSnapshot) };
+  } catch {
+    // A damaged snapshot must never prevent staff from opening the cycle screen.
+    return { ...current, backup: null };
+  }
+}
+
+export function startNewCycle(): CycleStatusRecord {
+  const db = database();
+  const snapshot = readCycleSnapshot(db);
+  if (snapshot.courses.length === 0) throw new Error("There is no current course cycle to clear.");
+  const backupId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  // Save the complete snapshot and clear the current cycle atomically. A failure in
+  // either step rolls back both, so staff never receive an incomplete empty system.
+  const replaceCycle = db.transaction(() => {
+    db.prepare("DELETE FROM schedule_backups").run();
+    db.prepare("INSERT INTO schedule_backups (id, snapshot_json, created_at) VALUES (?, ?, ?)").run(backupId, JSON.stringify(snapshot), createdAt);
+    db.prepare("DELETE FROM courses").run();
+  });
+  replaceCycle();
+  return cycleStatus();
+}
+
+export function restoreLastCycleBackup(): CycleStatusRecord {
+  const db = database();
+  const backup = db.prepare("SELECT snapshot_json FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { snapshot_json: string } | undefined;
+  if (!backup) throw new Error("No emergency cycle backup is available.");
+  let snapshot: CycleSnapshot;
+  try {
+    snapshot = JSON.parse(backup.snapshot_json) as CycleSnapshot;
+  } catch {
+    throw new Error("The emergency backup is not valid.");
+  }
+  if (![snapshot.courses, snapshot.allocations, snapshot.sections, snapshot.sectionGroups, snapshot.lessons].every(Array.isArray)) throw new Error("The emergency backup is not valid.");
+
+  // Restore in parent-to-child order so every foreign key is valid. Clearing and
+  // rebuilding run in one transaction; missing retained master data would roll back.
+  const restore = db.transaction(() => {
+    db.prepare("DELETE FROM courses").run();
+    const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const row of snapshot.courses) insertCourse.run(row.id, row.code, row.catalog, row.duration_hours, row.sessions_per_week, row.primary_year, row.minimum_room_capacity, row.requires_lab, row.requires_multi_projector, row.requires_smart_classroom, row.separate_sections_across_days, row.week_pattern, row.created_at, row.updated_at);
+    const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
+    for (const row of snapshot.allocations) insertAllocation.run(row.id, row.course_id, row.teacher_id, row.assigned_group_count);
+    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, ?)");
+    for (const row of snapshot.sections) insertSection.run(row.id, row.course_id, row.sequence, row.teacher_id);
+    const insertSectionGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
+    for (const row of snapshot.sectionGroups) insertSectionGroup.run(row.section_id, row.student_group_id);
+    const insertLesson = db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const row of snapshot.lessons) insertLesson.run(row.id, row.section_id, row.occurrence, row.day_of_week, row.start_hour, row.duration_hours, row.room_id, row.warnings_json, row.revision);
+  });
+  restore();
+  return cycleStatus();
 }
 
 export function listCourses(): CourseRecord[] {
