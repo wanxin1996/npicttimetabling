@@ -1,0 +1,31 @@
+# 技术架构说明
+
+## 当前技术栈
+
+- 前端与服务层：Next.js App Router、React、TypeScript。
+- 样式：Tailwind CSS。
+- 数据访问：Prisma ORM。
+- 本地开发数据库：SQLite。
+- 生产数据库目标：PostgreSQL；切换时保留同一业务模型，通过 Prisma 迁移调整数据库提供方。
+
+## 数据模型要点
+
+- `Course`、`Teacher`、`TeachingAllocation`：承载 `Teaching Members` Excel 的课程、教师与每位教师负责班次数量。
+- `CourseSection`：由课程生成的 `课程编号_01` 等独立班次，记录主年级和教师。
+- `ScheduledLesson`：每个班次的每次周课；可分别设置教室、时间及教学周区间，支持同一班次的两次课使用不同教室。
+- `StudentGroup` 与 `SectionStudentGroup`：支持一个班次关联多个学生班级，并用于学生冲突校验。
+- `TeacherUnavailableWindow`、`YearBlockedWindow`、`RuleSetting`：存储禁排时段和可启停规则。
+- `ScheduleBackup`：用于“开始新一轮排课”前的恢复备份。
+
+## 本地运行与验证
+
+在 `web/` 目录中：
+
+- `npm run lint`：检查代码风格。
+- `npm run build`：生产构建（使用 Webpack 兼容模式）。
+- `npm run db:generate`：生成 Prisma Client。
+- `npm run db:check`：校验 Prisma schema，并从空数据库生成 SQLite 建表 SQL，用于验证模型、关系和索引。
+
+## 后续基础设施决策
+
+首版的多人实时协作、跨设备访问和正式账号认证需要线上 PostgreSQL 及实时服务。该线上环境尚未创建；在取得部署平台/数据库账号后，将把本地 SQLite 配置迁移至 PostgreSQL，并接入认证与实时同步。

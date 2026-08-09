@@ -75,3 +75,29 @@
 
 1. 确定数据库、认证和实时协作方案，并建立数据模型。
 2. 实现基础数据维护页面。
+
+## 2026-08-09｜数据模型与本地数据层
+
+### 已完成
+
+- 已引入 Prisma ORM 与 SQLite 本地驱动。
+- 已建立课程、课程班次、每次课程安排、教师、学生班级、教室、教学分配、不可上课时段、规则设置与恢复备份的数据模型。
+- 已为 `Teaching Members` 的课程—教师—班次数量分配建立 `TeachingAllocation` 模型。
+- 已增加 `db:generate` 与 `db:check` 命令，并新增技术架构说明。
+
+### 当前限制
+
+- Prisma 的 schema-engine 在当前环境无法实际执行 SQLite 迁移，错误信息为空；但 schema 校验、从空数据库生成完整 SQLite SQL、Prisma Client 生成、lint 及生产构建均通过。
+- 线上 PostgreSQL、认证与实时协作服务尚未创建，因此本子任务只完成可迁移的数据模型和本地数据访问层。
+
+### 本次验证
+
+- `npx prisma validate` 通过。
+- `npx prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script` 成功生成完整建表 SQL。
+- `npx prisma generate` 通过。
+- `npm run lint` 与 `npm run build` 通过。
+
+### 下一步
+
+1. 实现教师、学生班级和教室的基础资料维护界面与输入校验。
+2. 选择并接入线上 PostgreSQL、认证与实时协作服务。

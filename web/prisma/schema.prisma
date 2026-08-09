@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model AppUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("SCHEDULER")
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Teacher {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  staffType String   @default("FT")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  allocations TeachingAllocation[]
+  sections    CourseSection[]
+  unavailable TeacherUnavailableWindow[]
+
+  @@index([staffType, isActive])
+}
+
+model StudentGroup {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  year      Int
+  program   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sections SectionStudentGroup[]
+
+  @@index([year, program])
+}
+
+model Room {
+  id                String   @id @default(cuid())
+  code              String   @unique
+  block             String?
+  capacity          Int
+  hasMultiProjector Boolean  @default(false)
+  isLab             Boolean  @default(false)
+  isSmartClassroom  Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  lessons ScheduledLesson[]
+
+  @@index([block, isActive])
+}
+
+model Course {
+  id                     String   @id @default(cuid())
+  code                   String   @unique
+  durationHours          Int
+  sessionsPerWeek        Int      @default(1)
+  minimumRoomCapacity    Int?
+  requiresLab            Boolean  @default(false)
+  requiresMultiProjector Boolean  @default(false)
+  requiresSmartClassroom Boolean  @default(false)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  allocations TeachingAllocation[]
+  sections    CourseSection[]
+}
+
+model TeachingAllocation {
+  id                 String   @id @default(cuid())
+  catalog            String?
+  assignedGroupCount Int
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  courseId  String
+  teacherId String
+  course    Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, teacherId])
+}
+
+model CourseSection {
+  id          String   @id @default(cuid())
+  sequence    Int
+  primaryYear Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  courseId  String
+  teacherId String?
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  teacher   Teacher? @relation(fields: [teacherId], references: [id], onDelete: SetNull)
+
+  studentGroups SectionStudentGroup[]
+  lessons       ScheduledLesson[]
+
+  @@unique([courseId, sequence])
+  @@index([primaryYear])
+  @@index([teacherId])
+}
+
+model SectionStudentGroup {
+  sectionId      String
+  studentGroupId String
+
+  section      CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  studentGroup StudentGroup  @relation(fields: [studentGroupId], references: [id], onDelete: Cascade)
+
+  @@id([sectionId, studentGroupId])
+  @@index([studentGroupId])
+}
+
+model ScheduledLesson {
+  id            String   @id @default(cuid())
+  occurrence    Int
+  dayOfWeek     Int?
+  startHour     Int?
+  durationHours Int
+  weekStart     Int?
+  weekEnd       Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sectionId String
+  roomId    String?
+  section   CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  room      Room?         @relation(fields: [roomId], references: [id], onDelete: SetNull)
+
+  @@unique([sectionId, occurrence])
+  @@index([roomId, dayOfWeek, startHour])
+  @@index([dayOfWeek, startHour])
+}
+
+model TeacherUnavailableWindow {
+  id        String   @id @default(cuid())
+  dayOfWeek Int
+  startHour Int
+  endHour   Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  teacherId String
+  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@index([teacherId, dayOfWeek])
+}
+
+model YearBlockedWindow {
+  id        String   @id @default(cuid())
+  year      Int
+  dayOfWeek Int
+  startHour Int
+  endHour   Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([year, dayOfWeek])
+}
+
+model RuleSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  isEnabled Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ScheduleBackup {
+  id           String   @id @default(cuid())
+  snapshotJson String
+  createdAt    DateTime @default(now())
+}
