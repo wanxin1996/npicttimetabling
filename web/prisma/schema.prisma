@@ -1,13 +1,16 @@
 generator client {
+  // Generate the typed client outside the source tree so the app can import it cleanly.
   provider = "prisma-client"
   output   = "../generated/prisma"
 }
 
 datasource db {
+  // The local prototype uses SQLite; the domain model remains portable to PostgreSQL later.
   provider = "sqlite"
 }
 
 model AppUser {
+  // Reserved for the simple local-login feature planned after core scheduling is complete.
   id           String   @id @default(cuid())
   username     String   @unique
   passwordHash String
@@ -18,6 +21,7 @@ model AppUser {
 }
 
 model Teacher {
+  // A teacher can be linked to imported allocations, generated course sections and blocked periods.
   id        String   @id @default(cuid())
   name      String   @unique
   staffType String   @default("FT")
@@ -33,6 +37,7 @@ model Teacher {
 }
 
 model StudentGroup {
+  // A student group is one class whose timetable must never overlap with itself.
   id        String   @id @default(cuid())
   code      String   @unique
   year      Int
@@ -46,6 +51,7 @@ model StudentGroup {
 }
 
 model Room {
+  // Room facilities support requirement matching and the block supports travel warnings.
   id                String   @id @default(cuid())
   code              String   @unique
   block             String?
@@ -63,6 +69,7 @@ model Room {
 }
 
 model Course {
+  // A course defines shared teaching requirements; individual sections are created underneath it.
   id                     String   @id @default(cuid())
   code                   String   @unique
   durationHours          Int
@@ -79,6 +86,7 @@ model Course {
 }
 
 model TeachingAllocation {
+  // This records how many sections of one course a specific teacher is expected to teach.
   id                 String   @id @default(cuid())
   catalog            String?
   assignedGroupCount Int
@@ -94,6 +102,7 @@ model TeachingAllocation {
 }
 
 model CourseSection {
+  // A section is the draggable unit, for example LEAD_01, with one assigned teacher.
   id          String   @id @default(cuid())
   sequence    Int
   primaryYear Int?
@@ -114,6 +123,7 @@ model CourseSection {
 }
 
 model SectionStudentGroup {
+  // This join table supports both normal and cross-year classes in the same section.
   sectionId      String
   studentGroupId String
 
@@ -125,6 +135,7 @@ model SectionStudentGroup {
 }
 
 model ScheduledLesson {
+  // One section can meet multiple times each week and can use a different room per meeting.
   id            String   @id @default(cuid())
   occurrence    Int
   dayOfWeek     Int?
@@ -146,6 +157,7 @@ model ScheduledLesson {
 }
 
 model TeacherUnavailableWindow {
+  // A hard unavailable window is checked whenever a lesson is placed for this teacher.
   id        String   @id @default(cuid())
   dayOfWeek Int
   startHour Int
@@ -160,6 +172,7 @@ model TeacherUnavailableWindow {
 }
 
 model YearBlockedWindow {
+  // A year-level blocked window captures rules such as a Wednesday without classes.
   id        String   @id @default(cuid())
   year      Int
   dayOfWeek Int
@@ -172,6 +185,7 @@ model YearBlockedWindow {
 }
 
 model RuleSetting {
+  // Feature flags let future rule changes be enabled or disabled without deleting data.
   id        String   @id @default(cuid())
   key       String   @unique
   isEnabled Boolean  @default(true)
@@ -180,6 +194,7 @@ model RuleSetting {
 }
 
 model ScheduleBackup {
+  // A serialized snapshot is kept before a new scheduling cycle replaces the old one.
   id           String   @id @default(cuid())
   snapshotJson String
   createdAt    DateTime @default(now())

@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
+// Each view uses the same page shell but displays a different master-data table.
 type View = "Teachers" | "Student groups" | "Rooms" | "Courses";
 
 type Teacher = {
@@ -36,6 +37,7 @@ type Course = {
 };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
+  // Reusable status badge: keeping colours here makes tables consistent and accessible.
   const tones = {
     slate: "bg-slate-100 text-slate-700",
     blue: "bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-200",
@@ -47,6 +49,7 @@ function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: 
 }
 
 export default function Home() {
+  // View and form state control what the scheduler currently sees and edits.
   const [view, setView] = useState<View>("Teachers");
   const [query, setQuery] = useState("");
   const [showForm, setShowForm] = useState(false);
@@ -58,6 +61,7 @@ export default function Home() {
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
 
+  // Filter in the browser so searching feels instant and does not repeatedly query SQLite.
   const filteredTeachers = useMemo(
     () => teachers.filter((teacher) => `${teacher.name} ${teacher.staffType}`.toLowerCase().includes(query.toLowerCase())),
     [query, teachers],
@@ -76,18 +80,21 @@ export default function Home() {
   );
 
   function openView(nextView: View) {
+    // Moving between tables clears controls that belong only to the previous table.
     setView(nextView);
     setQuery("");
     setShowForm(false);
   }
 
   async function fetchData() {
+    // Load independent reference lists together, which keeps the first screen fast.
     const [teacherResponse, groupResponse, roomResponse, courseResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms"), fetch("/api/courses")]);
     if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok || !courseResponse.ok) throw new Error("Could not load data.");
     return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>, courseResponse.json() as Promise<Course[]>]);
   }
 
   async function loadData() {
+    // Reuse one refresh routine after every successful edit or import.
     const [nextTeachers, nextGroups, nextRooms, nextCourses] = await fetchData();
     setTeachers(nextTeachers);
     setGroups(nextGroups);
@@ -96,6 +103,7 @@ export default function Home() {
   }
 
   useEffect(() => {
+    // Load saved local data once when the page first opens.
     void fetchData()
       .then(([nextTeachers, nextGroups, nextRooms, nextCourses]) => {
         setTeachers(nextTeachers);
@@ -109,6 +117,7 @@ export default function Home() {
   }, []);
 
   async function toggleTeacher(teacher: Teacher) {
+    // Status is toggled rather than deleting a teacher, protecting schedule history.
     const isActive = teacher.status !== "Active";
     const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
     if (!response.ok) return setNotice("Teacher status could not be updated.");
@@ -121,6 +130,7 @@ export default function Home() {
   }
 
   async function toggleRoom(room: Room) {
+    // The same non-destructive availability pattern applies to rooms.
     const isActive = room.status !== "Active";
     const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
     if (!response.ok) return setNotice("Room status could not be updated.");
@@ -133,12 +143,14 @@ export default function Home() {
   }
 
   async function addRecord(event: FormEvent<HTMLFormElement>) {
+    // One form handler supports the three manually maintained reference-data views.
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     let endpoint = "";
     let payload: Record<string, unknown> = {};
 
     if (view === "Teachers") {
+      // Teachers require only a name and employment type at this stage.
       const name = String(data.get("name") ?? "").trim().toUpperCase();
       if (!name) return;
       endpoint = "/api/teachers";
@@ -146,6 +158,7 @@ export default function Home() {
     }
 
     if (view === "Student groups") {
+      // Student groups identify the class whose timetable conflicts must be checked.
       const code = String(data.get("code") ?? "").trim().toUpperCase();
       if (!code) return;
       endpoint = "/api/student-groups";
@@ -153,12 +166,14 @@ export default function Home() {
     }
 
     if (view === "Rooms") {
+      // Room facilities are saved as flags for later room-requirement matching.
       const code = String(data.get("room") ?? "").trim().toUpperCase();
       if (!code) return;
       endpoint = "/api/rooms";
       payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
     }
 
+    // Send the normalised form data to the API; database validation remains the final check.
     const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) {
       const body = await response.json();
@@ -177,11 +192,13 @@ export default function Home() {
   }
 
   async function importTeachingMembers(event: FormEvent<HTMLFormElement>) {
+    // This separate handler uploads the Excel file without converting it to JSON in the browser.
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.");
     setImporting(true);
+    // Let the server validate the worksheet and update all allocation records atomically.
     const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
     const body = await response.json();
     setImporting(false);
@@ -195,10 +212,12 @@ export default function Home() {
     }
   }
 
+  // The primary button stays contextual so staff do not need to learn separate screens.
   const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import teaching allocation" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
   return (
     <main className="min-h-screen bg-[#f6f8fb] text-slate-900">
+      {/* Persistent identity header for the department workspace. */}
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-6 px-6 py-4">
           <div className="flex items-center gap-3">
@@ -216,6 +235,7 @@ export default function Home() {
       </header>
 
       <div className="mx-auto grid max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]">
+        {/* Navigation reflects the future scheduling modules; only data management is active today. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
           <button className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50" type="button">
@@ -236,6 +256,7 @@ export default function Home() {
         </aside>
 
         <section className="min-w-0">
+          {/* Page title and the single action that applies to the selected data view. */}
           <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
               <p className="text-sm font-semibold text-blue-700">Data management</p>
@@ -248,12 +269,14 @@ export default function Home() {
           </div>
 
           <div className="mb-6 grid gap-4 sm:grid-cols-3">
+            {/* At-a-glance counts confirm that import and master data are ready for scheduling. */}
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Teachers</p><p className="mt-1 text-2xl font-black">{teachers.length}</p><p className="mt-1 text-xs text-amber-700">{teachers.filter((teacher) => teacher.staffType === "PT").length} PT priority teachers</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Student groups</p><p className="mt-1 text-2xl font-black">{groups.length}</p><p className="mt-1 text-xs text-slate-500">Across Years 1–3</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+            {/* Table tabs and search share the same data card to minimise navigation. */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
                 {(["Teachers", "Student groups", "Rooms", "Courses"] as View[]).map((item) => (
@@ -264,6 +287,7 @@ export default function Home() {
             </div>
 
             {showForm && view === "Courses" && (
+              /* Excel import is deliberately separate from manual records because it replaces allocations. */
               <form onSubmit={importTeachingMembers} className="border-b border-blue-100 bg-blue-50/60 p-4">
                 <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
                 <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
@@ -272,6 +296,7 @@ export default function Home() {
             )}
 
             {showForm && view !== "Courses" && (
+              /* Manual forms only collect the minimum information required for this milestone. */
               <form onSubmit={addRecord} className="border-b border-blue-100 bg-blue-50/60 p-4">
                 <p className="mb-3 text-sm font-bold text-blue-950">New {view.slice(0, -1)}</p>
                 {view === "Teachers" && <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]"><input name="name" required placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="staffType" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Save teacher</button></div>}
@@ -281,6 +306,7 @@ export default function Home() {
             )}
 
             <div className="overflow-x-auto">
+              {/* Each table is rendered only after the initial database request has completed. */}
               {isLoading && <div className="p-8 text-sm text-slate-500">Loading data...</div>}
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}

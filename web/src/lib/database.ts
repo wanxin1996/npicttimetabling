@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
+// These types describe the simplified data sent from the database to the browser.
+// They intentionally use friendly names instead of SQLite column names.
 export type TeacherRecord = {
   id: string;
   name: string;
@@ -51,16 +53,21 @@ export type TeachingMembersImportSummary = {
 
 type DatabaseInstance = InstanceType<typeof Database>;
 
+// Next.js reloads modules in development. Keeping one connection globally prevents
+// a new SQLite connection from being opened each time a route is refreshed.
 const globalForDatabase = globalThis as unknown as {
   timetableDatabase: DatabaseInstance | undefined;
 };
 
 function database() {
+  // Even an existing connection must run the table setup: this safely adds tables
+  // after the application has been upgraded with a new feature.
   if (globalForDatabase.timetableDatabase) {
     initializeTables(globalForDatabase.timetableDatabase);
     return globalForDatabase.timetableDatabase;
   }
 
+  // Store development data inside the project, rather than in a temporary folder.
   const dataDirectory = path.join(process.cwd(), "data");
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(path.join(dataDirectory, "timetabling.db"));
@@ -72,6 +79,8 @@ function database() {
 }
 
 function initializeTables(db: DatabaseInstance) {
+  // CREATE ... IF NOT EXISTS makes this setup repeatable and safe on every start.
+  // The tables below are the part of the timetable model currently used by the UI.
   db.exec(`
     CREATE TABLE IF NOT EXISTS teachers (
       id TEXT PRIMARY KEY,
@@ -132,9 +141,12 @@ function initializeTables(db: DatabaseInstance) {
 }
 
 function seed(db: DatabaseInstance) {
+  // Sample records help a new installation show a usable screen before real data
+  // is imported. Once any teacher exists, never overwrite the user's database.
   const count = db.prepare("SELECT COUNT(*) AS count FROM teachers").get() as { count: number };
   if (count.count > 0) return;
 
+  // Prepare the repeated insert statements once, then add all sample data atomically.
   const createTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
   const createGroup = db.prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)");
   const createRoom = db.prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)");
@@ -155,10 +167,13 @@ function seed(db: DatabaseInstance) {
 }
 
 function activeStatus(isActive: number) {
+  // SQLite stores booleans as 0/1; the API exposes human-readable status text.
   return isActive ? "Active" : "Inactive";
 }
 
 export function listTeachers(): TeacherRecord[] {
+  // Count imported teaching allocations beside each teacher so the data screen
+  // immediately shows how many sections that teacher has been assigned.
   const rows = database().prepare(`
     SELECT teachers.id, teachers.name, teachers.staff_type, teachers.is_active,
       COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
@@ -171,17 +186,20 @@ export function listTeachers(): TeacherRecord[] {
 }
 
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
+  // UUIDs allow a record to be created locally without relying on a database counter.
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
   return { id, name, staffType, status: "Active", sections: 0 };
 }
 
 export function setTeacherStatus(id: string, isActive: boolean) {
+  // Deactivating preserves old timetable history while hiding a teacher from future work.
   const result = database().prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   return result.changes > 0;
 }
 
 export function listStudentGroups(): StudentGroupRecord[] {
+  // Order groups predictably for staff: year first, then programme, then class code.
   const rows = database().prepare("SELECT id, code, year, program FROM student_groups ORDER BY year ASC, program ASC, code ASC").all() as StudentGroupRecord[];
   return rows;
 }
@@ -193,6 +211,7 @@ export function createStudentGroup(code: string, year: number, program: string):
 }
 
 export function listRooms(): RoomRecord[] {
+  // Convert separate database flags into a short list that the table can display.
   const rows = database().prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom, is_active FROM rooms ORDER BY code ASC").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number }>;
   return rows.map((row) => ({
     id: row.id,
@@ -205,7 +224,9 @@ export function listRooms(): RoomRecord[] {
 
 export function createRoom(input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }): RoomRecord {
   const id = crypto.randomUUID();
+  // Room codes follow Block-Level-Room, so the first segment supports travel warnings later.
   const block = input.code.split("-")[0] || null;
+  // A Smart Classroom is always also a Multi Projector room in this department.
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
   database().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
   return { id, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
@@ -217,6 +238,8 @@ export function setRoomStatus(id: string, isActive: boolean) {
 }
 
 export function listCourses(): CourseRecord[] {
+  // Use separate subqueries so the section count and allocation total do not multiply
+  // each other when a course has several teachers and several generated sections.
   const rows = database().prepare(`
     SELECT courses.id, courses.code, courses.catalog,
       (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
@@ -229,6 +252,8 @@ export function listCourses(): CourseRecord[] {
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
   const db = database();
+  // Maps remove duplicates from the spreadsheet while preserving one record per
+  // teacher, course, and course-teacher allocation pair.
   const teachers = new Map<string, { name: string; staffType: "FT" | "PT" }>();
   const courses = new Map<string, { code: string; catalog: string | null }>();
   const allocations = new Map<string, TeachingMembersImportRow>();
@@ -236,12 +261,15 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   for (const row of rows) {
     teachers.set(row.lecturer, { name: row.lecturer, staffType: row.staffType });
     courses.set(row.mod, { code: row.mod, catalog: row.catalog });
+    // The null separator cannot occur in normal course codes or names, so it makes
+    // a safe composite key for repeated rows of the same allocation.
     const key = `${row.mod}\u0000${row.lecturer}`;
     const existing = allocations.get(key);
     allocations.set(key, existing ? { ...existing, groupCount: existing.groupCount + row.groupCount } : row);
   }
 
   const transaction = db.transaction(() => {
+    // Keep the import all-or-nothing: staff never see a half-imported allocation.
     const findTeacher = db.prepare("SELECT id FROM teachers WHERE name = ?");
     const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
     const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
@@ -252,6 +280,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
     const teacherIds = new Map<string, string>();
 
     for (const teacher of teachers.values()) {
+      // Reuse matching manual teachers, otherwise create a new one from the file.
       const existing = findTeacher.get(teacher.name) as { id: string } | undefined;
       const id = existing?.id ?? crypto.randomUUID();
       if (existing) updateTeacher.run(teacher.staffType, id);
@@ -259,6 +288,8 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       teacherIds.set(teacher.name, id);
     }
     for (const course of courses.values()) {
+      // Course setup fields are deliberately not replaced here; only the Excel catalog
+      // is refreshed, so future duration and room settings survive a re-import.
       const existing = findCourse.get(course.code) as { id: string } | undefined;
       const id = existing?.id ?? crypto.randomUUID();
       if (existing) updateCourse.run(course.catalog, id);
@@ -266,6 +297,8 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       courseIds.set(course.code, id);
     }
 
+    // The source file is the current teaching allocation, so rebuild its generated
+    // sections and allocations together. Course configuration remains untouched.
     db.prepare("DELETE FROM course_sections").run();
     db.prepare("DELETE FROM teaching_allocations").run();
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
@@ -276,6 +309,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       const teacherId = teacherIds.get(allocation.lecturer);
       if (!courseId || !teacherId) continue;
       insertAllocation.run(crypto.randomUUID(), courseId, teacherId, allocation.groupCount);
+      // Number sections continuously for each module: LEAD_01, LEAD_02, and so on.
       let sequence = sequenceByCourse.get(allocation.mod) ?? 0;
       for (let group = 0; group < allocation.groupCount; group += 1) {
         sequence += 1;
@@ -286,6 +320,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   });
   transaction();
 
+  // Return a compact audit summary for the upload confirmation message.
   return {
     courses: courses.size,
     teachers: teachers.size,
