@@ -31,6 +31,13 @@ export type CourseRecord = {
   id: string;
   code: string;
   catalog: string | null;
+  durationHours: number | null;
+  sessionsPerWeek: number;
+  primaryYear: number | null;
+  minimumRoomCapacity: number | null;
+  requiresLab: boolean;
+  requiresMultiProjector: boolean;
+  requiresSmartClassroom: boolean;
   allocatedSections: number;
   configuredSections: number;
 };
@@ -116,6 +123,7 @@ function initializeTables(db: DatabaseInstance) {
       catalog TEXT,
       duration_hours INTEGER,
       sessions_per_week INTEGER NOT NULL DEFAULT 1 CHECK (sessions_per_week > 0),
+      primary_year INTEGER CHECK (primary_year IN (1, 2, 3)),
       minimum_room_capacity INTEGER,
       requires_lab INTEGER NOT NULL DEFAULT 0,
       requires_multi_projector INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +146,13 @@ function initializeTables(db: DatabaseInstance) {
       UNIQUE(course_id, sequence)
     );
   `);
+
+  // SQLite cannot add a new column through CREATE TABLE after the table already
+  // exists. Check old local databases and upgrade this small prototype schema safely.
+  const courseColumns = db.prepare("PRAGMA table_info(courses)").all() as Array<{ name: string }>;
+  if (!courseColumns.some((column) => column.name === "primary_year")) {
+    db.exec("ALTER TABLE courses ADD COLUMN primary_year INTEGER CHECK (primary_year IN (1, 2, 3))");
+  }
 }
 
 function seed(db: DatabaseInstance) {
@@ -241,13 +256,39 @@ export function listCourses(): CourseRecord[] {
   // Use separate subqueries so the section count and allocation total do not multiply
   // each other when a course has several teachers and several generated sections.
   const rows = database().prepare(`
-    SELECT courses.id, courses.code, courses.catalog,
+    SELECT courses.id, courses.code, courses.catalog, courses.duration_hours, courses.sessions_per_week,
+      courses.primary_year, courses.minimum_room_capacity, courses.requires_lab,
+      courses.requires_multi_projector, courses.requires_smart_classroom,
       (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
       (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
     FROM courses
     ORDER BY courses.code ASC
-  `).all() as Array<{ id: string; code: string; catalog: string | null; configured_sections: number; allocated_sections: number }>;
-  return rows.map((row) => ({ id: row.id, code: row.code, catalog: row.catalog, allocatedSections: row.allocated_sections, configuredSections: row.configured_sections }));
+  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; configured_sections: number; allocated_sections: number }>;
+  return rows.map((row) => ({
+    id: row.id,
+    code: row.code,
+    catalog: row.catalog,
+    durationHours: row.duration_hours,
+    sessionsPerWeek: row.sessions_per_week,
+    primaryYear: row.primary_year,
+    minimumRoomCapacity: row.minimum_room_capacity,
+    requiresLab: Boolean(row.requires_lab),
+    requiresMultiProjector: Boolean(row.requires_multi_projector),
+    requiresSmartClassroom: Boolean(row.requires_smart_classroom),
+    allocatedSections: row.allocated_sections,
+    configuredSections: row.configured_sections,
+  }));
+}
+
+export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections">) {
+  // Course requirements apply to every generated section, so they are saved once
+  // on the course rather than duplicated 18 times for a course such as LEAD.
+  const result = database().prepare(`
+    UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
+      minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
+      requires_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, id);
+  return result.changes > 0;
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {

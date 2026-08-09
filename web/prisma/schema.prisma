@@ -74,6 +74,7 @@ model Course {
   code                   String   @unique
   durationHours          Int
   sessionsPerWeek        Int      @default(1)
+  primaryYear            Int?
   minimumRoomCapacity    Int?
   requiresLab            Boolean  @default(false)
   requiresMultiProjector Boolean  @default(false)
