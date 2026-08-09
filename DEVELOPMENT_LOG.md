@@ -649,3 +649,25 @@
 
 1. 增加实际教师班数与 Teaching Members 分配不一致提醒。
 2. 实现带自动备份和恢复能力的安全“新一轮排课”。
+
+## 2026-08-10｜Teaching Members 教师分配偏差提醒
+
+### 已完成
+
+- 系统按课程和教师比较 Teaching Members 的预期班数与当前课程班次的实际教师数量。
+- Courses 清单直接显示每门课程有多少项 allocation mismatch；打开 Sections 后列出具体教师的 expected / currently 数量。
+- 修改任一班次教师后，保存响应立即返回最新偏差并在页面状态栏提示；偏差只提醒、不阻止保存。
+- 实际使用未出现在 Excel 分配中的替代教师也会纳入偏差；没有 Teaching Members 基线的人工课程不会被误报。
+- 分配详情使用独立只读 API，保持现有 Sections API 格式稳定，便于以后单独刷新或扩展。
+
+### 本次验证
+
+- `npm run lint`、`npm run build` 与 `npx prisma validate` 通过。
+- LEAD 基线正确识别 4 项偏差，包括 WAN XIN expected 1 / currently 4，以及三位 expected 1 / currently 0 的教师。
+- 临时把 `LEAD_04` 从 ONG HOON JIN 改给 WAN XIN 后，保存响应立即变为 5 项偏差，且准确显示 ONG 1/0、WAN XIN 1/5。
+- 恢复 `LEAD_04` 后偏差回到原有 4 项；ONG HOON JIN 实际班数恢复为 1，WAN XIN 恢复为 4，临时管理员、会话和 cookie 已清除。
+
+### 下一步
+
+1. 实现带多次确认、自动备份和恢复能力的安全“新一轮排课”。
+2. 完成警告刷新一致性和全量 MVP 回归审计。

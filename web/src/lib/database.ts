@@ -43,6 +43,14 @@ export type CourseRecord = {
   weekPattern: "ALL" | "W1_4" | "W5_8";
   allocatedSections: number;
   configuredSections: number;
+  allocationVarianceCount: number;
+};
+
+export type AllocationVarianceRecord = {
+  teacherId: string;
+  teacherName: string;
+  expectedSections: number;
+  actualSections: number;
 };
 
 export type TeachingMembersImportRow = {
@@ -600,6 +608,7 @@ export function listCourses(): CourseRecord[] {
     weekPattern: row.week_pattern,
     allocatedSections: row.allocated_sections,
     configuredSections: row.configured_sections,
+    allocationVarianceCount: listCourseAllocationVariances(row.id).length,
   }));
 }
 
@@ -658,7 +667,7 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
   return resize();
 }
 
-export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections">) {
+export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections" | "allocationVarianceCount">) {
   // Course requirements apply to every generated section, so they are saved once
   // on the course rather than duplicated 18 times for a course such as LEAD.
   const db = database();
@@ -700,13 +709,36 @@ export function listCourseSections(courseId: string): CourseSectionRecord[] {
   return [...sections.values()];
 }
 
+export function listCourseAllocationVariances(courseId: string): AllocationVarianceRecord[] {
+  const db = database();
+  // Manual courses have no Teaching Members baseline, so their freely assigned
+  // teachers must not be reported as a mismatch against a non-existent allocation.
+  const hasAllocation = db.prepare("SELECT 1 FROM teaching_allocations WHERE course_id = ? LIMIT 1").get(courseId);
+  if (!hasAllocation) return [];
+
+  // Include both expected teachers and any substitute teacher currently assigned.
+  // Correlated counts keep the calculation readable and are inexpensive at this scale.
+  const rows = db.prepare(`
+    SELECT teachers.id, teachers.name,
+      COALESCE((SELECT assigned_group_count FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id), 0) AS expected_sections,
+      (SELECT COUNT(*) FROM course_sections sections WHERE sections.course_id = ? AND sections.teacher_id = teachers.id) AS actual_sections
+    FROM teachers
+    WHERE EXISTS (SELECT 1 FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id)
+       OR EXISTS (SELECT 1 FROM course_sections sections WHERE sections.course_id = ? AND sections.teacher_id = teachers.id)
+    ORDER BY teachers.name
+  `).all(courseId, courseId, courseId, courseId) as Array<{ id: string; name: string; expected_sections: number; actual_sections: number }>;
+  return rows
+    .filter((row) => row.expected_sections !== row.actual_sections)
+    .map((row) => ({ teacherId: row.id, teacherName: row.name, expectedSections: row.expected_sections, actualSections: row.actual_sections }));
+}
+
 export function updateCourseSection(id: string, teacherId: string | null, studentGroupIds: string[]) {
   const db = database();
   // Replacing the join records in one transaction makes an edited cross-level class
   // immediately consistent for future conflict checks.
   const transaction = db.transaction(() => {
-    const section = db.prepare("SELECT id FROM course_sections WHERE id = ?").get(id) as { id: string } | undefined;
-    if (!section) return false;
+    const section = db.prepare("SELECT id, course_id FROM course_sections WHERE id = ?").get(id) as { id: string; course_id: string } | undefined;
+    if (!section) return null;
     if (teacherId) {
       const teacher = db.prepare("SELECT id FROM teachers WHERE id = ? AND is_active = 1").get(teacherId);
       if (!teacher) throw new Error("Teacher not found");
@@ -715,7 +747,7 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
     db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(id);
     const addGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const groupId of [...new Set(studentGroupIds)]) addGroup.run(id, groupId);
-    return true;
+    return section.course_id;
   });
   return transaction();
 }

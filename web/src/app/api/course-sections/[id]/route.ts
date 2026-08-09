@@ -1,4 +1,4 @@
-import { updateCourseSection } from "@/lib/database";
+import { listCourseAllocationVariances, updateCourseSection } from "@/lib/database";
 
 // Section edits update local SQLite and therefore need the Node runtime.
 export const runtime = "nodejs";
@@ -11,8 +11,11 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     return Response.json({ error: "Teacher and student group selections are invalid." }, { status: 400 });
   }
   try {
-    if (!updateCourseSection(id, body.teacherId, body.studentGroupIds)) return Response.json({ error: "Section not found." }, { status: 404 });
-    return Response.json({ ok: true });
+    const courseId = updateCourseSection(id, body.teacherId, body.studentGroupIds);
+    if (!courseId) return Response.json({ error: "Section not found." }, { status: 404 });
+    // Resolve the parent after saving so the response can immediately tell staff
+    // whether this teacher change diverges from the imported allocation.
+    return Response.json({ ok: true, allocationVariances: listCourseAllocationVariances(courseId) });
   } catch {
     return Response.json({ error: "Choose an active teacher and valid student groups." }, { status: 400 });
   }

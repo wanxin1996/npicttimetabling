@@ -44,9 +44,11 @@ type Course = {
   weekPattern: "ALL" | "W1_4" | "W5_8";
   allocatedSections: number;
   configuredSections: number;
+  allocationVarianceCount: number;
 };
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
+type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[] };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
@@ -80,6 +82,7 @@ export default function Home() {
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
   const [sections, setSections] = useState<CourseSection[]>([]);
+  const [allocationVariances, setAllocationVariances] = useState<AllocationVariance[]>([]);
   const [timetableYear, setTimetableYear] = useState(1);
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
@@ -147,6 +150,7 @@ export default function Home() {
     setEditingCourse(null);
     setSelectedCourse(null);
     setSections([]);
+    setAllocationVariances([]);
   }
 
   async function openTimetable(year: number) {
@@ -604,10 +608,12 @@ export default function Home() {
   }
 
   async function openSections(course: Course) {
-    // Fetch sections only when requested so the page stays quick with a full department import.
-    const response = await fetch(`/api/courses/${course.id}/sections`);
-    if (!response.ok) return setNotice("Course sections could not be loaded.");
-    setSections(await response.json());
+    // Fetch detailed sections and their imported-allocation comparison only when
+    // requested, keeping the initial 52-course table compact and quick.
+    const [sectionsResponse, allocationResponse] = await Promise.all([fetch(`/api/courses/${course.id}/sections`), fetch(`/api/courses/${course.id}/allocation`)]);
+    if (!sectionsResponse.ok || !allocationResponse.ok) return setNotice("Course sections could not be loaded.");
+    setSections(await sectionsResponse.json());
+    setAllocationVariances(await allocationResponse.json());
     setSelectedCourse(course);
     setShowForm(false);
     setEditingCourse(null);
@@ -621,7 +627,8 @@ export default function Home() {
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "Section could not be saved.");
     if (selectedCourse) await openSections(selectedCourse);
-    setNotice(`${section.label} assignment saved.`);
+    const mismatchCount = (body.allocationVariances as AllocationVariance[]).length;
+    setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`);
   }
 
   // The primary button stays contextual so staff do not need to learn separate screens.
@@ -887,7 +894,7 @@ export default function Home() {
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
               {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => { setEditingRoom(room); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></div></td></tr>)}</tbody></table>}
-              {!isLoading && view === "Courses" && <table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Sections</th><th className="px-5 py-3 font-bold">Setup</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><Pill tone="blue">{course.configuredSections}</Pill></td><td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"}` : "Not configured"}</td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Sections</button><button onClick={() => { setEditingCourse(course); setShowForm(true); }} className="font-semibold text-blue-700 hover:text-blue-900" type="button">Configure</button></div></td></tr>)}</tbody></table>}
+              {!isLoading && view === "Courses" && <table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Mod</th><th className="px-5 py-3 font-bold">Catalog</th><th className="px-5 py-3 font-bold">Sections</th><th className="px-5 py-3 font-bold">Setup</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredCourses.map((course) => <tr className="border-t border-slate-100" key={course.id}><td className="px-5 py-4 font-semibold text-slate-800">{course.code}</td><td className="px-5 py-4 text-slate-600">{course.catalog ?? <span className="text-slate-400">—</span>}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-2"><Pill tone="blue">{course.configuredSections}</Pill>{course.allocationVarianceCount > 0 && <Pill tone="amber">{course.allocationVarianceCount} allocation mismatch{course.allocationVarianceCount === 1 ? "" : "es"}</Pill>}</div></td><td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"}` : "Not configured"}</td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Sections</button><button onClick={() => { setEditingCourse(course); setShowForm(true); }} className="font-semibold text-blue-700 hover:text-blue-900" type="button">Configure</button></div></td></tr>)}</tbody></table>}
             </div>
 
             {selectedCourse && (
@@ -895,7 +902,7 @@ export default function Home() {
               <div className="border-t border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                   <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
-                  <button onClick={() => { setSelectedCourse(null); setSections([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button>
+                  <button onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button>
                 </div>
                 {/* Count corrections keep lower-numbered sections stable. The server
                     refuses to remove any section that still contains scheduling work. */}
@@ -904,6 +911,7 @@ export default function Home() {
                   <button className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900" type="submit">Update count</button>
                   <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
                 </form>
+                {allocationVariances.length > 0 && <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-3"><p className="text-sm font-black text-amber-950">Teaching allocation differs from current teachers</p><p className="mt-1 text-xs text-amber-800">Saving is allowed. Review these counts against the imported Teaching Members file.</p><div className="mt-2 grid gap-1">{allocationVariances.map((variance) => <p key={variance.teacherId} className="text-xs font-semibold text-amber-900">{variance.teacherName}: expected {variance.expectedSections}, currently {variance.actualSections}</p>)}</div></div>}
                 <div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div>
               </div>
             )}
