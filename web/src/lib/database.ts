@@ -80,6 +80,8 @@ export type ScheduledLessonRecord = {
   durationHours: number;
   roomId: string | null;
   roomCode: string | null;
+  occurrence: number;
+  sessionsPerWeek: number;
   warnings: string[];
 };
 
@@ -89,6 +91,8 @@ export type UnscheduledSectionRecord = {
   teacherName: string | null;
   durationHours: number;
   studentGroups: string[];
+  occurrence: number;
+  sessionsPerWeek: number;
 };
 
 export type UnavailableWindowRecord = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
@@ -404,7 +408,11 @@ export function listCourses(): CourseRecord[] {
 export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections">) {
   // Course requirements apply to every generated section, so they are saved once
   // on the course rather than duplicated 18 times for a course such as LEAD.
-  const result = database().prepare(`
+  const db = database();
+  // Do not silently hide a second weekly meeting that staff have already scheduled.
+  const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
+  if (scheduledExtra) throw new Error("Return the extra weekly sessions to the tray before reducing sessions per week.");
+  const result = db.prepare(`
     UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
       minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
       requires_smart_classroom = ?, separate_sections_across_days = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
@@ -464,15 +472,16 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   const rows = database().prepare(`
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.id AS teacher_id, teachers.name AS teacher_name,
       lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
-      lessons.warnings_json, rooms.code AS room_code
+      lessons.warnings_json, lessons.occurrence, courses.sessions_per_week,
+      rooms.code AS room_code
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
-  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: JSON.parse(row.warnings_json) as string[] }));
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; sessions_per_week: number; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
 export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", ownerId: string): ScheduledLessonRecord[] {
@@ -486,7 +495,8 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", o
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence,
       teachers.id AS teacher_id, teachers.name AS teacher_name, lessons.day_of_week,
       lessons.start_hour, lessons.duration_hours, lessons.room_id,
-      lessons.warnings_json, rooms.code AS room_code
+      lessons.warnings_json, lessons.occurrence, courses.sessions_per_week,
+      rooms.code AS room_code
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
@@ -494,8 +504,8 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", o
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE ${ownerFilter}
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: JSON.parse(row.warnings_json) as string[] }));
+  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; sessions_per_week: number; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
@@ -503,21 +513,26 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   // missing setup remain visible in Courses, where staff can finish configuring them.
   const rows = database().prepare(`
     SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
+      courses.sessions_per_week, occurrences.occurrence,
       teachers.name AS teacher_name, student_groups.code AS group_code
     FROM course_sections sections
     JOIN courses ON courses.id = sections.course_id
+    JOIN (SELECT 1 AS occurrence UNION ALL SELECT 2) occurrences
+      ON occurrences.occurrence <= courses.sessions_per_week
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN section_student_groups links ON links.section_id = sections.id
     LEFT JOIN student_groups ON student_groups.id = links.student_group_id
     WHERE courses.primary_year = ? AND courses.duration_hours IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM scheduled_lessons WHERE scheduled_lessons.section_id = sections.id)
-    ORDER BY courses.code, sections.sequence, student_groups.code
-  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; teacher_name: string | null; group_code: string | null }>;
+      AND NOT EXISTS (SELECT 1 FROM scheduled_lessons WHERE scheduled_lessons.section_id = sections.id AND scheduled_lessons.occurrence = occurrences.occurrence)
+    ORDER BY courses.code, sections.sequence, occurrences.occurrence, student_groups.code
+  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; occurrence: number; teacher_name: string | null; group_code: string | null }>;
   const sections = new Map<string, UnscheduledSectionRecord>();
   for (const row of rows) {
-    const section = sections.get(row.id) ?? { id: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}`, teacherName: row.teacher_name, durationHours: row.duration_hours, studentGroups: [] };
+    // One section can contribute two draggable cards when it meets twice per week.
+    const occurrenceKey = `${row.id}:${row.occurrence}`;
+    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}`, teacherName: row.teacher_name, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
     if (row.group_code) section.studentGroups.push(row.group_code);
-    sections.set(row.id, section);
+    sections.set(occurrenceKey, section);
   }
   return [...sections.values()];
 }
@@ -562,7 +577,13 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   const warnings: string[] = [];
   const lessonId = input.lessonId ?? "";
   const endHour = input.startHour + input.durationHours;
-  const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.separate_sections_across_days FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; separate_sections_across_days: number };
+  const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.sessions_per_week, courses.separate_sections_across_days FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number };
+  if (courseRule.sessions_per_week > 1) {
+    // Separate weekly meetings of one class should not be placed on the same day,
+    // otherwise a nominally twice-weekly course becomes one long teaching day.
+    const sameSectionDay = db.prepare("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?").get(lessonId, input.sectionId, input.dayOfWeek);
+    if (sameSectionDay) warnings.push(`${courseRule.code} weekly sessions should be scheduled on different days`);
+  }
   if (courseRule.separate_sections_across_days) {
     const sameDay = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND sections.course_id = ? AND lessons.day_of_week = ?`).get(lessonId, courseRule.id, input.dayOfWeek);
     if (sameDay) warnings.push(`${courseRule.code} sections should not be scheduled on the same day`);
@@ -661,8 +682,9 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   // itself has not been opened in the editor again.
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
-      lessons.duration_hours, lessons.room_id, sections.teacher_id, sections.sequence,
-      courses.code, courses.primary_year, teachers.name AS teacher_name,
+      lessons.duration_hours, lessons.room_id, lessons.occurrence,
+      sections.teacher_id, sections.sequence, courses.code, courses.primary_year,
+      courses.sessions_per_week, teachers.name AS teacher_name,
       rooms.code AS room_code,
       (SELECT GROUP_CONCAT(groups.code, ', ')
         FROM section_student_groups links
@@ -675,7 +697,7 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year IS NOT NULL
     ORDER BY courses.primary_year, lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; teacher_id: string | null; sequence: number; code: string; primary_year: number; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
+  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; occurrence: number; teacher_id: string | null; sequence: number; code: string; primary_year: number; sessions_per_week: number; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
 
   const issues: ScheduleIssueRecord[] = [];
   const saveWarnings = db.prepare("UPDATE scheduled_lessons SET warnings_json = ? WHERE id = ?");
@@ -690,7 +712,7 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
         issues.push({
           id: `${row.id}:${index}`,
           lessonId: row.id,
-          sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`,
+          sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}`,
           primaryYear: row.primary_year,
           dayOfWeek: row.day_of_week,
           startHour: row.start_hour,
@@ -708,20 +730,22 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   return issues;
 }
 
-export function listCandidateSlots(sectionId: string): { sectionLabel: string; slots: CandidateSlotRecord[] } {
+export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
   const db = database();
   // Candidate search uses the section's saved teacher, student groups, duration and
   // course requirements. Incomplete sections therefore return no misleading options.
   const section = db.prepare(`
-    SELECT sections.id, sections.sequence, sections.teacher_id, courses.code, courses.duration_hours
+    SELECT sections.id, sections.sequence, sections.teacher_id, courses.code,
+      courses.duration_hours, courses.sessions_per_week
     FROM course_sections sections
     JOIN courses ON courses.id = sections.course_id
     WHERE sections.id = ?
-  `).get(sectionId) as { id: string; sequence: number; teacher_id: string | null; code: string; duration_hours: number | null } | undefined;
+  `).get(sectionId) as { id: string; sequence: number; teacher_id: string | null; code: string; duration_hours: number | null; sessions_per_week: number } | undefined;
   if (!section) throw new Error("Course section not found.");
   if (!section.duration_hours) throw new Error("Configure the course duration before finding candidate slots.");
-  const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ?").get(sectionId);
-  if (alreadyScheduled) throw new Error("Candidate slots are only available for unscheduled sections.");
+  if (!Number.isInteger(occurrence) || occurrence < 1 || occurrence > section.sessions_per_week) throw new Error("Choose a valid weekly session.");
+  const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? AND occurrence = ?").get(sectionId, occurrence);
+  if (alreadyScheduled) throw new Error("Candidate slots are only available for an unscheduled weekly session.");
 
   // Try every active room at every valid whole-hour placement. The existing warning
   // engine is the single source of truth, and only placements with zero messages pass.
@@ -746,25 +770,26 @@ export function listCandidateSlots(sectionId: string): { sectionLabel: string; s
       }
     }
   }
-  return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, slots };
+  return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${occurrence}` : ""}`, occurrence, sessionsPerWeek: section.sessions_per_week, slots };
 }
 
-export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
+export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
   const db = database();
-  const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
+  const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; teacher_id: string | null; teacher_name: string | null } | undefined;
   if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
+  if (!Number.isInteger(input.occurrence) || input.occurrence < 1 || input.occurrence > section.sessions_per_week) throw new Error("Choose a valid weekly session before placement.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new Error("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
   const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
   const id = crypto.randomUUID();
-  db.prepare("INSERT INTO scheduled_lessons (id, section_id, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, warnings: conflicts };
+  db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, warnings: conflicts };
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null }): ScheduledLessonRecord {
   const db = database();
   // The editor updates the section teacher and lesson placement together so the card
   // never briefly shows a teacher that differs from the conflict-check input.
-  const lesson = db.prepare(`SELECT lessons.section_id, courses.code, sections.sequence, courses.duration_hours FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; code: string; sequence: number; duration_hours: number } | undefined;
+  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number } | undefined;
   if (!lesson) throw new Error("Scheduled lesson not found.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
   const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
@@ -775,11 +800,12 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
     db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ? WHERE id = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id);
   })();
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, warnings };
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, warnings };
 }
 
 export function removeScheduledLesson(id: string) {
-  // Removing a lesson returns its section to the unscheduled tray through the normal query.
+  // Removing one lesson returns only that weekly session to the tray; the section's
+  // other occurrence remains scheduled when a course meets twice per week.
   return database().prepare("DELETE FROM scheduled_lessons WHERE id = ?").run(id).changes > 0;
 }
 

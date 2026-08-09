@@ -4,10 +4,11 @@ import { listCandidateSlots } from "@/lib/database";
 // teacher, student-group and room combinations are completely clear.
 export const runtime = "nodejs";
 
-export async function GET(_: Request, context: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
+  const occurrence = Number(new URL(request.url).searchParams.get("occurrence") ?? 1);
   try {
-    return Response.json(listCandidateSlots(id));
+    return Response.json(listCandidateSlots(id, occurrence));
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Candidate slots could not be calculated." }, { status: 400 });
   }

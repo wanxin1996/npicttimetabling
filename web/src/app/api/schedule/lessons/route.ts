@@ -13,6 +13,6 @@ export async function POST(request: Request) {
   // Warnings are returned with a successful save: the product requirement allows
   // staff to keep a difficult placement while making the issue visible immediately.
   const body = await request.json();
-  if (typeof body.sectionId !== "string" || !Number.isInteger(body.dayOfWeek) || !Number.isInteger(body.startHour) || !(body.roomId === null || typeof body.roomId === "string")) return Response.json({ error: "Section, day, start hour and room are invalid." }, { status: 400 });
+  if (typeof body.sectionId !== "string" || !Number.isInteger(body.occurrence) || !Number.isInteger(body.dayOfWeek) || !Number.isInteger(body.startHour) || !(body.roomId === null || typeof body.roomId === "string")) return Response.json({ error: "Section, weekly session, day, start hour and room are invalid." }, { status: 400 });
   try { return Response.json(placeScheduledLesson(body), { status: 201 }); } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Lesson could not be placed." }, { status: 400 }); }
 }

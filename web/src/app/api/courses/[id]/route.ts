@@ -13,14 +13,18 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   const primaryYear = body.primaryYear === null ? null : Number(body.primaryYear);
   const minimumRoomCapacity = body.minimumRoomCapacity === null ? null : Number(body.minimumRoomCapacity);
 
-  if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 1 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
+  if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 1 || durationHours > 4 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || sessionsPerWeek > 2 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
     return Response.json({ error: "Duration, weekly sessions, year and room capacity must use valid whole numbers." }, { status: 400 });
   }
   if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom, body.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) {
     return Response.json({ error: "Room requirements must be true or false." }, { status: 400 });
   }
 
-  const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays });
-  if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
-  return Response.json({ ok: true });
+  try {
+    const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays });
+    if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
+    return Response.json({ ok: true });
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "Course setup could not be saved." }, { status: 400 });
+  }
 }
