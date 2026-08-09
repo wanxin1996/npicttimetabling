@@ -1,11 +1,11 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type View = "Teachers" | "Student groups" | "Rooms";
 
 type Teacher = {
-  id: number;
+  id: string;
   name: string;
   staffType: "FT" | "PT";
   status: "Active" | "Inactive";
@@ -13,51 +13,19 @@ type Teacher = {
 };
 
 type StudentGroup = {
-  id: number;
+  id: string;
   code: string;
   year: number;
   program: string;
 };
 
 type Room = {
-  id: number;
+  id: string;
   code: string;
   capacity: number;
   features: string[];
   status: "Active" | "Inactive";
 };
-
-const initialTeachers: Teacher[] = [
-  { id: 1, name: "WAN XIN", staffType: "FT", status: "Active", sections: 1 },
-  {
-    id: 2,
-    name: "ANDREW TOH SZE CHOW",
-    staffType: "PT",
-    status: "Active",
-    sections: 3,
-  },
-  { id: 3, name: "LIEW YOON HIN", staffType: "FT", status: "Active", sections: 1 },
-  {
-    id: 4,
-    name: "SII-HARTONO ALICE",
-    staffType: "PT",
-    status: "Inactive",
-    sections: 1,
-  },
-];
-
-const initialGroups: StudentGroup[] = [
-  { id: 1, code: "AAA_01", year: 1, program: "AAA" },
-  { id: 2, code: "CICTP_02", year: 1, program: "CICTP" },
-  { id: 3, code: "CSF_03", year: 2, program: "CSF" },
-  { id: 4, code: "IT_01", year: 3, program: "IT" },
-];
-
-const initialRooms: Room[] = [
-  { id: 1, code: "31-05-10", capacity: 40, features: ["Smart classroom", "Multi projector"], status: "Active" },
-  { id: 2, code: "31-04-02", capacity: 24, features: ["Lab"], status: "Active" },
-  { id: 3, code: "27-03-08", capacity: 20, features: ["Multi projector"], status: "Active" },
-];
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   const tones = {
@@ -74,10 +42,11 @@ export default function Home() {
   const [view, setView] = useState<View>("Teachers");
   const [query, setQuery] = useState("");
   const [showForm, setShowForm] = useState(false);
-  const [teachers, setTeachers] = useState(initialTeachers);
-  const [groups, setGroups] = useState(initialGroups);
-  const [rooms, setRooms] = useState(initialRooms);
-  const [notice, setNotice] = useState("Demo data is stored in this browser session.");
+  const [teachers, setTeachers] = useState<Teacher[]>([]);
+  const [groups, setGroups] = useState<StudentGroup[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [notice, setNotice] = useState("Loading the local scheduling database...");
+  const [isLoading, setIsLoading] = useState(true);
 
   const filteredTeachers = useMemo(
     () => teachers.filter((teacher) => `${teacher.name} ${teacher.staffType}`.toLowerCase().includes(query.toLowerCase())),
@@ -98,42 +67,97 @@ export default function Home() {
     setShowForm(false);
   }
 
-  function toggleTeacher(id: number) {
-    setTeachers((current) => current.map((teacher) => (teacher.id === id ? { ...teacher, status: teacher.status === "Active" ? "Inactive" : "Active" } : teacher)));
-    setNotice("Teacher status updated. Database persistence will be connected in the next data-layer step.");
+  async function fetchData() {
+    const [teacherResponse, groupResponse, roomResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms")]);
+    if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok) throw new Error("Could not load data.");
+    return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>]);
   }
 
-  function toggleRoom(id: number) {
-    setRooms((current) => current.map((room) => (room.id === id ? { ...room, status: room.status === "Active" ? "Inactive" : "Active" } : room)));
-    setNotice("Room status updated. Database persistence will be connected in the next data-layer step.");
+  async function loadData() {
+    const [nextTeachers, nextGroups, nextRooms] = await fetchData();
+    setTeachers(nextTeachers);
+    setGroups(nextGroups);
+    setRooms(nextRooms);
   }
 
-  function addRecord(event: FormEvent<HTMLFormElement>) {
+  useEffect(() => {
+    void fetchData()
+      .then(([nextTeachers, nextGroups, nextRooms]) => {
+        setTeachers(nextTeachers);
+        setGroups(nextGroups);
+        setRooms(nextRooms);
+        setNotice("Local data is saved and ready for scheduling setup.");
+      })
+      .catch(() => setNotice("Unable to load the local scheduling database. Please refresh and try again."))
+      .finally(() => setIsLoading(false));
+  }, []);
+
+  async function toggleTeacher(teacher: Teacher) {
+    const isActive = teacher.status !== "Active";
+    const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+    if (!response.ok) return setNotice("Teacher status could not be updated.");
+    try {
+      await loadData();
+      setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}.`);
+    } catch {
+      setNotice("Teacher status changed but the latest data could not be loaded.");
+    }
+  }
+
+  async function toggleRoom(room: Room) {
+    const isActive = room.status !== "Active";
+    const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+    if (!response.ok) return setNotice("Room status could not be updated.");
+    try {
+      await loadData();
+      setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}.`);
+    } catch {
+      setNotice("Room status changed but the latest data could not be loaded.");
+    }
+  }
+
+  async function addRecord(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
+    let endpoint = "";
+    let payload: Record<string, unknown> = {};
 
     if (view === "Teachers") {
       const name = String(data.get("name") ?? "").trim().toUpperCase();
       if (!name) return;
-      setTeachers((current) => [...current, { id: Date.now(), name, staffType: String(data.get("staffType")) as "FT" | "PT", status: "Active", sections: 0 }]);
+      endpoint = "/api/teachers";
+      payload = { name, staffType: data.get("staffType") };
     }
 
     if (view === "Student groups") {
       const code = String(data.get("code") ?? "").trim().toUpperCase();
       if (!code) return;
-      setGroups((current) => [...current, { id: Date.now(), code, year: Number(data.get("year")), program: String(data.get("program")) }]);
+      endpoint = "/api/student-groups";
+      payload = { code, year: Number(data.get("year")), program: String(data.get("program") ?? "").trim().toUpperCase() };
     }
 
     if (view === "Rooms") {
       const code = String(data.get("room") ?? "").trim().toUpperCase();
       if (!code) return;
-      const features = [data.get("lab") ? "Lab" : "", data.get("projector") ? "Multi projector" : "", data.get("smart") ? "Smart classroom" : ""].filter(Boolean);
-      setRooms((current) => [...current, { id: Date.now(), code, capacity: Number(data.get("capacity")), features, status: "Active" }]);
+      endpoint = "/api/rooms";
+      payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
+    }
+
+    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (!response.ok) {
+      const body = await response.json();
+      setNotice(body.error ?? "This record could not be saved.");
+      return;
     }
 
     event.currentTarget.reset();
     setShowForm(false);
-    setNotice(`${view.slice(0, -1)} added to the current workspace.`);
+    try {
+      await loadData();
+      setNotice(`${view.slice(0, -1)} saved to the local database.`);
+    } catch {
+      setNotice("Record was saved but the latest data could not be loaded.");
+    }
   }
 
   const actionLabel = view === "Student groups" ? "Add student group" : `Add ${view.slice(0, -1).toLowerCase()}`;
@@ -214,13 +238,14 @@ export default function Home() {
             )}
 
             <div className="overflow-x-auto">
-              {view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher.id)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
-              {view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
-              {view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleRoom(room.id)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
+              {isLoading && <div className="p-8 text-sm text-slate-500">Loading data...</div>}
+              {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
+              {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td></tr>)}</tbody></table>}
+              {!isLoading && view === "Rooms" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Room</th><th className="px-5 py-3 font-bold">Capacity</th><th className="px-5 py-3 font-bold">Facilities</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredRooms.map((room) => <tr className="border-t border-slate-100" key={room.id}><td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td><td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td><td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td><td className="px-5 py-4 text-right"><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>)}</tbody></table>}
             </div>
           </div>
 
-          <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">Development note:</span> {notice}</p>
+          <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">System status:</span> {notice}</p>
         </section>
       </div>
     </main>

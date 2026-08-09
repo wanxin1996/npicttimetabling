@@ -4,7 +4,8 @@
 
 - 前端与服务层：Next.js App Router、React、TypeScript。
 - 样式：Tailwind CSS。
-- 数据访问：Prisma ORM。
+- 数据模型：Prisma ORM schema，用于维护可迁移的领域模型。
+- 本地开发数据访问：Node.js SQLite（`better-sqlite3`）及 Next.js Route Handlers。
 - 本地开发数据库：SQLite。
 - 生产数据库目标：PostgreSQL；切换时保留同一业务模型，通过 Prisma 迁移调整数据库提供方。
 
@@ -26,6 +27,14 @@
 - `npm run db:generate`：生成 Prisma Client。
 - `npm run db:check`：校验 Prisma schema，并从空数据库生成 SQLite 建表 SQL，用于验证模型、关系和索引。
 
+基础资料维护页面通过下列本地 API 持久化数据：
+
+- `GET`/`POST /api/teachers`、`PATCH /api/teachers/:id`
+- `GET`/`POST /api/student-groups`
+- `GET`/`POST /api/rooms`、`PATCH /api/rooms/:id`
+
+本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建，并插入最小示例资料；后续真实资料会保留在该文件中。
+
 ## 后续基础设施决策
 
-首版的多人实时协作、跨设备访问和正式账号认证需要线上 PostgreSQL 及实时服务。该线上环境尚未创建；在取得部署平台/数据库账号后，将把本地 SQLite 配置迁移至 PostgreSQL，并接入认证与实时同步。
+首版的多人实时协作、跨设备访问和正式账号认证需要线上 PostgreSQL 及实时服务。该线上环境尚未创建；在取得部署平台/数据库账号后，将把当前本地 SQLite 数据访问层迁移至 PostgreSQL，并接入认证与实时同步。
