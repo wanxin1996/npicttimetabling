@@ -948,3 +948,26 @@
 
 1. 由项目负责人确认 Railway + SQLite（推荐）或直接 PostgreSQL。
 2. 选择 Railway 后补充 standalone 配置、持久卷路径说明与部署后恢复验收。
+
+## 2026-08-10｜自包含 standalone 生产构建
+
+### 已完成
+
+- 启用 Next.js `output: standalone`，生成可由长期运行 Node 托管平台直接启动的自包含服务器。
+- 新增 `scripts/prepare-standalone.mjs`；生产构建后自动复制 `public/` 与 `.next/static/`，避免只部署 standalone 服务器时丢失图片、CSS 或浏览器脚本。
+- 新增 `npm run start:standalone`，保留原 `npm start` 供现有本机检查使用；托管环境可通过 `PORT`、`HOSTNAME` 和 `TIMETABLING_DATABASE_PATH` 注入运行配置。
+- 脚本对不存在的 public 目录安全跳过，并只忽略明确的 `ENOENT`；其他文件系统错误会中止构建，避免生成看似成功但不完整的部署包。
+- 更新架构与部署决策文档，记录 standalone 产物的构建和启动方式。
+
+### 本次验证
+
+- `npm run lint`、启用资源复制后的 `npm run build` 与 `npx prisma validate` 全部通过。
+- 构建产物包含 `server.js`、`better-sqlite3` 的 macOS/Linux 原生模块、`public/window.svg` 和 `.next/static`。
+- 用独立空数据库真实启动 `npm run start:standalone`：健康检查、首页、public SVG 和编译 CSS 均返回 HTTP 200。
+- 同一 standalone 实例未登录访问教师 API 返回 HTTP 401；教师、教室和账号数量均为 0，`foreign_key_check` 为 0。
+- 隔离服务器、数据库与响应文件已删除；正式本机数据库未被测试触碰。
+
+### 下一步
+
+1. 由项目负责人确认 Railway + SQLite（推荐）或直接 PostgreSQL。
+2. 确认 Railway 后增加平台配置清单并执行真实持久卷备份恢复验收。

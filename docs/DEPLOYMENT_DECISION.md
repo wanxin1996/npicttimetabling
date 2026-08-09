@@ -24,7 +24,7 @@
 
 ### 需要完成的开发工作
 
-1. 为 Next.js 增加 standalone 生产构建；不泄露业务数据的只读健康检查接口已经完成。
+1. Next.js standalone 生产构建和不泄露业务数据的只读健康检查接口均已完成。
 2. 在 Railway 把仓库根目录设为 `web/`，连接当前 GitHub 分支或合并后的主分支。
 3. 为应用挂载 `/data` 持久卷，并设置 `TIMETABLING_DATABASE_PATH=/data/timetabling.db`。
 4. 首次部署后导入 Teaching Members，并通过界面建立管理员账号；不把本机测试账号写进代码或镜像。

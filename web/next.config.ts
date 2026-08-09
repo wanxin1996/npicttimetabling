@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Produce a self-contained Node server for long-running hosts such as Railway.
+  // The post-build script below adds public and compiled static assets to the bundle.
+  output: "standalone",
   serverExternalPackages: ["better-sqlite3"],
   experimental: {
     // The provided Teaching Members workbook is about 16 MB. Authentication runs

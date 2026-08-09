@@ -27,6 +27,7 @@
 
 - `npm run lint`：检查代码风格。
 - `npm run build`：生产构建（使用 Webpack 兼容模式）。
+- `npm run start:standalone`：启动构建后的自包含生产服务器；`PORT`、`HOSTNAME` 与 `TIMETABLING_DATABASE_PATH` 可由托管平台注入。
 - `npm run db:generate`：生成 Prisma Client。
 - `npm run db:check`：校验 Prisma schema，并从空数据库生成 SQLite 建表 SQL，用于验证模型、关系和索引。
 
@@ -48,6 +49,8 @@
 - `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；所有有效行维护教师清单，只有正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
 本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建；只有开发模式会插入最小示例资料，生产模式始终以空资料开始，避免真实系统混入演示教师、班级或教室。后续真实资料会保留在该文件中。
+
+生产构建启用 Next.js standalone 输出。构建完成后，`scripts/prepare-standalone.mjs` 会把 `public/` 和 `.next/static/` 复制到自包含目录，避免部署后出现页面有 HTML 但缺少图标、CSS 或浏览器脚本的问题。
 
 ## 后续基础设施决策
 
