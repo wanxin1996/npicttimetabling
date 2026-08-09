@@ -496,6 +496,16 @@ export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherReco
   return { id, name, staffType, status: "Active", sections: 0 };
 }
 
+export function updateTeacher(id: string, input: { name: string; staffType: "FT" | "PT" }) {
+  // Editing the existing row preserves every allocation, unavailable window and
+  // scheduled lesson that already refers to this teacher's stable id.
+  const result = database().prepare(`
+    UPDATE teachers SET name = ?, staff_type = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(input.name, input.staffType, id);
+  return result.changes > 0;
+}
+
 export function setTeacherStatus(id: string, isActive: boolean) {
   // Deactivating preserves old timetable history while hiding a teacher from future work.
   const result = database().prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
@@ -512,6 +522,20 @@ export function createStudentGroup(code: string, year: number, program: string):
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
   return { id, code, year, program };
+}
+
+export function updateStudentGroup(id: string, input: { code: string; year: number; program: string }) {
+  // Keep the original group id so all section assignments survive a spelling,
+  // programme or year correction made by the scheduling team.
+  const db = database();
+  const result = db.prepare(`
+    UPDATE student_groups SET code = ?, year = ?, program = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(input.code, input.year, input.program, id);
+  // Group labels appear inside conflict warnings, so refresh saved warnings as
+  // soon as a linked group's details change.
+  if (result.changes > 0) refreshAllScheduleWarnings(db);
+  return result.changes > 0;
 }
 
 export function listRooms(): RoomRecord[] {
