@@ -35,17 +35,18 @@
 
 - 已将 `origin` 配置为 `https://github.com/wanxin1996/npicttimetabling.git`。
 - 已完成远程仓库的只读连接检查；当前远程没有分支。
+- 已将本地开发分支首次推送至 GitHub。
 
 ### 当前状态
 
 - 本地开发分支：`codex/timetabling-mvp`。
-- 当前提交尚未推送到远程；本次日志提交后将首次推送该分支。
+- 本地分支已跟踪 `origin/codex/timetabling-mvp`。
 
 ### 本次验证
 
 - `git ls-remote --heads origin` 成功完成且未返回远程分支。
+- `git push -u origin codex/timetabling-mvp` 成功完成。
 
 ### 下一步
 
-1. 推送当前开发分支与已有提交到 GitHub。
-2. 评估技术栈并初始化应用工程。
+1. 评估技术栈并初始化应用工程。
