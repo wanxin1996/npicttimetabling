@@ -48,7 +48,7 @@ type Course = {
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[] };
-type UnscheduledSection = { id: string; label: string; teacherName: string | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
+type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
@@ -83,6 +83,10 @@ export default function Home() {
   const [timetableYear, setTimetableYear] = useState(1);
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
+  const [unscheduledQuery, setUnscheduledQuery] = useState("");
+  const [unscheduledStaffType, setUnscheduledStaffType] = useState<"All" | "FT" | "PT">("All");
+  const [unscheduledGroupId, setUnscheduledGroupId] = useState("");
+  const [unscheduledProgram, setUnscheduledProgram] = useState("");
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [scheduleIssues, setScheduleIssues] = useState<ScheduleIssue[]>([]);
@@ -118,6 +122,21 @@ export default function Home() {
     () => courses.filter((course) => `${course.code} ${course.catalog ?? ""}`.toLowerCase().includes(query.toLowerCase())),
     [courses, query],
   );
+  const unscheduledPrograms = useMemo(() => [...new Set(groups.map((group) => group.program))].sort(), [groups]);
+  const filteredUnscheduledSections = useMemo(() => {
+    // Search enriches each tray card with its student programmes, while dropdowns
+    // provide exact filters for the most common allocation-workflow questions.
+    const normalizedQuery = unscheduledQuery.trim().toLowerCase();
+    const selectedGroupCode = groups.find((group) => group.id === unscheduledGroupId)?.code;
+    return unscheduledSections.filter((section) => {
+      const sectionGroups = groups.filter((group) => section.studentGroups.includes(group.code));
+      const searchableText = [section.label, section.teacherName ?? "", section.staffType ?? "", ...section.studentGroups, ...sectionGroups.map((group) => group.program)].join(" ").toLowerCase();
+      return (!normalizedQuery || searchableText.includes(normalizedQuery))
+        && (unscheduledStaffType === "All" || section.staffType === unscheduledStaffType)
+        && (!selectedGroupCode || section.studentGroups.includes(selectedGroupCode))
+        && (!unscheduledProgram || sectionGroups.some((group) => group.program === unscheduledProgram));
+    });
+  }, [groups, unscheduledGroupId, unscheduledProgram, unscheduledQuery, unscheduledSections, unscheduledStaffType]);
 
   function openView(nextView: View) {
     // Moving between tables clears controls that belong only to the previous table.
@@ -724,18 +743,26 @@ export default function Home() {
               <aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
                 <div className="mb-3">
                   <p className="font-bold text-slate-950">Unscheduled sessions</p>
-                  <p className="text-xs text-slate-500">{unscheduledSections.length} ready to place</p>
+                  <p className="text-xs text-slate-500">{filteredUnscheduledSections.length} of {unscheduledSections.length} ready to place</p>
+                </div>
+                {/* Tray filters run locally over the current year response, so hundreds
+                    of sections can be narrowed instantly without extra API requests. */}
+                <div className="mb-3 grid gap-2 rounded-xl bg-slate-50 p-2">
+                  <input value={unscheduledQuery} onChange={(event) => setUnscheduledQuery(event.target.value)} placeholder="Course or teacher..." className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs" />
+                  <div className="grid grid-cols-2 gap-2"><select value={unscheduledStaffType} onChange={(event) => setUnscheduledStaffType(event.target.value as "All" | "FT" | "PT")} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="All">FT + PT</option><option value="PT">PT priority</option><option value="FT">FT only</option></select><select value={unscheduledProgram} onChange={(event) => setUnscheduledProgram(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="">All programmes</option>{unscheduledPrograms.map((program) => <option key={program} value={program}>{program}</option>)}</select></div>
+                  <select value={unscheduledGroupId} onChange={(event) => setUnscheduledGroupId(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="">All student groups</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.code} · {group.program}</option>)}</select>
+                  {(unscheduledQuery || unscheduledStaffType !== "All" || unscheduledGroupId || unscheduledProgram) && <button onClick={() => { setUnscheduledQuery(""); setUnscheduledStaffType("All"); setUnscheduledGroupId(""); setUnscheduledProgram(""); }} className="text-left text-xs font-bold text-blue-700" type="button">Clear filters</button>}
                 </div>
                 <div className="grid max-h-[650px] gap-2 overflow-y-auto">
-                  {unscheduledSections.map((section) => (
-                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className="cursor-grab rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950 active:cursor-grabbing">
-                      <p className="font-black">{section.label}</p>
+                  {filteredUnscheduledSections.map((section) => (
+                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className={`cursor-grab rounded-xl border p-3 text-xs active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
+                      <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
-                      <p className="mt-1 text-blue-700">{section.studentGroups.join(", ") || "Student group pending"}</p>
+                      <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
                       <button draggable={false} onClick={(event) => { event.stopPropagation(); void findCandidateSlots(section); }} className="mt-2 rounded-lg border border-blue-200 bg-white px-2 py-1 font-bold text-blue-800 hover:border-blue-400" type="button">Find clear options</button>
                     </div>
                   ))}
-                  {unscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No configured sessions waiting for this year.</p>}
+                  {filteredUnscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">{unscheduledSections.length === 0 ? "No configured sessions waiting for this year." : "No sessions match these filters."}</p>}
                 </div>
               </aside>
 

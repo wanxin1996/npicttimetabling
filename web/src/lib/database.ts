@@ -92,6 +92,7 @@ export type UnscheduledSectionRecord = {
   id: string;
   label: string;
   teacherName: string | null;
+  staffType: "FT" | "PT" | null;
   durationHours: number;
   studentGroups: string[];
   occurrence: number;
@@ -769,7 +770,7 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   const rows = database().prepare(`
     SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
       courses.sessions_per_week, courses.week_pattern, occurrences.occurrence,
-      teachers.name AS teacher_name, student_groups.code AS group_code
+      teachers.name AS teacher_name, teachers.staff_type, student_groups.code AS group_code
     FROM course_sections sections
     JOIN courses ON courses.id = sections.course_id
     JOIN (SELECT 1 AS occurrence UNION ALL SELECT 2) occurrences
@@ -779,13 +780,14 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
     LEFT JOIN student_groups ON student_groups.id = links.student_group_id
     WHERE courses.primary_year = ? AND courses.duration_hours IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM scheduled_lessons WHERE scheduled_lessons.section_id = sections.id AND scheduled_lessons.occurrence = occurrences.occurrence)
-    ORDER BY courses.code, sections.sequence, occurrences.occurrence, student_groups.code
-  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; occurrence: number; teacher_name: string | null; group_code: string | null }>;
+    ORDER BY CASE WHEN teachers.staff_type = 'PT' THEN 0 ELSE 1 END,
+      courses.code, sections.sequence, occurrences.occurrence, student_groups.code
+  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; occurrence: number; teacher_name: string | null; staff_type: "FT" | "PT" | null; group_code: string | null }>;
   const sections = new Map<string, UnscheduledSectionRecord>();
   for (const row of rows) {
     // One section can contribute two draggable cards when it meets twice per week.
     const occurrenceKey = `${row.id}:${row.occurrence}`;
-    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, teacherName: row.teacher_name, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
+    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, teacherName: row.teacher_name, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
     if (row.group_code) section.studentGroups.push(row.group_code);
     sections.set(occurrenceKey, section);
   }
