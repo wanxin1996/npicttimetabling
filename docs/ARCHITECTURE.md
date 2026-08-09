@@ -4,10 +4,12 @@
 
 - 前端与服务层：Next.js App Router、React、TypeScript。
 - 样式：Tailwind CSS。
-- 数据模型：Prisma ORM schema，用于维护可迁移的领域模型。
+- 数据模型：Prisma ORM schema，与当前 SQLite 的真实表名、字段、关系和删除策略保持一致，用作后续迁移来源。
 - 本地开发数据访问：Node.js SQLite（`better-sqlite3`）及 Next.js Route Handlers。
 - 本地开发数据库：SQLite。
 - 生产数据库目标：PostgreSQL；切换时保留同一业务模型，通过 Prisma 迁移调整数据库提供方。
+
+当前业务读写仍集中在 `src/lib/database.ts` 的同步 SQLite 查询中；Prisma Client 尚未接管 API 数据访问。迁移 PostgreSQL 时必须把这些查询改为异步数据访问，不能只修改 datasource provider。
 
 ## 数据模型要点
 

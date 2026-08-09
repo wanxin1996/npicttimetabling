@@ -5,132 +5,136 @@ generator client {
 }
 
 datasource db {
-  // The local prototype uses SQLite; the domain model remains portable to PostgreSQL later.
+  // The running local application uses SQLite. Field and table mappings below mirror
+  // its real snake_case schema so this file can become a trustworthy migration source.
   provider = "sqlite"
 }
 
 model AppUser {
   // The first account is administrator; later scheduler accounts share timetable access.
-  id           String   @id @default(cuid())
+  id           String   @id @default(uuid())
   username     String   @unique
-  passwordHash String
-  isAdmin      Boolean  @default(false)
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  passwordHash String   @map("password_hash")
+  isAdmin      Boolean  @default(false) @map("is_admin")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
 
   sessions AuthSession[]
+
+  @@map("app_users")
 }
 
 model AuthSession {
   // Only a digest of the random cookie token is stored; sessions expire after 12 hours.
-  tokenHash String   @id
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-  userId    String
+  tokenHash String   @id @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  userId    String   @map("user_id")
   user      AppUser  @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, expiresAt])
+  @@map("auth_sessions")
 }
 
 model Teacher {
   // A teacher can be linked to imported allocations, generated course sections and blocked periods.
-  id        String   @id @default(cuid())
+  id        String   @id @default(uuid())
   name      String   @unique
-  staffType String   @default("FT")
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  staffType String   @default("FT") @map("staff_type")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   allocations TeachingAllocation[]
   sections    CourseSection[]
   unavailable TeacherUnavailableWindow[]
 
   @@index([staffType, isActive])
+  @@map("teachers")
 }
 
 model StudentGroup {
   // A student group is one class whose timetable must never overlap with itself.
-  id        String   @id @default(cuid())
+  id        String   @id @default(uuid())
   code      String   @unique
   year      Int
   program   String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   sections SectionStudentGroup[]
 
   @@index([year, program])
+  @@map("student_groups")
 }
 
 model Room {
   // Room facilities support requirement matching and the block supports travel warnings.
-  id                String   @id @default(cuid())
+  id                String   @id @default(uuid())
   code              String   @unique
   block             String?
   capacity          Int
-  hasMultiProjector Boolean  @default(false)
-  isLab             Boolean  @default(false)
-  isSmartClassroom  Boolean  @default(false)
-  isActive          Boolean  @default(true)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  hasMultiProjector Boolean  @default(false) @map("has_multi_projector")
+  isLab             Boolean  @default(false) @map("is_lab")
+  isSmartClassroom  Boolean  @default(false) @map("is_smart_classroom")
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   lessons ScheduledLesson[]
 
   @@index([block, isActive])
+  @@map("rooms")
 }
 
 model Course {
   // A course defines shared teaching requirements; individual sections are created underneath it.
-  id                     String   @id @default(cuid())
-  code                   String   @unique
-  durationHours          Int
-  sessionsPerWeek        Int      @default(1)
-  primaryYear            Int?
-  minimumRoomCapacity    Int?
-  requiresLab            Boolean  @default(false)
-  requiresMultiProjector Boolean  @default(false)
-  requiresSmartClassroom Boolean  @default(false)
-  separateSectionsAcrossDays Boolean @default(false)
+  id                         String   @id @default(uuid())
+  code                       String   @unique
+  catalog                    String?
+  durationHours              Int?     @map("duration_hours")
+  sessionsPerWeek            Int      @default(1) @map("sessions_per_week")
+  primaryYear                Int?     @map("primary_year")
+  minimumRoomCapacity        Int?     @map("minimum_room_capacity")
+  requiresLab                Boolean  @default(false) @map("requires_lab")
+  requiresMultiProjector     Boolean  @default(false) @map("requires_multi_projector")
+  requiresSmartClassroom     Boolean  @default(false) @map("requires_smart_classroom")
+  separateSectionsAcrossDays Boolean  @default(false) @map("separate_sections_across_days")
   // Legacy quick-pattern value retained for compatibility with older local backups.
-  weekPattern            String   @default("ALL")
+  weekPattern                String   @default("ALL") @map("week_pattern")
   // Null/null means all weeks; otherwise both positive bounds define the interval.
-  weekStart              Int?
-  weekEnd                Int?
-  createdAt              DateTime @default(now())
-  updatedAt              DateTime @updatedAt
+  weekStart                  Int?     @map("week_start")
+  weekEnd                    Int?     @map("week_end")
+  createdAt                  DateTime @default(now()) @map("created_at")
+  updatedAt                  DateTime @default(now()) @updatedAt @map("updated_at")
 
   allocations TeachingAllocation[]
   sections    CourseSection[]
+
+  @@map("courses")
 }
 
 model TeachingAllocation {
   // This records how many sections of one course a specific teacher is expected to teach.
-  id                 String   @id @default(cuid())
-  catalog            String?
-  assignedGroupCount Int
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id                 String @id @default(uuid())
+  assignedGroupCount Int    @map("assigned_group_count")
 
-  courseId  String
-  teacherId String
+  courseId  String  @map("course_id")
+  teacherId String  @map("teacher_id")
   course    Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
-  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Restrict)
 
   @@unique([courseId, teacherId])
+  @@map("teaching_allocations")
 }
 
 model CourseSection {
   // A section is the draggable unit, for example LEAD_01, with one assigned teacher.
-  id          String   @id @default(cuid())
-  sequence    Int
-  primaryYear Int?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id       String @id @default(uuid())
+  sequence Int
 
-  courseId  String
-  teacherId String?
+  courseId  String   @map("course_id")
+  teacherId String?  @map("teacher_id")
   course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
   teacher   Teacher? @relation(fields: [teacherId], references: [id], onDelete: SetNull)
 
@@ -138,85 +142,83 @@ model CourseSection {
   lessons       ScheduledLesson[]
 
   @@unique([courseId, sequence])
-  @@index([primaryYear])
   @@index([teacherId])
+  @@map("course_sections")
 }
 
 model SectionStudentGroup {
   // This join table supports both normal and cross-year classes in the same section.
-  sectionId      String
-  studentGroupId String
+  sectionId      String @map("section_id")
+  studentGroupId String @map("student_group_id")
 
   section      CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
   studentGroup StudentGroup  @relation(fields: [studentGroupId], references: [id], onDelete: Cascade)
 
   @@id([sectionId, studentGroupId])
   @@index([studentGroupId])
+  @@map("section_student_groups")
 }
 
 model ScheduledLesson {
   // One section can meet multiple times each week and can use a different room per meeting.
-  id            String   @id @default(cuid())
-  occurrence    Int
-  dayOfWeek     Int?
-  startHour     Int?
-  durationHours Int
-  revision      Int      @default(1)
-  weekStart     Int?
-  weekEnd       Int?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id            String @id @default(uuid())
+  occurrence    Int    @default(1)
+  dayOfWeek     Int    @map("day_of_week")
+  startHour     Int    @map("start_hour")
+  durationHours Int    @map("duration_hours")
+  revision      Int    @default(1)
+  warningsJson  String @default("[]") @map("warnings_json")
 
-  sectionId String
-  roomId    String?
+  sectionId String        @map("section_id")
+  roomId    String?       @map("room_id")
   section   CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
   room      Room?         @relation(fields: [roomId], references: [id], onDelete: SetNull)
 
   @@unique([sectionId, occurrence])
   @@index([roomId, dayOfWeek, startHour])
   @@index([dayOfWeek, startHour])
+  @@map("scheduled_lessons")
 }
 
 model TeacherUnavailableWindow {
   // A hard unavailable window is checked whenever a lesson is placed for this teacher.
-  id        String   @id @default(cuid())
-  dayOfWeek Int
-  startHour Int
-  endHour   Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id        String @id @default(uuid())
+  dayOfWeek Int    @map("day_of_week")
+  startHour Int    @map("start_hour")
+  endHour   Int    @map("end_hour")
 
-  teacherId String
+  teacherId String  @map("teacher_id")
   teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
 
   @@index([teacherId, dayOfWeek])
+  @@map("teacher_unavailable_windows")
 }
 
 model YearBlockedWindow {
   // A year-level blocked window captures rules such as a Wednesday without classes.
-  id        String   @id @default(cuid())
+  id        String @id @default(uuid())
   year      Int
-  dayOfWeek Int
-  startHour Int
-  endHour   Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  dayOfWeek Int    @map("day_of_week")
+  startHour Int    @map("start_hour")
+  endHour   Int    @map("end_hour")
 
   @@index([year, dayOfWeek])
+  @@map("year_blocked_windows")
 }
 
 model RuleSetting {
   // Feature flags let future rule changes be enabled or disabled without deleting data.
-  id        String   @id @default(cuid())
-  key       String   @unique
-  isEnabled Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  key       String  @id @map("rule_key")
+  isEnabled Boolean @default(true) @map("is_enabled")
+
+  @@map("rule_settings")
 }
 
 model ScheduleBackup {
   // A serialized snapshot is kept before a new scheduling cycle replaces the old one.
-  id           String   @id @default(cuid())
-  snapshotJson String
-  createdAt    DateTime @default(now())
+  id           String   @id @default(uuid())
+  snapshotJson String   @map("snapshot_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@map("schedule_backups")
 }

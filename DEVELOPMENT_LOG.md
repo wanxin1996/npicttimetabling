@@ -880,3 +880,26 @@
 
 1. 由项目负责人选择公网托管与生产 PostgreSQL 方案。
 2. 完成数据访问层迁移，并在共享环境执行双账号、跨浏览器协作验收。
+
+## 2026-08-10｜部署前 Prisma 数据模型对齐
+
+### 已完成
+
+- 对照 `database.ts` 中实际运行的 SQLite 建表语句，审计早期 Prisma 规划稿与真实数据库的偏差。
+- 为全部模型补齐 snake_case 表名与字段映射，使生成的迁移使用现有的 `app_users`、`course_sections`、`scheduled_lessons` 等真实名称。
+- 把 Catalog 归回 Course，把课程时长改为可空以支持“导入后待配置”，并移除 CourseSection 上已经废弃的主年级字段。
+- ScheduledLesson 改为真实的必填日期/时间字段，补回 `warnings_json`，并移除实际保存在 Course 上的教学周字段。
+- TeachingAllocation、禁排、规则和应急备份模型删除实际表中不存在的时间戳或多余字段，并对齐外键删除策略。
+- 更新技术架构说明，明确当前 API 仍使用同步 SQLite 查询；未来 PostgreSQL 迁移需要改写数据访问层，不能只切换 Prisma provider。
+
+### 本次验证
+
+- `npx prisma format`、`npx prisma validate`、`prisma generate` 与 `npm run db:check` 全部通过。
+- 从空数据库生成的迁移 SQL 使用真实表名与字段名，包括 `duration_hours`、`warnings_json`、`week_start` 和 `week_end`。
+- `npm run lint` 与 `npm run build` 通过，全部页面和 28 个 API Route Handler 正常生成。
+- 此调整只修正迁移模型，不改变当前 SQLite 运行时或正式本机数据。
+
+### 下一步
+
+1. 根据当前系统规模比较“单实例 + SQLite 持久卷”和“托管 PostgreSQL”两条公网部署路线。
+2. 由项目负责人确认路线后，补齐部署配置、备份和共享环境验收。
