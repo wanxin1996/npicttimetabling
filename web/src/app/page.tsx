@@ -47,7 +47,7 @@ type Course = {
 };
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
-type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; warnings: string[] };
+type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[] };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
@@ -177,7 +177,7 @@ export default function Home() {
     if (lessonId) {
       const lesson = lessons.find((item) => item.id === lessonId);
       if (!lesson) return;
-      const response = await fetch(`/api/schedule/lessons/${lessonId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek, startHour, roomId: lesson.roomId, teacherId: lesson.teacherId }) });
+      const response = await fetch(`/api/schedule/lessons/${lessonId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek, startHour, roomId: lesson.roomId, teacherId: lesson.teacherId, revision: lesson.revision }) });
       const body = await response.json();
       if (!response.ok) return setNotice(body.error ?? "The lesson could not be moved.");
       setEditingLesson(null);
@@ -229,7 +229,7 @@ export default function Home() {
     event.preventDefault();
     if (!editingLesson) return;
     const data = new FormData(event.currentTarget);
-    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), teacherId: String(data.get("teacherId") ?? "") || null, roomId: String(data.get("roomId") ?? "") || null }) });
+    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), teacherId: String(data.get("teacherId") ?? "") || null, roomId: String(data.get("roomId") ?? "") || null, revision: editingLesson.revision }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "The lesson could not be updated.");
     setEditingLesson(null);
@@ -240,7 +240,7 @@ export default function Home() {
   async function unscheduleLesson() {
     // Unscheduling returns the section to the tray instead of deleting its course data.
     if (!editingLesson) return;
-    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "DELETE" });
+    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}?revision=${editingLesson.revision}`, { method: "DELETE" });
     if (!response.ok) return setNotice("The lesson could not be returned to the tray.");
     const label = editingLesson.sectionLabel;
     setEditingLesson(null);

@@ -158,6 +158,7 @@ model ScheduledLesson {
   dayOfWeek     Int?
   startHour     Int?
   durationHours Int
+  revision      Int      @default(1)
   weekStart     Int?
   weekEnd       Int?
   createdAt     DateTime @default(now())

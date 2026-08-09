@@ -84,6 +84,7 @@ export type ScheduledLessonRecord = {
   roomCode: string | null;
   occurrence: number;
   sessionsPerWeek: number;
+  revision: number;
   warnings: string[];
 };
 
@@ -243,6 +244,7 @@ function initializeTables(db: DatabaseInstance) {
       duration_hours INTEGER NOT NULL CHECK (duration_hours BETWEEN 1 AND 4),
       room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
       warnings_json TEXT NOT NULL DEFAULT '[]',
+      revision INTEGER NOT NULL DEFAULT 1,
       UNIQUE(section_id, occurrence)
     );
     CREATE TABLE IF NOT EXISTS teacher_unavailable_windows (
@@ -299,6 +301,9 @@ function initializeTables(db: DatabaseInstance) {
   const lessonColumns = db.prepare("PRAGMA table_info(scheduled_lessons)").all() as Array<{ name: string }>;
   if (!lessonColumns.some((column) => column.name === "warnings_json")) {
     db.exec("ALTER TABLE scheduled_lessons ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!lessonColumns.some((column) => column.name === "revision")) {
+    db.exec("ALTER TABLE scheduled_lessons ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
   }
 }
 
@@ -620,7 +625,7 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   const rows = database().prepare(`
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.id AS teacher_id, teachers.name AS teacher_name,
       lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
-      lessons.warnings_json, lessons.occurrence, courses.sessions_per_week, courses.week_pattern,
+      lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week, courses.week_pattern,
       rooms.code AS room_code
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
@@ -628,8 +633,8 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
-  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, warnings: JSON.parse(row.warnings_json) as string[] }));
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
 export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", ownerId: string): ScheduledLessonRecord[] {
@@ -643,7 +648,7 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", o
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence,
       teachers.id AS teacher_id, teachers.name AS teacher_name, lessons.day_of_week,
       lessons.start_hour, lessons.duration_hours, lessons.room_id,
-      lessons.warnings_json, lessons.occurrence, courses.sessions_per_week, courses.week_pattern,
+      lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week, courses.week_pattern,
       rooms.code AS room_code
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
@@ -652,8 +657,8 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", o
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE ${ownerFilter}
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
-  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, warnings: JSON.parse(row.warnings_json) as string[] }));
+  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8"; room_code: string | null }>;
+  return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
@@ -939,31 +944,32 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
   const id = crypto.randomUUID();
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, warnings: conflicts };
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekPatternSuffix(section.week_pattern)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: conflicts };
 }
 
-export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null }): ScheduledLessonRecord {
+export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
   const db = database();
   // The editor updates the section teacher and lesson placement together so the card
   // never briefly shows a teacher that differs from the conflict-check input.
-  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_pattern FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8" } | undefined;
+  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_pattern FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_pattern: "ALL" | "W1_4" | "W5_8" } | undefined;
   if (!lesson) throw new Error("Scheduled lesson not found.");
+  if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
   const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
   if (input.teacherId && !teacher) throw new Error("Choose an active teacher.");
   const warnings = calculatePlacementWarnings(db, { sectionId: lesson.section_id, lessonId: id, teacherId: input.teacherId, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours });
   db.transaction(() => {
     db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
-    db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ? WHERE id = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id);
+    db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ?, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id, input.revision);
   })();
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, warnings };
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekPatternSuffix(lesson.week_pattern)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings };
 }
 
-export function removeScheduledLesson(id: string) {
+export function removeScheduledLesson(id: string, revision: number) {
   // Removing one lesson returns only that weekly session to the tray; the section's
   // other occurrence remains scheduled when a course meets twice per week.
-  return database().prepare("DELETE FROM scheduled_lessons WHERE id = ?").run(id).changes > 0;
+  return database().prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
