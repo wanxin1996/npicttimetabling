@@ -414,6 +414,37 @@ export function createAppUser(username: string, password: string): AppUserRecord
   return { id, username, isAdmin: false, isActive: true };
 }
 
+export function changeOwnPassword(userId: string, currentPassword: string, newPassword: string) {
+  const db = database();
+  const user = db.prepare("SELECT password_hash FROM app_users WHERE id = ? AND is_active = 1").get(userId) as { password_hash: string } | undefined;
+  if (!user || !passwordMatches(currentPassword, user.password_hash)) return false;
+  // Password changes revoke every existing login, including other forgotten browsers.
+  db.transaction(() => {
+    db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ?").run(hashPassword(newPassword), userId);
+    db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+  })();
+  return true;
+}
+
+export function setAppUserStatus(userId: string, isActive: boolean) {
+  const db = database();
+  // Deactivation revokes active sessions immediately; reactivation does not create one.
+  return db.transaction(() => {
+    const changed = db.prepare("UPDATE app_users SET is_active = ? WHERE id = ? AND is_admin = 0").run(isActive ? 1 : 0, userId).changes > 0;
+    if (changed && !isActive) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    return changed;
+  })();
+}
+
+export function resetAppUserPassword(userId: string, newPassword: string) {
+  const db = database();
+  return db.transaction(() => {
+    const changed = db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ? AND is_admin = 0").run(hashPassword(newPassword), userId).changes > 0;
+    if (changed) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    return changed;
+  })();
+}
+
 export function listTeachers(): TeacherRecord[] {
   // Count imported teaching allocations beside each teacher so the data screen
   // immediately shows how many sections that teacher has been assigned.
