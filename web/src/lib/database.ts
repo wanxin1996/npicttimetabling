@@ -124,6 +124,13 @@ export type CandidateSlotRecord = {
   roomFeatures: string[];
 };
 
+export type RuleSettingRecord = {
+  key: "prefer_9am" | "lunch_break" | "max_continuous" | "student_daily_limit" | "teacher_daily_limit" | "same_block" | "separate_weekly_sessions";
+  label: string;
+  description: string;
+  enabled: boolean;
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 function weekPatternSuffix(pattern: "ALL" | "W1_4" | "W5_8") {
@@ -249,7 +256,16 @@ function initializeTables(db: DatabaseInstance) {
       start_hour INTEGER NOT NULL,
       end_hour INTEGER NOT NULL CHECK (end_hour > start_hour)
     );
+    CREATE TABLE IF NOT EXISTS rule_settings (
+      rule_key TEXT PRIMARY KEY,
+      is_enabled INTEGER NOT NULL DEFAULT 1
+    );
   `);
+
+  // Policy rules are data-driven switches. Insert new defaults without overwriting a
+  // scheduler's existing choice when a later release adds another optional rule.
+  const addRule = db.prepare("INSERT OR IGNORE INTO rule_settings (rule_key, is_enabled) VALUES (?, 1)");
+  for (const ruleKey of ["prefer_9am", "lunch_break", "max_continuous", "student_daily_limit", "teacher_daily_limit", "same_block", "separate_weekly_sessions"]) addRule.run(ruleKey);
 
   // SQLite cannot add a new column through CREATE TABLE after the table already
   // exists. Check old local databases and upgrade this small prototype schema safely.
@@ -385,6 +401,31 @@ export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
   // The kind selects the exact table, preventing a coincidental id match elsewhere.
   const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
   return database().prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
+}
+
+const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
+  { key: "prefer_9am", label: "Prefer 09:00 starts", description: "Warn when a lesson starts at 08:00." },
+  { key: "lunch_break", label: "Keep one lunch hour", description: "Keep 12:00–13:00 or 13:00–14:00 free." },
+  { key: "max_continuous", label: "Maximum 4 continuous hours", description: "Warn teachers and classes after four continuous hours." },
+  { key: "student_daily_limit", label: "Student maximum 6 hours/day", description: "Highlight every student group above six class hours." },
+  { key: "teacher_daily_limit", label: "Teacher maximum 7 hours/day", description: "Highlight every teacher above seven teaching hours." },
+  { key: "same_block", label: "Back-to-back lessons in one block", description: "Warn about immediate travel between different blocks." },
+  { key: "separate_weekly_sessions", label: "Separate twice-weekly sessions", description: "Warn when both meetings of one class use the same day." },
+];
+
+export function listRuleSettings(): RuleSettingRecord[] {
+  // Join the stable explanatory copy to the small persisted switch table in code,
+  // keeping the database focused on values staff may change.
+  const rows = database().prepare("SELECT rule_key, is_enabled FROM rule_settings").all() as Array<{ rule_key: string; is_enabled: number }>;
+  const enabledByKey = new Map(rows.map((row) => [row.rule_key, Boolean(row.is_enabled)]));
+  return ruleSettingDetails.map((rule) => ({ ...rule, enabled: enabledByKey.get(rule.key) ?? true }));
+}
+
+export function updateRuleSetting(key: string, enabled: boolean) {
+  // Only registered policy keys can be changed; core collision checks deliberately
+  // have no switch and therefore cannot be disabled by accident.
+  if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
+  return database().prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
 }
 
 export function listCourses(): CourseRecord[] {
@@ -591,8 +632,11 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   const warnings: string[] = [];
   const lessonId = input.lessonId ?? "";
   const endHour = input.startHour + input.durationHours;
+  // Optional policy rules can change between semesters. Core resource and timetable
+  // collisions below remain unconditional and are intentionally absent from this set.
+  const enabledRules = new Set((db.prepare("SELECT rule_key FROM rule_settings WHERE is_enabled = 1").all() as Array<{ rule_key: string }>).map((row) => row.rule_key));
   const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.sessions_per_week, courses.separate_sections_across_days, courses.week_pattern FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8" };
-  if (courseRule.sessions_per_week > 1) {
+  if (courseRule.sessions_per_week > 1 && enabledRules.has("separate_weekly_sessions")) {
     // Separate weekly meetings of one class should not be placed on the same day,
     // otherwise a nominally twice-weekly course becomes one long teaching day.
     const sameSectionDay = db.prepare("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?").get(lessonId, input.sectionId, input.dayOfWeek);
@@ -652,7 +696,7 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   }
 
   // The department prefers 09:00 starts; 08:00 remains available when needed.
-  if (input.startHour === 8) warnings.push("08:00 start is discouraged");
+  if (input.startHour === 8 && enabledRules.has("prefer_9am")) warnings.push("08:00 start is discouraged");
 
   const proposedRoom = input.roomId ? db.prepare("SELECT block FROM rooms WHERE id = ?").get(input.roomId) as { block: string | null } | undefined : undefined;
   const proposed = { startHour: input.startHour, durationHours: input.durationHours, block: proposedRoom?.block ?? null };
@@ -660,10 +704,10 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     const teacherDay = db.prepare(`SELECT lessons.start_hour, lessons.duration_hours, rooms.block FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses occupied_courses ON occupied_courses.id = sections.course_id LEFT JOIN rooms ON rooms.id = lessons.room_id WHERE lessons.id <> ? AND sections.teacher_id = ? AND lessons.day_of_week = ? AND (? = 'ALL' OR occupied_courses.week_pattern = 'ALL' OR occupied_courses.week_pattern = ?)`).all(lessonId, input.teacherId, input.dayOfWeek, courseRule.week_pattern, courseRule.week_pattern) as Array<{ start_hour: number; duration_hours: number; block: string | null }>;
     const existing = teacherDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
     const combined = [...existing, proposed];
-    if (!hasLunchHour(combined)) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
-    if (longestContinuousHours(combined) > 4) warnings.push("Teacher has more than 4 continuous hours");
-    if (combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 7) warnings.push("Teacher exceeds 7 teaching hours in one day");
-    if (hasBackToBackBlockChange(existing, proposed)) warnings.push("Teacher has back-to-back lessons in different blocks");
+    if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
+    if (enabledRules.has("max_continuous") && longestContinuousHours(combined) > 4) warnings.push("Teacher has more than 4 continuous hours");
+    if (enabledRules.has("teacher_daily_limit") && combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 7) warnings.push("Teacher exceeds 7 teaching hours in one day");
+    if (enabledRules.has("same_block") && hasBackToBackBlockChange(existing, proposed)) warnings.push("Teacher has back-to-back lessons in different blocks");
   }
 
   // Evaluate each associated student group separately because cross-level sections
@@ -673,10 +717,10 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     const groupDay = db.prepare(`SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses occupied_courses ON occupied_courses.id = sections.course_id JOIN section_student_groups links ON links.section_id = lessons.section_id LEFT JOIN rooms ON rooms.id = lessons.room_id WHERE lessons.id <> ? AND links.student_group_id = ? AND lessons.day_of_week = ? AND (? = 'ALL' OR occupied_courses.week_pattern = 'ALL' OR occupied_courses.week_pattern = ?)`).all(lessonId, group.id, input.dayOfWeek, courseRule.week_pattern, courseRule.week_pattern) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null }>;
     const existing = groupDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
     const combined = [...existing, proposed];
-    if (!hasLunchHour(combined)) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
-    if (longestContinuousHours(combined) > 4) warnings.push(`${group.code} has more than 4 continuous hours`);
-    if (combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 6) warnings.push(`${group.code} exceeds 6 class hours in one day`);
-    if (hasBackToBackBlockChange(existing, proposed)) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
+    if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
+    if (enabledRules.has("max_continuous") && longestContinuousHours(combined) > 4) warnings.push(`${group.code} has more than 4 continuous hours`);
+    if (enabledRules.has("student_daily_limit") && combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 6) warnings.push(`${group.code} exceeds 6 class hours in one day`);
+    if (enabledRules.has("same_block") && hasBackToBackBlockChange(existing, proposed)) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
   }
   return warnings;
 }
@@ -770,10 +814,11 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
   // engine is the single source of truth, and only placements with zero messages pass.
   const rooms = db.prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom FROM rooms WHERE is_active = 1 ORDER BY code").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
   const slots: CandidateSlotRecord[] = [];
+  const preferredStartRule = db.prepare("SELECT is_enabled FROM rule_settings WHERE rule_key = 'prefer_9am'").get() as { is_enabled: number } | undefined;
   for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
-    // 08:00 is intentionally omitted because it always carries the department's
-    // discouraged-start advisory and candidates must be completely warning-free.
-    for (let startHour = 9; startHour + section.duration_hours <= 18; startHour += 1) {
+    // 08:00 becomes a valid candidate only when staff explicitly disable the
+    // preferred 09:00-start policy; the warning engine remains the final filter.
+    for (let startHour = preferredStartRule?.is_enabled === 0 ? 8 : 9; startHour + section.duration_hours <= 18; startHour += 1) {
       for (const room of rooms) {
         const warnings = calculatePlacementWarnings(db, { sectionId, teacherId: section.teacher_id, roomId: room.id, dayOfWeek, startHour, durationHours: section.duration_hours });
         if (warnings.length > 0) continue;

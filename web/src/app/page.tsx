@@ -51,6 +51,7 @@ type UnscheduledSection = { id: string; label: string; teacherName: string | nul
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
+type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" | "red" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -89,6 +90,7 @@ export default function Home() {
   const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup">("Teacher");
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
+  const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -135,10 +137,11 @@ export default function Home() {
   async function openRules() {
     // Load restrictions and the recalculated timetable review together, so editing a
     // rule immediately refreshes every affected issue on the same screen.
-    const [rulesResponse, issuesResponse] = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues")]);
-    if (!rulesResponse.ok || !issuesResponse.ok) return setNotice("Rules and timetable issues could not be loaded.");
+    const [rulesResponse, issuesResponse, settingsResponse] = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
+    if (!rulesResponse.ok || !issuesResponse.ok || !settingsResponse.ok) return setNotice("Rules and timetable issues could not be loaded.");
     setUnavailableWindows(await rulesResponse.json());
     setScheduleIssues(await issuesResponse.json());
+    setRuleSettings(await settingsResponse.json());
     setView("Rules & issues");
     setShowForm(false);
   }
@@ -258,6 +261,15 @@ export default function Home() {
     if (!response.ok) return setNotice("Unavailable time could not be removed.");
     await openRules();
     setNotice(`${window.ownerLabel} unavailable time removed.`);
+  }
+
+  async function toggleRuleSetting(rule: RuleSetting) {
+    // Saving one switch then reopening the screen also recalculates every issue using
+    // the new policy, so the effect is visible immediately.
+    const response = await fetch("/api/rule-settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: rule.key, enabled: !rule.enabled }) });
+    if (!response.ok) return setNotice("The rule setting could not be changed.");
+    await openRules();
+    setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`);
   }
 
   function toggleForm() {
@@ -564,6 +576,21 @@ export default function Home() {
                     </Fragment>
                   ))}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {view === "Rules & issues" && (
+            /* Optional policy rules are editable here; core collision checks remain fixed. */
+            <div className="mb-4 rounded-2xl border border-slate-200 bg-white shadow-sm">
+              <div className="border-b border-slate-200 p-4"><p className="font-black">Policy rule settings</p><p className="mt-1 text-xs text-slate-500">Changes immediately recalculate the issue list and future candidate slots.</p></div>
+              <div className="grid gap-px bg-slate-100 md:grid-cols-2">
+                {ruleSettings.map((rule) => (
+                  <div key={rule.key} className="flex items-center justify-between gap-4 bg-white p-4">
+                    <div><p className="text-sm font-bold text-slate-900">{rule.label}</p><p className="mt-1 text-xs text-slate-500">{rule.description}</p></div>
+                    <button onClick={() => void toggleRuleSetting(rule)} className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-bold ${rule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500"}`} type="button">{rule.enabled ? "Enabled" : "Disabled"}</button>
+                  </div>
+                ))}
               </div>
             </div>
           )}
