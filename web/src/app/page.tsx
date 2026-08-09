@@ -1,6 +1,6 @@
 "use client";
 
-import { DragEvent, FormEvent, Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
 type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
@@ -58,6 +58,10 @@ type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; prima
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
 type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
 type CycleStatus = { courses: number; sections: number; lessons: number; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
+type PositionedLesson = { lesson: ScheduledLesson; lane: number; laneCount: number };
+
+const timetableDays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+const timetableHours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" | "red" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -78,6 +82,119 @@ function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
   if (severity === "High") return { card: "bg-red-50 text-red-950 ring-red-300", message: "text-red-700" };
   if (severity === "Warning") return { card: "bg-amber-50 text-amber-950 ring-amber-300", message: "text-amber-700" };
   return { card: "bg-blue-50 text-blue-900 ring-blue-300", message: "text-blue-700" };
+}
+
+function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[] {
+  const positioned: PositionedLesson[] = [];
+
+  for (let dayOfWeek = 1; dayOfWeek <= timetableDays.length; dayOfWeek += 1) {
+    // Sort one day chronologically. Longer lessons come first when starts match, so
+    // their visual lane remains stable while shorter conflicts sit beside them.
+    const dayLessons = lessons
+      .filter((lesson) => lesson.dayOfWeek === dayOfWeek)
+      .sort((left, right) => left.startHour - right.startHour || right.durationHours - left.durationHours || left.id.localeCompare(right.id));
+    let component: ScheduledLesson[] = [];
+    let componentEnd = 0;
+
+    const placeComponent = () => {
+      if (component.length === 0) return;
+      // Give overlapping lessons the first available horizontal lane. Every lesson
+      // in the connected overlap group uses the final lane count, preventing cards
+      // saved with deliberate conflicts from covering one another.
+      const laneEnds: number[] = [];
+      const assignments = component.map((lesson) => {
+        let lane = laneEnds.findIndex((endHour) => endHour <= lesson.startHour);
+        if (lane === -1) lane = laneEnds.length;
+        laneEnds[lane] = lesson.startHour + lesson.durationHours;
+        return { lesson, lane };
+      });
+      const laneCount = Math.max(1, laneEnds.length);
+      positioned.push(...assignments.map((assignment) => ({ ...assignment, laneCount })));
+    };
+
+    for (const lesson of dayLessons) {
+      // A lesson beginning exactly when the current component ends does not overlap
+      // it, so the next group can return to the full day-column width.
+      if (component.length > 0 && lesson.startHour >= componentEnd) {
+        placeComponent();
+        component = [];
+        componentEnd = 0;
+      }
+      component.push(lesson);
+      componentEnd = Math.max(componentEnd, lesson.startHour + lesson.durationHours);
+    }
+    placeComponent();
+  }
+
+  return positioned;
+}
+
+function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
+  lessons: ScheduledLesson[];
+  renderLesson: (lesson: ScheduledLesson) => React.ReactNode;
+  onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
+}) {
+  const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
+  // A day with deliberately saved conflicts needs extra horizontal room for its
+  // lanes. Normal days remain compact; conflict-heavy days make only the grid scroll.
+  const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
+  const minimumGridWidth = 64 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(150, laneCount * 150), 0) + (timetableDays.length * 8);
+  const timetableColumns = `64px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(150, laneCount * 150)}px, ${laneCount}fr)`).join(" ")}`;
+
+  return (
+    <div className="overflow-x-auto pb-2">
+      {/* Fixed 72px hour tracks let each absolute lesson cover exactly the number of
+          hours stored in durationHours, while the outer wrapper handles small screens. */}
+      <div className="grid gap-x-2 text-xs" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "40px repeat(10, 72px)", minWidth: minimumGridWidth }}>
+        <div className="pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
+        {timetableDays.map((day, index) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
+
+        {timetableHours.map((hour, hourIndex) => (
+          <div key={`time-${hour}`} className="border-t border-slate-100 py-3 font-semibold text-slate-400" style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
+            {String(hour).padStart(2, "0")}:00
+          </div>
+        ))}
+
+        {/* Background cells remain the drag targets. Lesson overlays use
+            pointer-events:none except on the cards, so empty hours stay droppable. */}
+        {timetableHours.flatMap((hour, hourIndex) => timetableDays.map((_, dayIndex) => (
+          <div
+            key={`cell-${dayIndex + 1}-${hour}`}
+            onDragOver={onCellDrop ? (event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } : undefined}
+            onDrop={onCellDrop ? (event) => onCellDrop(event, dayIndex + 1, hour) : undefined}
+            className={onCellDrop ? "m-0.5 rounded-lg border border-dashed border-slate-200 transition hover:border-blue-400 hover:bg-blue-50/40" : "m-0.5 rounded-lg border border-slate-100 bg-slate-50/50"}
+            style={{ gridColumn: dayIndex + 2, gridRow: hourIndex + 2 }}
+          />
+        )))}
+
+        {timetableDays.map((_, dayIndex) => (
+          <div key={`overlay-${dayIndex + 1}`} className="pointer-events-none relative z-10" style={{ gridColumn: dayIndex + 2, gridRow: "2 / span 10" }}>
+            {positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map(({ lesson, lane, laneCount }) => {
+              const laneWidth = 100 / laneCount;
+              const top = ((lesson.startHour - timetableHours[0]) / timetableHours.length) * 100;
+              const height = (lesson.durationHours / timetableHours.length) * 100;
+              return (
+                <div
+                  key={lesson.id}
+                  data-lesson-id={lesson.id}
+                  data-day-of-week={lesson.dayOfWeek}
+                  data-start-hour={lesson.startHour}
+                  data-duration-hours={lesson.durationHours}
+                  aria-label={`${lesson.sectionLabel}, ${lesson.durationHours} hours`}
+                  onDragOver={onCellDrop ? (event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } : undefined}
+                  onDrop={onCellDrop ? (event) => onCellDrop(event, lesson.dayOfWeek, lesson.startHour) : undefined}
+                  className="pointer-events-auto absolute"
+                  style={{ top: `calc(${top}% + 3px)`, height: `calc(${height}% - 6px)`, left: `calc(${lane * laneWidth}% + 3px)`, width: `calc(${laneWidth}% - 6px)` }}
+                >
+                  {renderLesson(lesson)}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function Home() {
@@ -838,11 +955,15 @@ export default function Home() {
                 <div><p className="font-black text-slate-950">Weekly timetable</p><p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p></div>
                 <Pill tone={personalLessons.some((lesson) => lesson.warningSeverity === "High") ? "red" : personalLessons.some((lesson) => lesson.warningSeverity === "Warning") ? "amber" : personalLessons.some((lesson) => lesson.warningSeverity === "Advisory") ? "blue" : "green"}>{personalLessons.some((lesson) => lesson.warningSeverity === "High") ? "Has serious issues" : personalLessons.some((lesson) => lesson.warningSeverity === "Warning") ? "Has warnings" : personalLessons.some((lesson) => lesson.warningSeverity === "Advisory") ? "Has advisories" : "No saved issues"}</Pill>
               </div>
-              <div className="grid grid-cols-6 gap-2 text-xs">
-                <div className="pt-2 text-slate-400">Time</div>
-                {["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}
-                {[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const cellLessons = personalLessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-16 rounded-lg border border-slate-100 bg-slate-50/50 p-1">{cellLessons.map((lesson) => { const issueClasses = lessonIssueClasses(lesson.warningSeverity); return <div key={lesson.id} className={`mb-1 rounded-md p-2 ${issueClasses.card}`}><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>; })}</div>; })}</Fragment>)}
-              </div>
+              <WeeklyTimetableGrid
+                lessons={personalLessons}
+                renderLesson={(lesson) => {
+                  // Personal projections use the same spanning geometry but remain
+                  // read-only, with the selected owner's most useful counterpart shown.
+                  const issueClasses = lessonIssueClasses(lesson.warningSeverity);
+                  return <div className={`h-full overflow-y-auto rounded-md p-2 shadow-sm ${issueClasses.card}`}><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p className="mt-1 font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</p><p className="mt-1">{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>;
+                }}
+              />
             </div>
           )}
 
@@ -883,33 +1004,22 @@ export default function Home() {
                   <div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div>
                   <div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div>
                 </div>
-                <div className="grid grid-cols-6 gap-2 text-xs">
-                  <div className="pt-2 text-slate-400">Time</div>
-                  {["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}
-                  {[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => (
-                    <Fragment key={hour}>
-                      <div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>
-                      {[1, 2, 3, 4, 5].map((day) => {
-                        const cellLessons = lessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour);
-                        return (
-                          <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">
-                            {cellLessons.map((lesson) => {
-                              // Use the server's highest issue level for both the card
-                              // and its message, keeping the grid aligned with Issues.
-                              const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                              return <div key={lesson.id} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className={`mb-1 cursor-pointer rounded-md p-2 hover:ring-2 ${issueClasses.card}`}>
-                                <p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p>
-                                <p>{lesson.teacherName ?? "Teacher pending"}</p>
-                                <p>{lesson.roomCode ?? "Room pending"}</p>
-                                {lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.join(", ")}</p>}
-                              </div>;
-                            })}
-                          </div>
-                        );
-                      })}
-                    </Fragment>
-                  ))}
-                </div>
+                <WeeklyTimetableGrid
+                  lessons={lessons}
+                  onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
+                  renderLesson={(lesson) => {
+                    // The card fills its duration-based wrapper. Explicit start/end
+                    // text reinforces the occupied hours even before reading the grid.
+                    const issueClasses = lessonIssueClasses(lesson.warningSeverity);
+                    return <div draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className={`h-full cursor-pointer overflow-y-auto rounded-md p-2 shadow-sm hover:ring-2 ${issueClasses.card}`}>
+                      <p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p>
+                      <p className="mt-1 font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</p>
+                      <p className="mt-1">{lesson.teacherName ?? "Teacher pending"}</p>
+                      <p>{lesson.roomCode ?? "Room pending"}</p>
+                      {lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.join(", ")}</p>}
+                    </div>;
+                  }}
+                />
               </div>
             </div>
           )}
