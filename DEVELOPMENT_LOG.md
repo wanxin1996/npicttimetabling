@@ -50,3 +50,28 @@
 ### 下一步
 
 1. 评估技术栈并初始化应用工程。
+
+## 2026-08-09｜Web 应用基础工程
+
+### 已完成
+
+- 已在 `web/` 初始化 Next.js 16、React 19、TypeScript、Tailwind CSS 与 ESLint。
+- 已移除默认 Google Fonts 依赖，避免构建时依赖外部字体服务。
+- 已将生产构建固定为 `next build --webpack`；当前环境的 Turbopack 无法创建其内部所需进程/端口，但 Webpack 构建可稳定通过。
+
+### 技术选择
+
+- 前端与服务层：Next.js App Router + TypeScript。
+- UI 样式：Tailwind CSS。
+- 质量检查：ESLint 与生产构建。
+- 数据库、认证与实时协作将在下一子任务中确定并接入。
+
+### 本次验证
+
+- `npm run lint` 通过。
+- `npx next build --webpack` 通过，首页可静态构建。
+
+### 下一步
+
+1. 确定数据库、认证和实时协作方案，并建立数据模型。
+2. 实现基础数据维护页面。
