@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, Fragment, useEffect, useMemo, useState } from "react";
+import { DragEvent, FormEvent, Fragment, useEffect, useMemo, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
 type View = "Year timetables" | "Teachers" | "Student groups" | "Rooms" | "Courses";
@@ -45,6 +45,7 @@ type Course = {
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
 type ScheduledLesson = { id: string; sectionLabel: string; courseCode: string; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomCode: string | null; warnings: string[] };
+type UnscheduledSection = { id: string; label: string; teacherName: string | null; durationHours: number; studentGroups: string[] };
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" }) {
   // Reusable status badge: keeping colours here makes tables consistent and accessible.
@@ -72,6 +73,7 @@ export default function Home() {
   const [sections, setSections] = useState<CourseSection[]>([]);
   const [timetableYear, setTimetableYear] = useState(1);
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
+  const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
@@ -106,12 +108,26 @@ export default function Home() {
 
   async function openTimetable(year: number) {
     // Load one year at a time because the department maintains three separate master tables.
-    const response = await fetch(`/api/schedule/lessons?year=${year}`);
-    if (!response.ok) return setNotice("The year timetable could not be loaded.");
+    const [lessonResponse, unscheduledResponse] = await Promise.all([fetch(`/api/schedule/lessons?year=${year}`), fetch(`/api/schedule/unscheduled?year=${year}`)]);
+    if (!lessonResponse.ok || !unscheduledResponse.ok) return setNotice("The year timetable could not be loaded.");
     setTimetableYear(year);
-    setLessons(await response.json());
+    setLessons(await lessonResponse.json());
+    setUnscheduledSections(await unscheduledResponse.json());
     setView("Year timetables");
     setShowForm(false);
+  }
+
+  async function placeSection(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
+    // The dragged card carries only its section id; the server retrieves duration and
+    // teacher data itself so browser-side changes cannot bypass validation.
+    event.preventDefault();
+    const sectionId = event.dataTransfer.getData("text/plain");
+    if (!sectionId) return;
+    const response = await fetch("/api/schedule/lessons", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionId, dayOfWeek, startHour, roomId: null }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
+    await openTimetable(timetableYear);
+    setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully. Assign its room next.`);
   }
 
   function toggleForm() {
@@ -340,13 +356,13 @@ export default function Home() {
           {/* Page title and the single action that applies to the selected data view. */}
           <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
-              <p className="text-sm font-semibold text-blue-700">Data management</p>
-              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">Build the scheduling foundation</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections.</p>
+              <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : "Data management"}</p>
+              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : "Build the scheduling foundation"}</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
-            <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
+            {view !== "Year timetables" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
-            </button>
+            </button>}
           </div>
 
           <div className="mb-6 grid gap-4 sm:grid-cols-3">
@@ -356,9 +372,9 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>
 
-          {view === "Year timetables" && <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-5 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-14 rounded-lg border border-dashed border-slate-200 p-1">{lesson && <div className="rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-bold">{lesson.sectionLabel}</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div>}
+          {view === "Year timetables" && <div className="mb-6 grid gap-4 xl:grid-cols-[240px_1fr]"><aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-3"><p className="font-bold text-slate-950">Unscheduled sections</p><p className="text-xs text-slate-500">{unscheduledSections.length} ready to place</p></div><div className="grid max-h-[650px] gap-2 overflow-y-auto">{unscheduledSections.map((section) => <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className="cursor-grab rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950 active:cursor-grabbing"><p className="font-black">{section.label}</p><p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p><p className="mt-1 text-blue-700">{section.studentGroups.join(", ") || "Student group pending"}</p></div>)}{unscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No configured sections waiting for this year.</p>}</div></aside><div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div><div className="grid grid-cols-6 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const lesson = lessons.find((item) => item.dayOfWeek === day && item.startHour === hour); return <div key={`${day}-${hour}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => void placeSection(event, day, hour)} className="min-h-16 rounded-lg border border-dashed border-slate-200 p-1 transition hover:border-blue-400 hover:bg-blue-50/40">{lesson && <div className="rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{lesson.teacherName ?? "Teacher pending"}</p><p>{lesson.roomCode ?? "Room pending"}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.join(", ")}</p>}</div>}</div>; })}</Fragment>)}</div></div></div>}
 
-          <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          {view !== "Year timetables" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
             {/* Table tabs and search share the same data card to minimise navigation. */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
@@ -411,7 +427,7 @@ export default function Home() {
               /* Section assignment is separate from course setup because each class can differ. */
               <div className="border-t border-slate-200 bg-slate-50 p-4"><div className="mb-3 flex items-center justify-between"><div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div><button onClick={() => { setSelectedCourse(null); setSections([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button></div><div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div></div>
             )}
-          </div>
+          </div>}
 
           <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">System status:</span> {notice}</p>
         </section>

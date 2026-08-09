@@ -81,6 +81,14 @@ export type ScheduledLessonRecord = {
   warnings: string[];
 };
 
+export type UnscheduledSectionRecord = {
+  id: string;
+  label: string;
+  teacherName: string | null;
+  durationHours: number;
+  studentGroups: string[];
+};
+
 type DatabaseInstance = InstanceType<typeof Database>;
 
 // Next.js reloads modules in development. Keeping one connection globally prevents
@@ -389,6 +397,30 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
   `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; room_code: string | null }>;
   return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}`, courseCode: row.code, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, warnings: [] }));
+}
+
+export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
+  // Only sections with a completed duration can be dragged to the grid. Sections
+  // missing setup remain visible in Courses, where staff can finish configuring them.
+  const rows = database().prepare(`
+    SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
+      teachers.name AS teacher_name, student_groups.code AS group_code
+    FROM course_sections sections
+    JOIN courses ON courses.id = sections.course_id
+    LEFT JOIN teachers ON teachers.id = sections.teacher_id
+    LEFT JOIN section_student_groups links ON links.section_id = sections.id
+    LEFT JOIN student_groups ON student_groups.id = links.student_group_id
+    WHERE courses.primary_year = ? AND courses.duration_hours IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM scheduled_lessons WHERE scheduled_lessons.section_id = sections.id)
+    ORDER BY courses.code, sections.sequence, student_groups.code
+  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; teacher_name: string | null; group_code: string | null }>;
+  const sections = new Map<string, UnscheduledSectionRecord>();
+  for (const row of rows) {
+    const section = sections.get(row.id) ?? { id: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}`, teacherName: row.teacher_name, durationHours: row.duration_hours, studentGroups: [] };
+    if (row.group_code) section.studentGroups.push(row.group_code);
+    sections.set(row.id, section);
+  }
+  return [...sections.values()];
 }
 
 export function placeScheduledLesson(input: { sectionId: string; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
