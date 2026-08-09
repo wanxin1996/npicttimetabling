@@ -668,13 +668,15 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   return rows.map((row) => ({ id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekPatternSuffix(row.week_pattern)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings: JSON.parse(row.warnings_json) as string[] }));
 }
 
-export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup", ownerId: string): ScheduledLessonRecord[] {
+export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
   const db = database();
-  // Teacher schedules span all three master years. Student-group schedules use the
-  // section link table so a cross-level course appears for every participating class.
+  // Teacher and room schedules span all three master years. Student-group schedules
+  // use the link table so a cross-level course appears for every participating class.
   const ownerFilter = kind === "Teacher"
     ? "sections.teacher_id = ?"
-    : "EXISTS (SELECT 1 FROM section_student_groups personal_links WHERE personal_links.section_id = sections.id AND personal_links.student_group_id = ?)";
+    : kind === "Room"
+      ? "lessons.room_id = ?"
+      : "EXISTS (SELECT 1 FROM section_student_groups personal_links WHERE personal_links.section_id = sections.id AND personal_links.student_group_id = ?)";
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence,
       teachers.id AS teacher_id, teachers.name AS teacher_name, lessons.day_of_week,

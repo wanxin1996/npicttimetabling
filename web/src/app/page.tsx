@@ -88,7 +88,7 @@ export default function Home() {
   const [candidateSection, setCandidateSection] = useState<UnscheduledSection | null>(null);
   const [candidateSlots, setCandidateSlots] = useState<CandidateSlot[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
-  const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup">("Teacher");
+  const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup" | "Room">("Teacher");
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
@@ -151,10 +151,14 @@ export default function Home() {
     setShowForm(false);
   }
 
-  async function loadPersonalTimetable(kind: "Teacher" | "StudentGroup", requestedOwnerId?: string) {
+  async function loadPersonalTimetable(kind: "Teacher" | "StudentGroup" | "Room", requestedOwnerId?: string) {
     // Choose a valid default when staff first open or switch the personal view, then
     // keep the selected owner explicit for subsequent dropdown changes.
-    const availableOwners = kind === "Teacher" ? teachers.filter((teacher) => teacher.status === "Active") : groups;
+    const availableOwners = kind === "Teacher"
+      ? teachers.filter((teacher) => teacher.status === "Active")
+      : kind === "Room"
+        ? rooms.filter((room) => room.status === "Active")
+        : groups;
     const ownerId = requestedOwnerId || availableOwners[0]?.id || "";
     setPersonalKind(kind);
     setPersonalOwnerId(ownerId);
@@ -162,7 +166,8 @@ export default function Home() {
     setShowForm(false);
     if (!ownerId) {
       setPersonalLessons([]);
-      return setNotice(`Add at least one ${kind === "Teacher" ? "active teacher" : "student group"} before opening a personal timetable.`);
+      const missingOwner = kind === "Teacher" ? "active teacher" : kind === "Room" ? "active room" : "student group";
+      return setNotice(`Add at least one ${missingOwner} before opening a personal timetable.`);
     }
     const response = await fetch(`/api/schedule/personal?kind=${kind}&ownerId=${encodeURIComponent(ownerId)}`);
     if (!response.ok) return setNotice("The personal timetable could not be loaded.");
@@ -622,7 +627,7 @@ export default function Home() {
             <div>
               <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Accounts" ? "Administration" : view === "Profile" ? "My account" : "Data management"}</p>
               <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Accounts" ? "Manage scheduler accounts" : view === "Profile" ? "Change my password" : "Build the scheduling foundation"}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher or student group." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
             {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Accounts" && view !== "Profile" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
@@ -638,7 +643,39 @@ export default function Home() {
 
           {view === "Year timetables" && editingLesson && <form onSubmit={saveLesson} className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm"><div className="mb-3 flex items-center justify-between"><div><p className="text-sm font-black text-amber-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-amber-800">Update the placement, teacher and room, or return it to the tray.</p></div><button onClick={() => setEditingLesson(null)} className="text-sm font-semibold text-amber-800" type="button">Close</button></div><div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label></div><div className="mt-3 flex justify-end gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-amber-700 px-4 py-2 text-sm font-bold text-white" type="submit">Save changes</button></div></form>}
 
-          {view === "Personal timetables" && <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-4 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-slate-700">View by<select value={personalKind} onChange={(event) => void loadPersonalTimetable(event.target.value as "Teacher" | "StudentGroup")} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option value="Teacher">Teacher</option><option value="StudentGroup">Student group</option></select></label><label className="text-xs font-semibold text-slate-700">{personalKind === "Teacher" ? "Teacher" : "Student group"}<select value={personalOwnerId} onChange={(event) => void loadPersonalTimetable(personalKind, event.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">{personalKind === "Teacher" ? teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>) : groups.map((group) => <option key={group.id} value={group.id}>{group.code} · Year {group.year}</option>)}</select></label></div><div className="mb-3 flex items-center justify-between"><div><p className="font-black text-slate-950">Weekly timetable</p><p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p></div><Pill tone={personalLessons.some((lesson) => lesson.warnings.length > 0) ? "amber" : "green"}>{personalLessons.some((lesson) => lesson.warnings.length > 0) ? "Has warnings" : "No saved warnings"}</Pill></div><div className="grid grid-cols-6 gap-2 text-xs"><div className="pt-2 text-slate-400">Time</div>{["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const cellLessons = personalLessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-16 rounded-lg border border-slate-100 bg-slate-50/50 p-1">{cellLessons.map((lesson) => <div key={lesson.id} className="mb-1 rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.length} warning{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>)}</div>; })}</Fragment>)}</div></div>}
+          {view === "Personal timetables" && (
+            /* All three read-only projections come from the same saved lessons, so
+               staff can review people and room occupancy without duplicate data. */
+            <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+              <div className="mb-4 grid gap-3 sm:grid-cols-2">
+                <label className="text-xs font-semibold text-slate-700">
+                  View by
+                  <select value={personalKind} onChange={(event) => void loadPersonalTimetable(event.target.value as "Teacher" | "StudentGroup" | "Room")} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                    <option value="Teacher">Teacher</option>
+                    <option value="StudentGroup">Student group</option>
+                    <option value="Room">Room</option>
+                  </select>
+                </label>
+                <label className="text-xs font-semibold text-slate-700">
+                  {personalKind === "Teacher" ? "Teacher" : personalKind === "Room" ? "Room" : "Student group"}
+                  <select value={personalOwnerId} onChange={(event) => void loadPersonalTimetable(personalKind, event.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                    {personalKind === "Teacher" && teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}
+                    {personalKind === "StudentGroup" && groups.map((group) => <option key={group.id} value={group.id}>{group.code} · Year {group.year}</option>)}
+                    {personalKind === "Room" && rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
+                  </select>
+                </label>
+              </div>
+              <div className="mb-3 flex items-center justify-between">
+                <div><p className="font-black text-slate-950">Weekly timetable</p><p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p></div>
+                <Pill tone={personalLessons.some((lesson) => lesson.warnings.length > 0) ? "amber" : "green"}>{personalLessons.some((lesson) => lesson.warnings.length > 0) ? "Has warnings" : "No saved warnings"}</Pill>
+              </div>
+              <div className="grid grid-cols-6 gap-2 text-xs">
+                <div className="pt-2 text-slate-400">Time</div>
+                {["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500">{day}</div>)}
+                {[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <Fragment key={hour}><div className="py-3 font-semibold text-slate-400">{String(hour).padStart(2, "0")}:00</div>{[1, 2, 3, 4, 5].map((day) => { const cellLessons = personalLessons.filter((lesson) => lesson.dayOfWeek === day && lesson.startHour === hour); return <div key={`${day}-${hour}`} className="min-h-16 rounded-lg border border-slate-100 bg-slate-50/50 p-1">{cellLessons.map((lesson) => <div key={lesson.id} className="mb-1 rounded-md bg-blue-50 p-2 text-blue-900"><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p>{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className="mt-1 text-amber-700">⚠ {lesson.warnings.length} warning{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>)}</div>; })}</Fragment>)}
+              </div>
+            </div>
+          )}
 
           {view === "Year timetables" && candidateSection && <div className="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-sm"><div className="flex items-start justify-between gap-3"><div><p className="font-black text-emerald-950">Completely clear options for {candidateSection.label}</p><p className="mt-1 text-xs text-emerald-800">Only times and rooms with no conflict, warning or recommendation are shown.</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-sm font-semibold text-emerald-800" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-emerald-800">Checking every weekday, hour and active room...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-white/70 p-3 text-sm text-emerald-900">No completely clear option is available. Confirm the teacher, student groups, rooms and unavailable windows, then try again.</p> : <div className="mt-4 grid max-h-56 gap-2 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-white p-3 text-left text-sm transition hover:border-emerald-500 hover:shadow-sm" type="button"><p className="font-black text-emerald-950">{["Mon", "Tue", "Wed", "Thu", "Fri"][slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</p><p className="mt-1 font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</p><p className="mt-1 text-xs text-slate-500">{slot.roomFeatures.join(", ") || "Standard classroom"}</p></button>)}</div>}</div>}
 
