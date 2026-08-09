@@ -70,8 +70,12 @@ export async function POST(request: Request) {
     return NextResponse.json(importTeachingMembers(rows, ignoredZeroRows));
   } catch (error) {
     // Keep detailed technical information in the server console while returning a
-    // safe explanation that a scheduler can act on.
+    // safe explanation that a scheduler can act on. Known scheduling-safety errors
+    // are already written for users, so preserve those instead of hiding them.
     console.error("Teaching Members import failed", error);
-    return NextResponse.json({ error: "The file could not be read. Please use the Teaching Members export format." }, { status: 400 });
+    const message = error instanceof Error && error.message.startsWith("Teaching allocation cannot be re-imported")
+      ? error.message
+      : "The file could not be read. Please use the Teaching Members export format.";
+    return NextResponse.json({ error: message }, { status: 400 });
   }
 }

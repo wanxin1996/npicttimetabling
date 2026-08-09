@@ -602,6 +602,61 @@ export function listCourses(): CourseRecord[] {
   }));
 }
 
+export function createManualCourse(input: { code: string; catalog: string | null; sectionCount: number }): CourseRecord {
+  const db = database();
+  // A manual course covers a missing Excel row without inventing a teaching
+  // allocation. Its sections start unassigned so staff can choose teachers explicitly.
+  const create = db.transaction(() => {
+    const id = crypto.randomUUID();
+    db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)").run(id, input.code, input.catalog);
+    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, NULL)");
+    for (let sequence = 1; sequence <= input.sectionCount; sequence += 1) {
+      insertSection.run(crypto.randomUUID(), id, sequence);
+    }
+    return id;
+  });
+  const id = create();
+  // Reuse the normal projection so manually and spreadsheet-created courses always
+  // have exactly the same API shape and downstream behaviour.
+  const course = listCourses().find((item) => item.id === id);
+  if (!course) throw new Error("The course was created but could not be read.");
+  return course;
+}
+
+export function resizeCourseSections(courseId: string, sectionCount: number) {
+  const db = database();
+  // Resize only at the highest sequence numbers, preserving stable labels and all
+  // assignments on LEAD_01 ... LEAD_N that remain within the requested count.
+  const resize = db.transaction(() => {
+    const course = db.prepare("SELECT id FROM courses WHERE id = ?").get(courseId) as { id: string } | undefined;
+    if (!course) return false;
+    const currentSections = db.prepare("SELECT id, sequence FROM course_sections WHERE course_id = ? ORDER BY sequence ASC").all(courseId) as Array<{ id: string; sequence: number }>;
+
+    if (sectionCount > currentSections.length) {
+      const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, NULL)");
+      for (let sequence = currentSections.length + 1; sequence <= sectionCount; sequence += 1) {
+        insertSection.run(crypto.randomUUID(), courseId, sequence);
+      }
+    }
+
+    if (sectionCount < currentSections.length) {
+      const removable = currentSections.filter((section) => section.sequence > sectionCount);
+      const hasScheduledLesson = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? LIMIT 1");
+      const hasStudentGroup = db.prepare("SELECT 1 FROM section_student_groups WHERE section_id = ? LIMIT 1");
+      for (const section of removable) {
+        // A user must first return scheduled lessons to the tray and clear student
+        // groups, preventing a count correction from silently discarding real work.
+        if (hasScheduledLesson.get(section.id)) throw new Error(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
+        if (hasStudentGroup.get(section.id)) throw new Error(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
+      }
+      const removeSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
+      for (const section of removable) removeSection.run(section.id);
+    }
+    return true;
+  });
+  return resize();
+}
+
 export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "allocatedSections" | "configuredSections">) {
   // Course requirements apply to every generated section, so they are saved once
   // on the course rather than duplicated 18 times for a course such as LEAD.
@@ -1066,10 +1121,21 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       courseIds.set(course.code, id);
     }
 
-    // The source file is the current teaching allocation, so rebuild its generated
-    // sections and allocations together. Course configuration remains untouched.
-    db.prepare("DELETE FROM course_sections").run();
-    db.prepare("DELETE FROM teaching_allocations").run();
+    // Rebuild only courses present in this workbook. This preserves a course that
+    // staff added manually because it was omitted from Excel.
+    const importedCourseIds = [...courseIds.values()];
+    const findScheduledCourse = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? LIMIT 1`);
+    for (const courseId of importedCourseIds) {
+      // Re-importing generated sections would cascade-delete their timetable work.
+      // Require staff to use manual corrections after scheduling has begun instead.
+      if (findScheduledCourse.get(courseId)) throw new Error("Teaching allocation cannot be re-imported after one of its courses has been scheduled. Use the manual course and section corrections, or start a new cycle first.");
+    }
+    const deleteCourseSections = db.prepare("DELETE FROM course_sections WHERE course_id = ?");
+    const deleteCourseAllocations = db.prepare("DELETE FROM teaching_allocations WHERE course_id = ?");
+    for (const courseId of importedCourseIds) {
+      deleteCourseSections.run(courseId);
+      deleteCourseAllocations.run(courseId);
+    }
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
     const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, ?)");
     const sequenceByCourse = new Map<string, number>();

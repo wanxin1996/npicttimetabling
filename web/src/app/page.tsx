@@ -526,6 +526,36 @@ export default function Home() {
     }
   }
 
+  async function addManualCourse(event: FormEvent<HTMLFormElement>) {
+    // This correction path handles a course omitted from Excel without inventing a
+    // teacher allocation; staff assign each generated section afterwards.
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: String(data.get("code") ?? ""), catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Manual course could not be created.");
+    event.currentTarget.reset();
+    setShowForm(false);
+    await loadData();
+    setNotice(`${body.code} and ${body.configuredSections} unassigned sections created.`);
+  }
+
+  async function changeSectionCount(event: FormEvent<HTMLFormElement>) {
+    // Reducing the total removes only highest-numbered sections. Ask for explicit
+    // confirmation because even an unscheduled section is meaningful course data.
+    event.preventDefault();
+    if (!selectedCourse) return;
+    const data = new FormData(event.currentTarget);
+    const sectionCount = Number(data.get("sectionCount"));
+    if (sectionCount < sections.length && !window.confirm(`Remove ${sections.length - sectionCount} highest-numbered unscheduled section(s) from ${selectedCourse.code}?`)) return;
+    const response = await fetch(`/api/courses/${selectedCourse.id}/sections`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionCount }) });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "Section count could not be changed.");
+    await loadData();
+    await openSections(selectedCourse);
+    setNotice(`${selectedCourse.code} now has ${sectionCount} sections.`);
+  }
+
   async function saveCourseSetup(event: FormEvent<HTMLFormElement>) {
     // The course list selects one course at a time, making the required settings less overwhelming.
     event.preventDefault();
@@ -576,7 +606,7 @@ export default function Home() {
   }
 
   // The primary button stays contextual so staff do not need to learn separate screens.
-  const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import teaching allocation" : `Add ${view.slice(0, -1).toLowerCase()}`;
+  const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import or add course" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
   if (authScreen !== "ready") {
     // Logged-out users see no scheduling data; first launch becomes administrator setup.
@@ -775,12 +805,20 @@ export default function Home() {
             </div>
 
             {showForm && view === "Courses" && !editingCourse && (
-              /* Excel import is deliberately separate from manual records because it replaces allocations. */
-              <form onSubmit={importTeachingMembers} className="border-b border-blue-100 bg-blue-50/60 p-4">
-                <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
-                <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center"><input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" /><button disabled={importing} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">{importing ? "Importing..." : "Import allocation"}</button></div>
-              </form>
+              /* Import remains the normal path; the second form is the explicit
+                 correction path for a course missing from the workbook. */
+              <div className="grid border-b border-blue-100 bg-blue-50/60 lg:grid-cols-2 lg:divide-x lg:divide-blue-100">
+                <form onSubmit={importTeachingMembers} className="p-4">
+                  <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
+                  <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
+                  <div className="flex flex-col gap-3"><input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" /><button disabled={importing} className="w-fit rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">{importing ? "Importing..." : "Import allocation"}</button></div>
+                </form>
+                <form onSubmit={addManualCourse} className="p-4">
+                  <p className="mb-1 text-sm font-bold text-blue-950">Add a missing course manually</p>
+                  <p className="mb-3 text-xs leading-5 text-blue-800">Use this only when the Teaching Members file omitted a course. New sections start without teachers.</p>
+                  <div className="grid gap-3 sm:grid-cols-[1fr_1fr_110px_auto]"><input name="code" required placeholder="Mod" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" /><input name="catalog" placeholder="Catalog (optional)" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" /><input name="sectionCount" required min="1" max="999" type="number" placeholder="Sections" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" /><button className="rounded-xl bg-blue-700 px-4 py-2 text-sm font-bold text-white" type="submit">Add</button></div>
+                </form>
+              </div>
             )}
 
             {showForm && view === "Courses" && editingCourse && (
@@ -827,7 +865,20 @@ export default function Home() {
 
             {selectedCourse && (
               /* Section assignment is separate from course setup because each class can differ. */
-              <div className="border-t border-slate-200 bg-slate-50 p-4"><div className="mb-3 flex items-center justify-between"><div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div><button onClick={() => { setSelectedCourse(null); setSections([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button></div><div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div></div>
+              <div className="border-t border-slate-200 bg-slate-50 p-4">
+                <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                  <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
+                  <button onClick={() => { setSelectedCourse(null); setSections([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button>
+                </div>
+                {/* Count corrections keep lower-numbered sections stable. The server
+                    refuses to remove any section that still contains scheduling work. */}
+                <form key={`${selectedCourse.id}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <label className="text-xs font-semibold text-amber-950">Total sections<input name="sectionCount" required min="1" max="999" defaultValue={sections.length} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm" /></label>
+                  <button className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900" type="submit">Update count</button>
+                  <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
+                </form>
+                <div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div>
+              </div>
             )}
           </div>}
 
