@@ -12,7 +12,8 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   const sessionsPerWeek = Number(body.sessionsPerWeek);
   const primaryYear = body.primaryYear === null ? null : Number(body.primaryYear);
   const minimumRoomCapacity = body.minimumRoomCapacity === null ? null : Number(body.minimumRoomCapacity);
-  const weekPattern = body.weekPattern;
+  const weekStart = body.weekStart === null ? null : Number(body.weekStart);
+  const weekEnd = body.weekEnd === null ? null : Number(body.weekEnd);
 
   // The department confirmed that every class lasts 2, 3 or 4 whole hours.
   // Enforce that business boundary on the server even if a custom client bypasses HTML.
@@ -22,10 +23,14 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom, body.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) {
     return Response.json({ error: "Room requirements must be true or false." }, { status: 400 });
   }
-  if (!["ALL", "W1_4", "W5_8"].includes(weekPattern)) return Response.json({ error: "Choose a valid teaching week pattern." }, { status: 400 });
+  // Both teaching-week bounds are blank for a normal all-week course. Limited
+  // courses need positive whole bounds with the start no later than the end.
+  if ((weekStart === null) !== (weekEnd === null) || (weekStart !== null && weekEnd !== null && (!Number.isInteger(weekStart) || !Number.isInteger(weekEnd) || weekStart < 1 || weekEnd < weekStart))) {
+    return Response.json({ error: "Leave both teaching weeks blank for all weeks, or enter a valid positive start and end range." }, { status: 400 });
+  }
 
   try {
-    const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays, weekPattern });
+    const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays, weekStart, weekEnd });
     if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch (error) {

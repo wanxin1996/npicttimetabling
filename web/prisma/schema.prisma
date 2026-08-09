@@ -93,8 +93,11 @@ model Course {
   requiresMultiProjector Boolean  @default(false)
   requiresSmartClassroom Boolean  @default(false)
   separateSectionsAcrossDays Boolean @default(false)
-  // ALL, W1_4 or W5_8 lets swap-over courses share a timetable slot without conflict.
+  // Legacy quick-pattern value retained for compatibility with older local backups.
   weekPattern            String   @default("ALL")
+  // Null/null means all weeks; otherwise both positive bounds define the interval.
+  weekStart              Int?
+  weekEnd                Int?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 
