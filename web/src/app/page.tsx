@@ -39,6 +39,7 @@ type Course = {
   requiresLab: boolean;
   requiresMultiProjector: boolean;
   requiresSmartClassroom: boolean;
+  separateSectionsAcrossDays: boolean;
   allocatedSections: number;
   configuredSections: number;
 };
@@ -345,6 +346,7 @@ export default function Home() {
         requiresLab: Boolean(data.get("requiresLab")),
         requiresMultiProjector: Boolean(data.get("requiresMultiProjector")),
         requiresSmartClassroom: Boolean(data.get("requiresSmartClassroom")),
+        separateSectionsAcrossDays: Boolean(data.get("separateSectionsAcrossDays")),
       }),
     });
     const body = await response.json();
@@ -471,7 +473,7 @@ export default function Home() {
                 <p className="mb-1 text-sm font-bold text-emerald-950">Configure {editingCourse.code}</p>
                 <p className="mb-3 text-xs leading-5 text-emerald-800">These requirements are retained when Teaching Members is imported again.</p>
                 <div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Duration (hours)<input name="durationHours" required min="1" defaultValue={editingCourse.durationHours ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label><label className="text-xs font-semibold text-slate-700">Sessions/week<select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="1">1</option><option value="2">2</option></select></label><label className="text-xs font-semibold text-slate-700">Primary year<select name="primaryYear" defaultValue={editingCourse.primaryYear ?? ""} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="">Choose later</option><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select></label><label className="text-xs font-semibold text-slate-700">Minimum capacity<input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label></div>
-                <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-700"><label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} type="checkbox" /> Lab</label><label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} type="checkbox" /> Multi projector</label><label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} type="checkbox" /> Smart classroom</label><button className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white" type="submit">Save course setup</button></div>
+                <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-700"><label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} type="checkbox" /> Lab</label><label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} type="checkbox" /> Multi projector</label><label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} type="checkbox" /> Smart classroom</label><label className="flex items-center gap-2"><input name="separateSectionsAcrossDays" defaultChecked={editingCourse.separateSectionsAcrossDays} type="checkbox" /> Keep sections on different days</label><button className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white" type="submit">Save course setup</button></div>
               </form>
             )}
 

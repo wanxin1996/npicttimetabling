@@ -38,6 +38,7 @@ export type CourseRecord = {
   requiresLab: boolean;
   requiresMultiProjector: boolean;
   requiresSmartClassroom: boolean;
+  separateSectionsAcrossDays: boolean;
   allocatedSections: number;
   configuredSections: number;
 };
@@ -162,6 +163,7 @@ function initializeTables(db: DatabaseInstance) {
       requires_lab INTEGER NOT NULL DEFAULT 0,
       requires_multi_projector INTEGER NOT NULL DEFAULT 0,
       requires_smart_classroom INTEGER NOT NULL DEFAULT 0,
+      separate_sections_across_days INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -216,6 +218,9 @@ function initializeTables(db: DatabaseInstance) {
   const courseColumns = db.prepare("PRAGMA table_info(courses)").all() as Array<{ name: string }>;
   if (!courseColumns.some((column) => column.name === "primary_year")) {
     db.exec("ALTER TABLE courses ADD COLUMN primary_year INTEGER CHECK (primary_year IN (1, 2, 3))");
+  }
+  if (!courseColumns.some((column) => column.name === "separate_sections_across_days")) {
+    db.exec("ALTER TABLE courses ADD COLUMN separate_sections_across_days INTEGER NOT NULL DEFAULT 0");
   }
   const lessonColumns = db.prepare("PRAGMA table_info(scheduled_lessons)").all() as Array<{ name: string }>;
   if (!lessonColumns.some((column) => column.name === "warnings_json")) {
@@ -347,12 +352,12 @@ export function listCourses(): CourseRecord[] {
   const rows = database().prepare(`
     SELECT courses.id, courses.code, courses.catalog, courses.duration_hours, courses.sessions_per_week,
       courses.primary_year, courses.minimum_room_capacity, courses.requires_lab,
-      courses.requires_multi_projector, courses.requires_smart_classroom,
+      courses.requires_multi_projector, courses.requires_smart_classroom, courses.separate_sections_across_days,
       (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
       (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
     FROM courses
     ORDER BY courses.code ASC
-  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; configured_sections: number; allocated_sections: number }>;
+  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; configured_sections: number; allocated_sections: number }>;
   return rows.map((row) => ({
     id: row.id,
     code: row.code,
@@ -364,6 +369,7 @@ export function listCourses(): CourseRecord[] {
     requiresLab: Boolean(row.requires_lab),
     requiresMultiProjector: Boolean(row.requires_multi_projector),
     requiresSmartClassroom: Boolean(row.requires_smart_classroom),
+    separateSectionsAcrossDays: Boolean(row.separate_sections_across_days),
     allocatedSections: row.allocated_sections,
     configuredSections: row.configured_sections,
   }));
@@ -375,8 +381,8 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
   const result = database().prepare(`
     UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
       minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
-      requires_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-  `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, id);
+      requires_smart_classroom = ?, separate_sections_across_days = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, id);
   return result.changes > 0;
 }
 
@@ -507,6 +513,11 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   const warnings: string[] = [];
   const lessonId = input.lessonId ?? "";
   const endHour = input.startHour + input.durationHours;
+  const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.separate_sections_across_days FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; separate_sections_across_days: number };
+  if (courseRule.separate_sections_across_days) {
+    const sameDay = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND sections.course_id = ? AND lessons.day_of_week = ?`).get(lessonId, courseRule.id, input.dayOfWeek);
+    if (sameDay) warnings.push(`${courseRule.code} sections should not be scheduled on the same day`);
+  }
   const overlaps = db.prepare(`SELECT lessons.id, sections.teacher_id, lessons.room_id FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND lessons.day_of_week = ? AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?`).all(lessonId, input.dayOfWeek, endHour, input.startHour) as Array<{ id: string; teacher_id: string | null; room_id: string | null }>;
 
   // Missing assignments are allowed during drafting, but remain visible as warnings.

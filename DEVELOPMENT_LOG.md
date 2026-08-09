@@ -331,3 +331,21 @@
 
 1. 增加少数课程“同一门不同班次不能安排在同一天”的可配置规则。
 2. 建立 Rules & issues 的统一问题清单，按教师、学生班级和规则类型汇总所有警告。
+
+## 2026-08-10｜同一课程班次分散日期规则
+
+### 已完成
+
+- 课程 Configure 表单新增 `Keep sections on different days` 开关，仅对少数需要该限制的课程启用。
+- 启用后，若同一课程已有其他班次安排在相同工作日，系统显示警告但仍允许保存。
+- 规则属于课程配置，重新导入 Teaching Members 时不会被覆盖。
+
+### 本次验证
+
+- `npm run lint` 与 `npm run build` 通过。
+- 已为 LEAD 启用该规则；重新保存 Monday 的 `LEAD_02` 后成功返回 `LEAD sections should not be scheduled on the same day`。
+
+### 下一步
+
+1. 建立 Rules & issues 统一问题清单，集中查看所有已排课程警告。
+2. 加入候选时段功能，仅列出完全没有冲突、警告或不推荐项的时段。

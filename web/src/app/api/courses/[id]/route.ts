@@ -16,11 +16,11 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   if (durationHours === null || !Number.isInteger(durationHours) || durationHours < 1 || !Number.isInteger(sessionsPerWeek) || sessionsPerWeek < 1 || (primaryYear !== null && ![1, 2, 3].includes(primaryYear)) || (minimumRoomCapacity !== null && (!Number.isInteger(minimumRoomCapacity) || minimumRoomCapacity < 1))) {
     return Response.json({ error: "Duration, weekly sessions, year and room capacity must use valid whole numbers." }, { status: 400 });
   }
-  if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom].every((value) => typeof value === "boolean")) {
+  if (![body.requiresLab, body.requiresMultiProjector, body.requiresSmartClassroom, body.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) {
     return Response.json({ error: "Room requirements must be true or false." }, { status: 400 });
   }
 
-  const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom });
+  const saved = updateCourseSetup(id, { durationHours, sessionsPerWeek, primaryYear, minimumRoomCapacity, requiresLab: body.requiresLab, requiresMultiProjector: body.requiresMultiProjector, requiresSmartClassroom: body.requiresSmartClassroom, separateSectionsAcrossDays: body.separateSectionsAcrossDays });
   if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
   return Response.json({ ok: true });
 }
