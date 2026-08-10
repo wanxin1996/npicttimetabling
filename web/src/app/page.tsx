@@ -571,11 +571,14 @@ export default function Home() {
   async function saveUnavailableWindow(event: FormEvent<HTMLFormElement>, kind: "Teacher" | "Year") {
     // Teacher and year forms share one API while keeping their owner selectors easy to understand.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // Keep the real form element before awaiting the server. React clears
+    // event.currentTarget after the event callback yields, but this reference stays valid.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "Unavailable time could not be saved.");
-    event.currentTarget.reset();
+    form.reset();
     await openRules();
     setNotice(`${kind} unavailable time saved.`);
   }
@@ -708,11 +711,14 @@ export default function Home() {
   async function createAccount(event: FormEvent<HTMLFormElement>) {
     // New schedulers receive normal access; only the initial administrator can create them.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // Capture the form before the request so the success cleanup cannot read a
+    // cleared React event target after the asynchronous response returns.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "Account could not be created.");
-    event.currentTarget.reset();
+    form.reset();
     await openAccounts();
     setNotice(`${body.username} account created.`);
   }
@@ -742,11 +748,13 @@ export default function Home() {
     // Administrators can replace a forgotten password without learning the old one;
     // the server also revokes that user's existing sessions after the reset.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // Retain the submitted form itself because the React event target is temporary.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "Password could not be reset.");
-    event.currentTarget.reset();
+    form.reset();
     setNotice("Password reset. Existing sessions for that account were signed out.");
   }
 
@@ -818,7 +826,10 @@ export default function Home() {
     // Two explicit acknowledgements plus an exact phrase form the agreed repeated
     // confirmation. The server independently checks the phrase before clearing data.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // The request and reference-data reload are asynchronous, so retain the form
+    // element now for the final reset instead of returning to event.currentTarget.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.");
     const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? "") }) });
     const body = await response.json();
@@ -829,7 +840,7 @@ export default function Home() {
     setSelectedCourse(null);
     setSections([]);
     await loadData();
-    event.currentTarget.reset();
+    form.reset();
     setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.");
   }
 
@@ -837,14 +848,16 @@ export default function Home() {
     // Restoring replaces any work created after the clear, so it requires its own
     // acknowledgement and exact phrase rather than a one-click undo.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // Store a stable form reference before waiting for the restore response.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.");
     const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? "") }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "The emergency backup could not be restored.");
     setCurrentCycle(body);
     await loadData();
-    event.currentTarget.reset();
+    form.reset();
     setNotice("The last emergency cycle backup was restored.");
   }
 
@@ -877,7 +890,10 @@ export default function Home() {
   async function addRecord(event: FormEvent<HTMLFormElement>) {
     // One form handler supports the three manually maintained reference-data views.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // The save request is asynchronous. Capture the form now so successful teacher,
+    // student-group and room saves can clear it without using a released React event.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     let endpoint = "";
     let method = "POST";
     let payload: Record<string, unknown> = {};
@@ -918,7 +934,7 @@ export default function Home() {
       return;
     }
 
-    event.currentTarget.reset();
+    form.reset();
     setShowForm(false);
     setEditingTeacher(null);
     setEditingGroup(null);
@@ -934,7 +950,10 @@ export default function Home() {
   async function importTeachingMembers(event: FormEvent<HTMLFormElement>) {
     // This separate handler uploads the Excel file without converting it to JSON in the browser.
     event.preventDefault();
-    const formData = new FormData(event.currentTarget);
+    // Keep the form element across the long workbook upload; event.currentTarget is
+    // no longer reliable after the first await even when the import itself succeeds.
+    const form = event.currentTarget;
+    const formData = new FormData(form);
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.");
     setImporting(true);
@@ -943,7 +962,7 @@ export default function Home() {
     const body = await response.json();
     setImporting(false);
     if (!response.ok) return setNotice(body.error ?? "Teaching allocation import failed.");
-    event.currentTarget.reset();
+    form.reset();
     try {
       await loadData();
       setNotice(`Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${body.ignoredZeroRows} zero-allocation rows were ignored.`);
@@ -956,11 +975,13 @@ export default function Home() {
     // This correction path handles a course omitted from Excel without inventing a
     // teacher allocation; staff assign each generated section afterwards.
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    // Retain the form before awaiting the API so the success reset uses a stable node.
+    const form = event.currentTarget;
+    const data = new FormData(form);
     const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: String(data.get("code") ?? ""), catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "Manual course could not be created.");
-    event.currentTarget.reset();
+    form.reset();
     setShowForm(false);
     await loadData();
     setNotice(`${body.code} and ${body.configuredSections} unassigned sections created.`);
