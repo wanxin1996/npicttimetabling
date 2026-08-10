@@ -597,7 +597,19 @@ export default function Home() {
     if (lessonId) {
       const lesson = lessons.find((item) => item.id === lessonId);
       if (!lesson) return;
-      const response = await fetch(`/api/schedule/lessons/${lessonId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek, startHour, roomId: lesson.roomId, teacherId: lesson.teacherId, revision: lesson.revision }) });
+      // 移动课程只改变星期和时间，但 PATCH 接口会整体保存班次资料；因此必须把现有学生班级 ID 原样带回，避免移动时误清空班级或被完整性检查拒绝。
+      const response = await fetch(`/api/schedule/lessons/${lessonId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dayOfWeek,
+          startHour,
+          roomId: lesson.roomId,
+          teacherId: lesson.teacherId,
+          studentGroupIds: lesson.studentGroupIds,
+          revision: lesson.revision,
+        }),
+      });
       const body = await response.json();
       if (!response.ok) return setNotice(body.error ?? "The lesson could not be moved.");
       setEditingLesson(null);
