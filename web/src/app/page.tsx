@@ -1259,7 +1259,9 @@ export default function Home() {
                       <div className="mt-1.5 grid grid-cols-2 gap-1"><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); setPlacingSection(section); setEditingLesson(null); setCandidateSection(null); }} className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white" type="button">Schedule</button><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); void findCandidateSlots(section); }} className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400" type="button">Clear slots</button></div>
                     </div>
                   ))}
-                  {filteredUnscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">{unscheduledSections.length === 0 ? "No configured sessions waiting for this year." : "No sessions match these filters."}</p>}
+                  {/* Excel 导入只知道课程和教师分配，无法自动猜测课时与所属年级。
+                      当待排区为空时，直接解释缺少的资料并提供课程设置入口，避免老师误以为导入失败。 */}
+                  {filteredUnscheduledSections.length === 0 && (unscheduledSections.length === 0 ? <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-xs leading-5 text-blue-900"><p className="font-black">No sessions are ready for Year {timetableYear} yet.</p><p className="mt-1">The allocation was imported, but every course still needs its duration and primary year before its sections can enter this tray.</p><button onClick={() => openView("Courses")} className="mt-2 rounded-lg bg-[#153d75] px-3 py-1.5 font-bold text-white" type="button">Configure courses</button></div> : <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No sessions match these filters.</p>)}
                 </div>
               </aside>
 
