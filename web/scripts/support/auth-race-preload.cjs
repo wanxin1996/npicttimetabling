@@ -41,6 +41,65 @@ if (testMode !== exactTestMode || !/^[AB]$/.test(processLabel) || !tokenHasExpec
 const armFile = path.join(controlDirectory, "arm.json");
 const originalTimingSafeEqual = crypto.timingSafeEqual;
 const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+const candidateSnapshotSqlMarker = "/* timetabling:candidate-snapshot */";
+const candidateRoomUpdateSqlMarker = "/* timetabling:candidate-race-room-update */";
+
+function waitForRaceRelease(releaseFile, nonce, description) {
+  // 所有同步屏障都要求 release 文件内容精确匹配随机 nonce；只创建文件名不能误放行。
+  // 二十秒硬上限保证主测试异常退出时，standalone 不会永久卡在同步等待中。
+  const deadline = Date.now() + 20_000;
+  while (true) {
+    try {
+      if (fs.readFileSync(releaseFile, "utf8").trim() === nonce) return;
+    } catch {
+      // release 尚未建立属于正常测试时序，短暂休眠后继续检查。
+    }
+    if (Date.now() >= deadline) throw new Error(`Timed out while waiting for the ${description} release nonce.`);
+    Atomics.wait(sleepBuffer, 0, 0, 25);
+  }
+}
+
+function consumeCandidateSnapshotArm(rooms) {
+  // 只有 A 进程负责候选读取竞态。带 marker 的 Active rooms 查询已经完整返回后，
+  // 原子建立 ready 并暂停，使主测试可以让 B 在同一时刻修改教室容量。
+  if (processLabel !== "A") return;
+  const candidateArmFile = path.join(controlDirectory, "candidate-snapshot-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(candidateArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.roomId !== "string" || !Array.isArray(rooms)
+      || !rooms.some((room) => room && room.id === control.roomId)) return;
+    const readyFile = path.join(controlDirectory, `candidate-snapshot-ready-A-${control.nonce}.json`);
+    fs.renameSync(candidateArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `candidate-snapshot-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "candidate snapshot");
+  } catch (error) {
+    // arm 不存在表示普通候选请求；已经被同一请求消费也可直接继续。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeCandidateRoomUpdateArm(roomId, changes) {
+  // B 的真实 UPDATE 已经在 IMMEDIATE 事务内改到目标教室后才建立 ready。
+  // 此时 HTTP 若仍未返回，说明 A 的候选读快照正在阻止这笔修改提交。
+  if (processLabel !== "B" || changes !== 1) return;
+  const updateArmFile = path.join(controlDirectory, "candidate-room-update-arm-B.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(updateArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.roomId !== roomId) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    const readyFile = path.join(controlDirectory, `candidate-room-update-ready-B-${control.nonce}.json`);
+    fs.renameSync(updateArmFile, readyFile);
+  } catch (error) {
+    // 没有 arm 的普通教室编辑不参与竞态同步，必须保持原执行路径。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
 
 function consumeWriterArm() {
   // 每个 standalone 拥有独立 writer arm。命中 run token、进程标签和随机 nonce 后，
@@ -65,7 +124,34 @@ function patchBetterSqlite3(Database) {
   // require 结果，而不是只 patch 项目根 node_modules 中可能完全不同的构造器实例。
   if (!Database?.prototype || Database.prototype.__timetablingRacePatched) return Database;
   const originalTransaction = Database.prototype.transaction;
+  const originalPrepare = Database.prototype.prepare;
   Object.defineProperty(Database.prototype, "__timetablingRacePatched", { value: true });
+  Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
+    // 只包装两个内部 marker：候选 Active rooms 读取，以及本回归使用的教室 UPDATE。
+    // 其他 SQL 和 Statement 方法完全透明。
+    const statement = Reflect.apply(originalPrepare, this, argumentsList);
+    const [sql] = argumentsList;
+    if (typeof sql !== "string") return statement;
+    if (sql.includes(candidateSnapshotSqlMarker)) {
+      const originalAll = statement.all;
+      statement.all = function candidateSnapshotAwareAll(...allArguments) {
+        const rows = Reflect.apply(originalAll, this, allArguments);
+        // `.all()` 已经把旧教室行物化后才暂停，旧实现若随后读取新容量会产生可识别的混合结果。
+        consumeCandidateSnapshotArm(rows);
+        return rows;
+      };
+    }
+    if (sql.includes(candidateRoomUpdateSqlMarker)) {
+      const originalRun = statement.run;
+      statement.run = function candidateRoomUpdateAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        // 教室 ID 是 UPDATE 的最后一个参数；只有目标行确实改变后才允许写入 ready 证据。
+        consumeCandidateRoomUpdateArm(runArguments.at(-1), result.changes);
+        return result;
+      };
+    }
+    return statement;
+  };
   Database.prototype.transaction = function testAwareTransaction(...argumentsList) {
     const transaction = originalTransaction.apply(this, argumentsList);
     // 四个 wrapper 都把调用者的 `this` 原样传给真实事务函数；测试同步点不能改变
@@ -144,18 +230,8 @@ crypto.timingSafeEqual = function testAwareTimingSafeEqual(...argumentsList) {
     throw error;
   }
 
-  // release 文件内容必须精确等于本次随机 nonce，单纯创建同名文件不能解除暂停。
-  // 二十秒上限确保主测试崩溃时 preload 不会永久挂起 Node 进程。
+  // 复用统一 nonce 屏障；认证 ready 仍精确表示旧密码已经验证成功。
   const releaseFile = path.join(controlDirectory, `release-${control.nonce}.txt`);
-  const deadline = Date.now() + 20_000;
-  while (true) {
-    try {
-      if (fs.readFileSync(releaseFile, "utf8").trim() === control.nonce) break;
-    } catch {
-      // release 尚未建立属于预期状态，短暂休眠后再次检查。
-    }
-    if (Date.now() >= deadline) throw new Error("Timed out while waiting for the authentication race release nonce.");
-    Atomics.wait(sleepBuffer, 0, 0, 25);
-  }
+  waitForRaceRelease(releaseFile, control.nonce, "authentication race");
   return passwordsMatch;
 };

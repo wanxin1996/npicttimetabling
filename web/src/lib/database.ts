@@ -975,6 +975,7 @@ export function updateRoom(id: string, input: { code: string; capacity: number; 
   const db = database();
   const updateTransaction = db.transaction(() => {
     const result = db.prepare(`
+      /* timetabling:candidate-race-room-update */
       UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
         is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
@@ -1874,7 +1875,10 @@ function calculatePlacementWarnings(input: PlacementWarningInput, statements: Pl
   // 可选政策规则可能每学期调整；下面的教师、班级、教室和时间重叠属于核心冲突，
   // 始终无条件检查，刻意不放进可关闭规则集合。
   const enabledRules = new Set((statements.enabledRules.all() as Array<{ rule_key: string }>).map((row) => row.rule_key));
-  const courseRule = statements.courseRule.get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null };
+  const courseRule = statements.courseRule.get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null } | undefined;
+  // 正常外键和候选只读快照保证班次一定关联课程；仍显式检查内部不变量，
+  // 避免未来事务边界调整后把 undefined 解引用文字意外送进路由错误处理。
+  if (!courseRule) throw new Error("Warning calculation source was not found.");
   if (courseRule.sessions_per_week > 1 && enabledRules.has("separate_weekly_sessions")) {
     // 同一班次每周分开的两次课不应排在同一天，
     // 否则名义上的“每周两次”会变成同一天的一段长课。
@@ -2059,10 +2063,51 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   return issues;
 }
 
-export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
+export class CandidateSlotsInputError extends Error {
+  // 课程时长、每周课次或教师资料不完整时，老师可以根据这段安全业务提示修正资料。
+  constructor(message: string) {
+    super(message);
+    this.name = "CandidateSlotsInputError";
+  }
+}
+
+export class CandidateSlotsNotFoundError extends Error {
+  // 另一账号或新周期已经删除班次时使用明确 404，不把内部 undefined／SQLite 文字发给浏览器。
+  constructor() {
+    super("Course section not found.");
+    this.name = "CandidateSlotsNotFoundError";
+  }
+}
+
+export class CandidateSlotsStateConflictError extends Error {
+  // 候选只适用于仍存在的待排课次；另一位老师可能已排课，或把每周两次改成一次。
+  constructor() {
+    super("This course section or weekly session has changed. Reload the latest timetable before finding clear options.");
+    this.name = "CandidateSlotsStateConflictError";
+  }
+}
+
+export class CandidateSlotsBusyError extends Error {
+  // 极短的 SQLite 锁竞争属于可以重试的暂时状态；独立类型让 API 安全返回 503。
+  constructor() {
+    super("Another scheduler is updating timetable data. Try finding clear options again in a moment.");
+    this.name = "CandidateSlotsBusyError";
+  }
+}
+
+function candidateSlotsDatabase() {
+  // database() 初始化也可能遇到另一个进程的写锁，必须与候选读取中的 BUSY 使用相同安全语义。
+  try {
+    return database();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new CandidateSlotsBusyError();
+    throw error;
+  }
+}
+
+function calculateCandidateSlotsFromSnapshot(db: DatabaseInstance, sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
   // 候选搜索只提供建议，不自动排课：系统评估所有有效教室和整点时段，
   // 只返回在当前已启用规则下完全没有警告的组合。
-  const db = database();
   // 候选搜索读取班次已保存的教师、学生班级、时长及教室要求。
   // 资料不完整时不返回可能误导用户的候选结果。
   const section = db.prepare(`
@@ -2072,20 +2117,27 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
     JOIN courses ON courses.id = sections.course_id
     WHERE sections.id = ?
   `).get(sectionId) as { id: string; sequence: number; teacher_id: string | null; code: string; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
-  if (!section) throw new Error("Course section not found.");
-  if (!section.duration_hours) throw new Error("Configure the course duration before finding candidate slots.");
-  if (!Number.isInteger(occurrence) || occurrence < 1 || occurrence > section.sessions_per_week) throw new Error("Choose a valid weekly session.");
+  if (!section) throw new CandidateSlotsNotFoundError();
+  if (!section.duration_hours) throw new CandidateSlotsInputError("Configure the course duration before finding candidate slots.");
+  if (!Number.isSafeInteger(occurrence) || ![1, 2].includes(occurrence)) throw new CandidateSlotsInputError("Choose a valid weekly session.");
+  if (occurrence > section.sessions_per_week) throw new CandidateSlotsStateConflictError();
   const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? AND occurrence = ?").get(sectionId, occurrence);
-  if (alreadyScheduled) throw new Error("Candidate slots are only available for an unscheduled weekly session.");
+  if (alreadyScheduled) throw new CandidateSlotsStateConflictError();
 
   // Clear slots 只展示“完全没有问题”的组合。没有教师或教师已停用时，不应返回一个含糊的空清单，
   // 而是直接说明需要先选择 Active 教师；老师仍可绕过候选功能手工放课并保留红色警告。
   const assignedTeacher = section.teacher_id ? db.prepare("SELECT is_active FROM teachers WHERE id = ?").get(section.teacher_id) as { is_active: number } | undefined : undefined;
-  if (!assignedTeacher || assignedTeacher.is_active !== 1) throw new Error("Assign an active teacher before looking for clear options.");
+  if (!assignedTeacher || assignedTeacher.is_active !== 1) throw new CandidateSlotsInputError("Assign an active teacher before looking for clear options.");
 
   // 遍历每个启用教室和所有合法整点位置；现有警告引擎是唯一判断标准，
   // 只有零条警告的排法才会通过候选筛选。
-  const rooms = db.prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom FROM rooms WHERE is_active = 1 ORDER BY code").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
+  const rooms = db.prepare(`
+    /* timetabling:candidate-snapshot */
+    SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom
+    FROM rooms
+    WHERE is_active = 1
+    ORDER BY code
+  `).all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
   const slots: CandidateSlotRecord[] = [];
   const preferredStartRule = db.prepare("SELECT is_enabled FROM rule_settings WHERE rule_key = 'prefer_9am'").get() as { is_enabled: number } | undefined;
   // 一次候选搜索会评估许多教室和时段。查询模板只在这里准备一次，
@@ -2111,6 +2163,23 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
     }
   }
   return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, occurrence, sessionsPerWeek: section.sessions_per_week, slots };
+}
+
+export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
+  const db = candidateSlotsDatabase();
+  // SQLite 的 DEFERRED 只读事务在第一条 SELECT 时固定一致快照。候选计算约两百毫秒，
+  // 期间另一进程可以先取得 RESERVED 写锁，但提交会等本次读取结束；一个响应不会混合修改前后的规则或课程。
+  try {
+    // transaction wrapper 的建立和执行都放进同一个错误边界；未来 SQLite 若在准备
+    // BEGIN／COMMIT 控制语句时遇到锁，也会稳定转换为安全 503。
+    const readConsistentSnapshot = db.transaction(() => calculateCandidateSlotsFromSnapshot(db, sectionId, occurrence));
+    return readConsistentSnapshot.deferred();
+  } catch (error) {
+    if (error instanceof CandidateSlotsInputError || error instanceof CandidateSlotsNotFoundError
+      || error instanceof CandidateSlotsStateConflictError || error instanceof CandidateSlotsBusyError) throw error;
+    if (isSqliteBusyError(error)) throw new CandidateSlotsBusyError();
+    throw error;
+  }
 }
 
 function listSectionStudentGroupAssignments(db: DatabaseInstance, sectionId: string) {

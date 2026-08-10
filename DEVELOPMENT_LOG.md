@@ -2127,3 +2127,35 @@
 1. 修复 Candidate API 的既有一致性边界：在短只读快照中一次读取候选所需资料，再在内存中计算，避免另一进程恰好修改课程或 Cycle 时单个响应混合两个版本；同时把未知数据库异常改为安全通用 500，不能原样当成 400 返回。
 2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
 3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并另建旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。
+
+## 2026-08-11｜Candidate API 使用一致读快照并收紧安全错误边界
+
+### 已完成
+
+- Candidate／Clear slots 的完整读取和警告计算现在放在同一个 SQLite `DEFERRED` 只读事务中；事务第一条查询固定已提交快照，同一响应不能再把修改前的课程／教室清单与修改后的容量、规则、教师状态或排课记录拼在一起。
+- 当前实现刻意选择最低风险的完整读事务，而不是一次性重写 warning 引擎。代价是在 rollback journal 模式下约 150–220 ms 的候选计算期间，另一进程可以执行修改但 COMMIT 会短暂等待读事务结束；现有 5 秒 busy timeout 和单实例部署下有充分余量。
+- 为候选业务新增明确错误类型：资料未完成为 400、班次不存在为 404、旧页面的 occurrence 已被移除或已排课为带 `CANDIDATE_REQUEST_STALE` 的 409、SQLite `BUSY／LOCKED` 为带 `Retry-After: 1` 的 503。
+- 未知数据库、schema、磁盘或程序异常不再把 `error.message` 原样当作 400 发给浏览器；服务器只记录内部详情，客户端固定收到 `Candidate slots could not be calculated. Try again.` 500，避免泄露 SQLite、表名、列名或路径。
+- occurrence 查询参数缺省为第一次课；显式参数只接受精确的 `1` 或 `2`，空白、0、3、科学记数法和 `+1` 都得到固定 400，不再依赖 JavaScript 宽松数字转换。
+- 警告计算读取不到关联课程时新增显式内部不变量检查，不能再以 `undefined` 解引用 TypeError 偶然决定 HTTP 响应；正常外键和同一读快照下该分支不会出现。
+- 扩充 production API CRUD 回归：验证缺失班次 404、五类非法 occurrence 400、未分配 Active 教师 400、有效候选非空、课次排入后候选 409，以及错误正文不含 SQLite／表列／stack 文字。
+- 扩充双 standalone 跨进程回归：课程最低容量30、唯一 Active 教室容量20时旧候选精确为空；修改为40后新候选精确为35项，每天只含 09、10、11、13、14、15、16 点且全部显示容量40。
+- 跨进程测试会让 A 在真实 Active rooms 查询已经物化容量20后暂停，再由 B 的正式 Room PATCH 在 IMMEDIATE 事务内真实执行容量40的 UPDATE；A 的读锁仍存在时 B 的 HTTP 必须等待 COMMIT，释放 A 后其响应只能是完整旧状态，随后 A／B 都读取完整新状态。
+- 测试同步点只由显式 `node --require` 的隔离 preload 使用，并绑定随机 run token、A／B 标签、随机 nonce、系统临时目录、数据库和 control 直属路径；生产启动不加载，HTTP 无法启用。异常、Ctrl-C 和 SIGTERM 都会先写入匹配 release，再停止进程并删除整个临时目录。
+- 新增及修改的数据库、API 和测试区块都写入面向基础开发人员的中文注释；老师尚未提交的 UX package 命令、脚本和文档继续保持不动。
+
+### 本次验证
+
+- `node --check` 两个跨进程脚本、`git diff --check`、独立 TypeScript 检查、ESLint 和 production build 全部通过。
+- `npm run test:concurrency` 完整通过：候选快照、首次排课、Course Setup、Cycle Start／Restore、密码重置和账号停用六组跨进程竞态全部成功，没有 500、503或 SQLite 泄露。
+- 最终 `npm run test:release` 完整通过：身份、Excel、Teaching allocation 重导、全部 CRUD／revision、warning 原子回滚、完整备份、Cycle、外键、跨进程和374班次规模性能全部成功。
+- 最新满载基线为 Issues p95 中位 `15.5 ms`、Year timetable p95 `13.0 ms`、30间教室候选中位 `145.3 ms`、六账号30请求轮询整轮 `56.2 ms`／请求 p95 `51.4 ms`、360条 warning 重算 `62.8 ms`、一个写入加十个读取 `93.9 ms`。
+- Prepared Statement 结构审计仍为候选 `16 prepare／12,600 execute`、全量警告刷新 `16／5,288`；新增一致读事务没有破坏上一任务的查询复用或数量级性能。
+- 所有自动化只使用 `os.tmpdir()` 下的临时 SQLite 和随机 localhost 端口；测试结束没有残留 `timetabling-api-*` 目录。
+- 正式 `web/data/timetabling.db` 修改时间仍为 `2026-08-11 04:45:51`、大小 544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空；本轮测试没有连接或修改正式数据库。
+
+### 下一步
+
+1. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务一次性加载完整资料 + 事务外纯内存计算”，缩短 rollback journal 下对其他老师 COMMIT 的等待；当前完整读事务已先保证正确性。
+2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
+3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。

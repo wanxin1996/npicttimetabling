@@ -22,7 +22,7 @@ let authRaceRunToken;
 let administratorCookie = "";
 let cleanupPromise;
 const serverHandles = [];
-const activeAuthRaceReleases = new Map();
+const activeRaceReleases = new Map();
 
 function report(message) {
   // 每组业务保证完成后只输出一行，便于基础开发人员快速定位失败阶段。
@@ -232,12 +232,12 @@ async function login(server, username, password, expectedStatus = 200) {
   };
 }
 
-async function waitForWriterReady(server, readyFile, expectedControl, requestSettled, description) {
-  // Preload 会在该进程调用真实 `.immediate()` 前把 arm 原子改名为 ready；
-  // 因此读到完整 control 就能确定请求已经到达写事务，而不是仍在网络队列中。
+async function waitForRaceReady(server, readyFile, expectedControl, requestSettled, description, markerDescription) {
+  // Preload 只有到达指定 SQLite 读取／写入同步点后才会把 arm 原子改名为 ready；
+  // 因此完整 control 比固定 sleep 更能证明两个真实进程已经按预期交错。
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
-    assert.equal(requestSettled(), false, `${description} completed before reaching its SQLite lock wait.`);
+    assert.equal(requestSettled(), false, `${description} completed before reaching ${markerDescription}.`);
     try {
       const readyControl = JSON.parse(await readFile(readyFile, "utf8"));
       assert.deepEqual(readyControl, expectedControl);
@@ -247,7 +247,7 @@ async function waitForWriterReady(server, readyFile, expectedControl, requestSet
     }
     await delay(25);
   }
-  throw new Error(`${description} never reached the writer marker in server ${server.label}.`);
+  throw new Error(`${description} never reached ${markerDescription} in server ${server.label}.`);
 }
 
 async function runWhileBothWritersAreBlocked(description, serverA, serverB, leftRequest, rightRequest) {
@@ -290,8 +290,8 @@ async function runWhileBothWritersAreBlocked(description, serverA, serverB, left
     // 至少持锁 400ms，并且必须取得 A/B 各自在 `.immediate()` 前写出的 ready。
     await Promise.all([
       delay(overlapHoldMilliseconds),
-      waitForWriterReady(serverA, writerFiles[0].ready, writerControls[0], () => settled[0], description),
-      waitForWriterReady(serverB, writerFiles[1].ready, writerControls[1], () => settled[1], description),
+      waitForRaceReady(serverA, writerFiles[0].ready, writerControls[0], () => settled[0], description, "its SQLite writer entry"),
+      waitForRaceReady(serverB, writerFiles[1].ready, writerControls[1], () => settled[1], description, "its SQLite writer entry"),
     ]);
     assert.deepEqual(
       settled,
@@ -357,6 +357,162 @@ function readDatabaseValue(sql, ...parameters) {
   } finally {
     db.close();
   }
+}
+
+function assertCandidateSnapshot(body, fixture, expectedCapacity) {
+  // 旧快照容量20不满足课程最低30，所以必须没有候选；新快照容量40时，
+  // 午餐规则会排除12:00，留下每天七个2小时整点位置，共35项。
+  assert.equal(body.sectionLabel, "CROSS_PROCESS_02");
+  assert.equal(body.occurrence, 1);
+  assert.equal(body.sessionsPerWeek, 1);
+  assert(Array.isArray(body.slots));
+  if (expectedCapacity === 20) {
+    assert.deepEqual(body.slots, []);
+    return;
+  }
+  const expectedStarts = [9, 10, 11, 13, 14, 15, 16];
+  const expectedKeys = [];
+  for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
+    for (const startHour of expectedStarts) expectedKeys.push(`${dayOfWeek}-${startHour}`);
+  }
+  assert.equal(body.slots.length, expectedKeys.length);
+  assert.deepEqual(
+    body.slots.map((slot) => `${slot.dayOfWeek}-${slot.startHour}`).sort(),
+    expectedKeys.sort(),
+  );
+  for (const slot of body.slots) {
+    assert.equal(slot.endHour, slot.startHour + 2);
+    assert.equal(slot.roomId, fixture.candidateRoom.id);
+    assert.equal(slot.roomCode, fixture.candidateRoom.code);
+    assert.equal(slot.roomCapacity, 40);
+    assert.deepEqual(slot.roomFeatures, []);
+  }
+}
+
+async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
+  const candidatePath = `/api/course-sections/${fixture.candidateSectionId}/candidates?occurrence=1`;
+  const roomPayload = (capacity) => ({
+    code: fixture.candidateRoom.code,
+    capacity,
+    hasLab: false,
+    hasMultiProjector: false,
+    isSmartClassroom: false,
+  });
+
+  // 先分别证明夹具的完整旧状态和完整新状态，避免竞态断言只因候选功能本身坏掉而假绿。
+  const oldBaseline = await requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie });
+  assertCandidateSnapshot(oldBaseline.body, fixture, 20);
+  await requestApi(serverB, `/api/rooms/${fixture.candidateRoom.id}`, {
+    method: "PATCH",
+    cookie: fixture.schedulerBCookie,
+    json: roomPayload(40),
+  });
+  const newBaseline = await requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie });
+  assertCandidateSnapshot(newBaseline.body, fixture, 40);
+  await requestApi(serverA, `/api/rooms/${fixture.candidateRoom.id}`, {
+    method: "PATCH",
+    cookie: fixture.schedulerACookie,
+    json: roomPayload(20),
+  });
+  const resetBaseline = await requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie });
+  assertCandidateSnapshot(resetBaseline.body, fixture, 20);
+
+  // A 会在 Active rooms 已按容量20物化后暂停；B 随后真实执行容量40的 UPDATE。
+  // 没有一致读事务时，后续 warning SQL 可能看到40，却把旧 rooms 行的20写入响应。
+  const snapshotNonce = randomBytes(16).toString("hex");
+  const updateNonce = randomBytes(16).toString("hex");
+  const snapshotControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: snapshotNonce,
+    roomId: fixture.candidateRoom.id,
+  };
+  const updateControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: updateNonce,
+    roomId: fixture.candidateRoom.id,
+  };
+  const files = {
+    snapshotArm: path.join(authRaceControlDirectory, "candidate-snapshot-arm-A.json"),
+    snapshotTemporary: path.join(authRaceControlDirectory, `candidate-snapshot-arm-A-${snapshotNonce}.tmp`),
+    snapshotReady: path.join(authRaceControlDirectory, `candidate-snapshot-ready-A-${snapshotNonce}.json`),
+    snapshotRelease: path.join(authRaceControlDirectory, `candidate-snapshot-release-${snapshotNonce}.txt`),
+    updateArm: path.join(authRaceControlDirectory, "candidate-room-update-arm-B.json"),
+    updateTemporary: path.join(authRaceControlDirectory, `candidate-room-update-arm-B-${updateNonce}.tmp`),
+    updateReady: path.join(authRaceControlDirectory, `candidate-room-update-ready-B-${updateNonce}.json`),
+  };
+  activeRaceReleases.set(files.snapshotRelease, snapshotNonce);
+  await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
+  await rename(files.snapshotTemporary, files.snapshotArm);
+
+  let candidateSettled = false;
+  let roomUpdateSettled = false;
+  const pendingCandidate = requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie });
+  pendingCandidate.then(
+    () => { candidateSettled = true; },
+    () => { candidateSettled = true; },
+  );
+  let pendingRoomUpdate;
+  try {
+    await waitForRaceReady(
+      serverA,
+      files.snapshotReady,
+      snapshotControl,
+      () => candidateSettled,
+      "Candidate snapshot consistency",
+      "the materialized Active rooms snapshot",
+    );
+    await writeFile(files.updateTemporary, JSON.stringify(updateControl), { flag: "wx", mode: 0o600 });
+    await rename(files.updateTemporary, files.updateArm);
+    pendingRoomUpdate = requestApi(serverB, `/api/rooms/${fixture.candidateRoom.id}`, {
+      method: "PATCH",
+      cookie: fixture.schedulerBCookie,
+      json: roomPayload(40),
+    });
+    pendingRoomUpdate.then(
+      () => { roomUpdateSettled = true; },
+      () => { roomUpdateSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      files.updateReady,
+      updateControl,
+      () => roomUpdateSettled,
+      "Candidate snapshot consistency",
+      "the applied room UPDATE",
+    );
+
+    // UPDATE 已执行但 A 仍持有 DELETE-journal 的 SHARED 快照；B 的 COMMIT 必须等候。
+    // 四百毫秒与现有双写重叠测试使用相同宽松窗口，且远低于 SQLite 的5秒 busy timeout。
+    const writerReadyAt = Date.now();
+    await delay(overlapHoldMilliseconds);
+    assert.equal(candidateSettled, false, "Candidate request left its snapshot barrier too early.");
+    assert.equal(roomUpdateSettled, false, "Room update committed while the candidate read snapshot was still paused.");
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
+    const [raceCandidate, roomUpdate] = await Promise.all([pendingCandidate, pendingRoomUpdate]);
+    assert.equal(roomUpdate.body.ok, true);
+    assert(Date.now() - writerReadyAt < 2_000, "Room update waited too long for the candidate snapshot to finish.");
+    assertCandidateSnapshot(raceCandidate.body, fixture, 20);
+
+    // A 的旧响应完成后，两个独立进程都必须立即看到同一个完整新版本。
+    const [latestA, latestB] = await Promise.all([
+      requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie }),
+    ]);
+    assertCandidateSnapshot(latestA.body, fixture, 40);
+    assertCandidateSnapshot(latestB.body, fixture, 40);
+    assert.deepEqual(latestA.body, latestB.body);
+  } finally {
+    // 任一断言失败都先释放 A，再等待已启动请求结束，避免 preload 或 SQLite 锁残留。
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce).catch(() => undefined);
+    activeRaceReleases.delete(files.snapshotRelease);
+    await Promise.allSettled([pendingCandidate, pendingRoomUpdate].filter(Boolean));
+    await Promise.all(Object.values(files).map((filename) => rm(filename, { force: true }).catch(() => undefined)));
+  }
+  report("候选建议在跨进程教室更新期间保持单一 SQLite 读快照");
 }
 
 async function verifyConcurrentFirstPlacement(serverA, serverB, fixture) {
@@ -689,7 +845,7 @@ function storedPasswordFingerprint(accountId) {
   return createHash("sha256").update(Buffer.from(expectedHex, "hex")).digest("hex");
 }
 
-async function releaseAuthenticationRace(releaseFile, nonce) {
+async function releaseRaceBarrier(releaseFile, nonce) {
   // release 内容必须精确等于本次 nonce；EEXIST 表示正常路径已经释放，不应追加第二份内容。
   try {
     await writeFile(releaseFile, `${nonce}\n`, { flag: "wx", mode: 0o600 });
@@ -718,7 +874,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
   const temporaryArmFile = path.join(authRaceControlDirectory, `arm-${nonce}.tmp`);
   const readyFile = path.join(authRaceControlDirectory, `ready-${nonce}.json`);
   const releaseFile = path.join(authRaceControlDirectory, `release-${nonce}.txt`);
-  activeAuthRaceReleases.set(releaseFile, nonce);
+  activeRaceReleases.set(releaseFile, nonce);
   // 先完整写好临时文件再原子改名，B 不会读到半截 JSON。
   await writeFile(temporaryArmFile, JSON.stringify(expectedControl), { flag: "wx", mode: 0o600 });
   await rename(temporaryArmFile, armFile);
@@ -755,7 +911,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
       readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
       0,
     );
-    await releaseAuthenticationRace(releaseFile, nonce);
+    await releaseRaceBarrier(releaseFile, nonce);
     const rejectedLogin = await pendingLogin;
     assert.deepEqual(rejectedLogin.body, { error: "Username or password is incorrect." });
     assert.equal(rejectedLogin.response.headers.get("set-cookie"), null);
@@ -765,8 +921,8 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
     );
   } finally {
     // 任一断言失败也必须释放 B；否则同步 preload 会一直等到自己的超时上限。
-    await releaseAuthenticationRace(releaseFile, nonce).catch(() => undefined);
-    activeAuthRaceReleases.delete(releaseFile);
+    await releaseRaceBarrier(releaseFile, nonce).catch(() => undefined);
+    activeRaceReleases.delete(releaseFile);
     await rm(armFile, { force: true }).catch(() => undefined);
     await pendingLogin.catch(() => undefined);
   }
@@ -835,9 +991,9 @@ function cleanupTemporaryResources() {
   // 普通 finally、Ctrl-C 和 CI SIGTERM 共用一个幂等 Promise，保证最多清理一次。
   if (!cleanupPromise) {
     cleanupPromise = (async () => {
-      // 若认证请求停在 preload，先建立 release 文件，再终止两个进程。
-      await Promise.all([...activeAuthRaceReleases].map(([releaseFile, nonce]) => (
-        releaseAuthenticationRace(releaseFile, nonce).catch(() => undefined)
+      // 若认证或候选读取停在 preload，先建立对应 release 文件，再终止两个进程。
+      await Promise.all([...activeRaceReleases].map(([releaseFile, nonce]) => (
+        releaseRaceBarrier(releaseFile, nonce).catch(() => undefined)
       )));
       await Promise.allSettled(serverHandles.map((handle) => stopServer(handle)));
       if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
@@ -892,6 +1048,7 @@ async function run() {
   // 管理员已提前建立；接下来创建账号、独立会话和课程 fixture。
   const fixture = await initializeFixtureAfterAdministrator(serverA, serverB);
 
+  await verifyCandidateSnapshotConsistency(serverA, serverB, fixture);
   await verifyConcurrentFirstPlacement(serverA, serverB, fixture);
   await verifyConcurrentCourseSetup(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);
@@ -930,6 +1087,33 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
   await requestApi(serverB, "/api/teachers", { cookie: schedulerA.cookie });
   await requestApi(serverA, "/api/teachers", { cookie: schedulerB.cookie });
 
+  // 候选快照夹具只建立一位 Active 教师、一个班级和一间容量20的教室。
+  // 课程最低容量设为30，因此修改教室前一定没有 clear slot，修改到40后才会出现候选。
+  const candidateTeacher = (await requestApi(serverA, "/api/teachers", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: { name: "cross candidate teacher", staffType: "FT" },
+  })).body;
+  const candidateGroup = (await requestApi(serverA, "/api/student-groups", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: { code: "cross_y1_01", year: 1, program: "cross" },
+  })).body;
+  const candidateRoom = (await requestApi(serverA, "/api/rooms", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: {
+      code: "31-01-01",
+      capacity: 20,
+      hasLab: false,
+      hasMultiProjector: false,
+      isSmartClassroom: false,
+    },
+  })).body;
+
   const course = (await requestApi(serverA, "/api/courses", {
     method: "POST",
     cookie: schedulerA.cookie,
@@ -944,7 +1128,7 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
       durationHours: 2,
       sessionsPerWeek: 1,
       primaryYear: 1,
-      minimumRoomCapacity: 20,
+      minimumRoomCapacity: 30,
       requiresLab: false,
       requiresMultiProjector: false,
       requiresSmartClassroom: false,
@@ -955,12 +1139,30 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
   });
   const sections = (await requestApi(serverB, `/api/courses/${course.id}/sections`, { cookie: schedulerB.cookie })).body;
   assert.equal(sections.length, 2);
+  const candidateAssignment = await requestApi(serverA, `/api/course-sections/${sections[1].id}`, {
+    method: "PATCH",
+    cookie: schedulerA.cookie,
+    json: {
+      teacherId: candidateTeacher.id,
+      studentGroupIds: [candidateGroup.id],
+      revision: sections[1].revision,
+    },
+  });
+  // PATCH 响应只返回新的 revision；稳定 ID 和显示资料继续取自刚读取的班次记录。
+  sections[1] = {
+    ...sections[1],
+    teacherId: candidateTeacher.id,
+    studentGroupIds: [candidateGroup.id],
+    revision: candidateAssignment.body.revision,
+  };
   report("两个 standalone 共享账号、会话和最小课程资料");
   return {
     accounts,
     courseId: course.id,
     setupRevision: initialSetup.body.revision,
     sections,
+    candidateRoom,
+    candidateSectionId: sections[1].id,
     schedulerACookie: schedulerA.cookie,
     schedulerBCookie: schedulerB.cookie,
   };

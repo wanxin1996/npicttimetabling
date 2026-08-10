@@ -707,6 +707,24 @@ async function verifyCrudAndRevisions() {
   assert.equal(sections[0].id, section.id);
   const secondSection = sections[1];
 
+  // Candidate GET 的路径、query 和业务状态必须使用稳定状态码；内部异常不能再被一律当成400原样返回。
+  const missingCandidateSection = await requestApi(`/api/course-sections/${randomUUID()}/candidates?occurrence=1`, {
+    expectedStatus: 404,
+  });
+  assert.deepEqual(missingCandidateSection.body, { error: "Course section not found." });
+  for (const invalidOccurrence of ["", "0", "3", "1e0", "%2B1"]) {
+    const invalidCandidate = await requestApi(`/api/course-sections/${section.id}/candidates?occurrence=${invalidOccurrence}`, {
+      expectedStatus: 400,
+    });
+    assert.deepEqual(invalidCandidate.body, { error: "Choose weekly session 1 or 2." });
+  }
+  const unassignedCandidate = await requestApi(`/api/course-sections/${secondSection.id}/candidates?occurrence=1`, {
+    expectedStatus: 400,
+  });
+  assert.match(unassignedCandidate.body.error, /active teacher/i);
+  const validCandidate = await requestApi(`/api/course-sections/${section.id}/candidates?occurrence=1`);
+  assert(Array.isArray(validCandidate.body.slots) && validCandidate.body.slots.length > 0);
+
   // 同一每周课次首次放置只能成功一次；重复请求要返回稳定业务 code，
   // 不能泄露 SQLite UNIQUE 约束文字。
   const lessonOne = (await requestApi("/api/schedule/lessons", {
@@ -721,6 +739,11 @@ async function verifyCrudAndRevisions() {
   });
   assert.equal(duplicatePlacement.body.code, "LESSON_ALREADY_SCHEDULED");
   assert(!/sqlite|unique|constraint/i.test(JSON.stringify(duplicatePlacement.body)));
+  const staleCandidate = await requestApi(`/api/course-sections/${section.id}/candidates?occurrence=1`, {
+    expectedStatus: 409,
+  });
+  assert.equal(staleCandidate.body.code, "CANDIDATE_REQUEST_STALE");
+  assert(!/sqlite|constraint|scheduled_lessons|section_id|stack/i.test(JSON.stringify(staleCandidate.body)));
   const lessonTwo = (await requestApi("/api/schedule/lessons", {
     method: "POST",
     expectedStatus: 201,
