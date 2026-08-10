@@ -1783,7 +1783,89 @@ function hasBackToBackBlockChange(intervals: DailyInterval[], proposed: DailyInt
   return intervals.some((interval) => interval.block && interval.block !== proposed.block && (interval.startHour + interval.durationHours === proposed.startHour || interval.startHour === proposedEnd));
 }
 
-function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: string; lessonId?: string; teacherId: string | null; roomId: string | null; dayOfWeek: number; startHour: number; durationHours: number }) {
+type PlacementWarningInput = {
+  sectionId: string;
+  lessonId?: string;
+  teacherId: string | null;
+  roomId: string | null;
+  dayOfWeek: number;
+  startHour: number;
+  durationHours: number;
+};
+
+function preparePlacementWarningStatements(db: DatabaseInstance) {
+  // better-sqlite3 的 prepare 会编译 SQL。候选时段可能连续检查上千个“时间 + 教室”组合，
+  // 全量刷新也会逐节重算警告；因此每批工作只编译一次，再用不同参数重复执行。
+  // 这里只复用 Statement，不缓存查询结果，所以同一事务里刚写入的课程、规则或资料仍会被下一次执行看到。
+  const prepare = (sql: string) => db.prepare(`/* timetabling:placement-warning */ ${sql}`);
+  return {
+    // 第一组查询负责读取课程政策、同日限制以及所有会发生时间重叠的既有课程。
+    enabledRules: prepare("SELECT rule_key FROM rule_settings WHERE is_enabled = 1"),
+    courseRule: prepare(`SELECT courses.id, courses.code, courses.sessions_per_week, courses.separate_sections_across_days, courses.week_start, courses.week_end FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`),
+    sameSectionDay: prepare("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?"),
+    sameCourseDay: prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND sections.course_id = ? AND lessons.day_of_week = ?`),
+    overlaps: prepare(`
+      SELECT lessons.id, sections.teacher_id, lessons.room_id
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
+      WHERE lessons.id <> ? AND lessons.day_of_week = ?
+        AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?
+        AND (? IS NULL OR occupied_courses.week_start IS NULL
+          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
+    `),
+
+    // 第二组查询检查教师、学生班级和年级不可用时段；跨年级课程会返回多个 affected year。
+    teacherStatus: prepare("SELECT is_active FROM teachers WHERE id = ?"),
+    teacherUnavailable: prepare("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?"),
+    groupConflicts: prepare(`
+      SELECT DISTINCT groups.code FROM scheduled_lessons lessons
+      JOIN course_sections occupied_sections ON occupied_sections.id = lessons.section_id
+      JOIN courses occupied_courses ON occupied_courses.id = occupied_sections.course_id
+      JOIN section_student_groups occupied ON occupied.section_id = lessons.section_id
+      JOIN section_student_groups proposed ON proposed.student_group_id = occupied.student_group_id
+      JOIN student_groups groups ON groups.id = occupied.student_group_id
+      WHERE proposed.section_id = ? AND lessons.id <> ? AND lessons.day_of_week = ?
+        AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?
+        AND (? IS NULL OR occupied_courses.week_start IS NULL
+          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
+      ORDER BY groups.code
+    `),
+    groupCount: prepare("SELECT COUNT(*) AS count FROM section_student_groups WHERE section_id = ?"),
+    affectedYears: prepare(`SELECT DISTINCT year FROM student_groups JOIN section_student_groups ON section_student_groups.student_group_id = student_groups.id WHERE section_student_groups.section_id = ? UNION SELECT primary_year AS year FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ? AND primary_year IS NOT NULL`),
+    yearBlocked: prepare("SELECT 1 FROM year_blocked_windows WHERE year = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?"),
+
+    // 第三组查询检查教室要求，并读取教师与每个学生班级当天的课程，用于午餐、连续时长和跨楼提醒。
+    roomSuitability: prepare(`SELECT rooms.code, rooms.capacity, rooms.has_multi_projector, rooms.is_lab, rooms.is_smart_classroom, rooms.is_active, courses.minimum_room_capacity, courses.requires_multi_projector, courses.requires_lab, courses.requires_smart_classroom FROM rooms JOIN course_sections sections ON sections.id = ? JOIN courses ON courses.id = sections.course_id WHERE rooms.id = ?`),
+    roomBlock: prepare("SELECT block FROM rooms WHERE id = ?"),
+    teacherDay: prepare(`
+      SELECT lessons.start_hour, lessons.duration_hours, rooms.block
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
+      LEFT JOIN rooms ON rooms.id = lessons.room_id
+      WHERE lessons.id <> ? AND sections.teacher_id = ? AND lessons.day_of_week = ?
+        AND (? IS NULL OR occupied_courses.week_start IS NULL
+          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
+    `),
+    proposedGroups: prepare("SELECT student_groups.id, student_groups.code FROM section_student_groups JOIN student_groups ON student_groups.id = section_student_groups.student_group_id WHERE section_id = ?"),
+    groupDay: prepare(`
+      SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
+      JOIN section_student_groups links ON links.section_id = lessons.section_id
+      LEFT JOIN rooms ON rooms.id = lessons.room_id
+      WHERE lessons.id <> ? AND links.student_group_id = ? AND lessons.day_of_week = ?
+        AND (? IS NULL OR occupied_courses.week_start IS NULL
+          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
+    `),
+  };
+}
+
+type PlacementWarningStatements = ReturnType<typeof preparePlacementWarningStatements>;
+
+function calculatePlacementWarnings(input: PlacementWarningInput, statements: PlacementWarningStatements) {
   // 所有排课入口都使用同一个警告引擎，确保拖放、编辑以及候选时段建议
   // 对同一种冲突采用完全一致的定义。
   const warnings: string[] = [];
@@ -1791,72 +1873,51 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   const endHour = input.startHour + input.durationHours;
   // 可选政策规则可能每学期调整；下面的教师、班级、教室和时间重叠属于核心冲突，
   // 始终无条件检查，刻意不放进可关闭规则集合。
-  const enabledRules = new Set((db.prepare("SELECT rule_key FROM rule_settings WHERE is_enabled = 1").all() as Array<{ rule_key: string }>).map((row) => row.rule_key));
-  const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.sessions_per_week, courses.separate_sections_across_days, courses.week_start, courses.week_end FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null };
+  const enabledRules = new Set((statements.enabledRules.all() as Array<{ rule_key: string }>).map((row) => row.rule_key));
+  const courseRule = statements.courseRule.get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null };
   if (courseRule.sessions_per_week > 1 && enabledRules.has("separate_weekly_sessions")) {
     // 同一班次每周分开的两次课不应排在同一天，
     // 否则名义上的“每周两次”会变成同一天的一段长课。
-    const sameSectionDay = db.prepare("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?").get(lessonId, input.sectionId, input.dayOfWeek);
+    const sameSectionDay = statements.sameSectionDay.get(lessonId, input.sectionId, input.dayOfWeek);
     if (sameSectionDay) warnings.push(`${courseRule.code} weekly sessions should be scheduled on different days`);
   }
   if (courseRule.separate_sections_across_days) {
-    const sameDay = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND sections.course_id = ? AND lessons.day_of_week = ?`).get(lessonId, courseRule.id, input.dayOfWeek);
+    const sameDay = statements.sameCourseDay.get(lessonId, courseRule.id, input.dayOfWeek);
     if (sameDay) warnings.push(`${courseRule.code} sections should not be scheduled on the same day`);
   }
   // 周次边界为空表示覆盖全学期。两个有限周次范围按包含端点方式判断重叠：
   // 若它们在同一周相接，该周仍同时上课，因此属于冲突。
-  const overlaps = db.prepare(`
-    SELECT lessons.id, sections.teacher_id, lessons.room_id
-    FROM scheduled_lessons lessons
-    JOIN course_sections sections ON sections.id = lessons.section_id
-    JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
-    WHERE lessons.id <> ? AND lessons.day_of_week = ?
-      AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?
-      AND (? IS NULL OR occupied_courses.week_start IS NULL
-        OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
-  `).all(lessonId, input.dayOfWeek, endHour, input.startHour, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; teacher_id: string | null; room_id: string | null }>;
+  const overlaps = statements.overlaps.all(lessonId, input.dayOfWeek, endHour, input.startHour, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; teacher_id: string | null; room_id: string | null }>;
 
   // 草拟阶段允许暂时缺少教师、学生班级或教室分配，但系统会持续显示警告提醒补齐。
   if (!input.teacherId) warnings.push("Teacher not assigned");
   else {
     // 停用不会删除旧排课中的教师关联。系统用高优先级警告说明这位教师已不在可用名单中，
     // 让老师仍可移动课程或修正其他资料，同时候选位置会因为存在警告而自动排除该班次。
-    const teacher = db.prepare("SELECT is_active FROM teachers WHERE id = ?").get(input.teacherId) as { is_active: number } | undefined;
+    const teacher = statements.teacherStatus.get(input.teacherId) as { is_active: number } | undefined;
     if (!teacher || teacher.is_active !== 1) warnings.push("Teacher is inactive");
     if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
-    const unavailable = db.prepare("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?").get(input.teacherId, input.dayOfWeek, endHour, input.startHour);
+    const unavailable = statements.teacherUnavailable.get(input.teacherId, input.dayOfWeek, endHour, input.startHour);
     if (unavailable) warnings.push("Teacher is unavailable at this time");
   }
   if (!input.roomId) warnings.push("Room not assigned");
   else if (overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
 
   // 通过稳定的学生班级 ID 比较重叠课程，因此也能识别跨年级课程共享班级造成的冲突。
-  const groupConflicts = db.prepare(`
-    SELECT DISTINCT groups.code FROM scheduled_lessons lessons
-    JOIN course_sections occupied_sections ON occupied_sections.id = lessons.section_id
-    JOIN courses occupied_courses ON occupied_courses.id = occupied_sections.course_id
-    JOIN section_student_groups occupied ON occupied.section_id = lessons.section_id
-    JOIN section_student_groups proposed ON proposed.student_group_id = occupied.student_group_id
-    JOIN student_groups groups ON groups.id = occupied.student_group_id
-    WHERE proposed.section_id = ? AND lessons.id <> ? AND lessons.day_of_week = ?
-      AND lessons.start_hour < ? AND lessons.start_hour + lessons.duration_hours > ?
-      AND (? IS NULL OR occupied_courses.week_start IS NULL
-        OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
-    ORDER BY groups.code
-  `).all(input.sectionId, lessonId, input.dayOfWeek, endHour, input.startHour, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ code: string }>;
+  const groupConflicts = statements.groupConflicts.all(input.sectionId, lessonId, input.dayOfWeek, endHour, input.startHour, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ code: string }>;
   if (groupConflicts.length) warnings.push(`Student group conflict (${groupConflicts.map((group) => group.code).join(", ")})`);
-  const groupCount = db.prepare("SELECT COUNT(*) AS count FROM section_student_groups WHERE section_id = ?").get(input.sectionId) as { count: number };
+  const groupCount = statements.groupCount.get(input.sectionId) as { count: number };
   if (groupCount.count === 0) warnings.push("Student group not assigned");
-  const affectedYears = db.prepare(`SELECT DISTINCT year FROM student_groups JOIN section_student_groups ON section_student_groups.student_group_id = student_groups.id WHERE section_student_groups.section_id = ? UNION SELECT primary_year AS year FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ? AND primary_year IS NOT NULL`).all(input.sectionId, input.sectionId) as Array<{ year: number }>;
+  const affectedYears = statements.affectedYears.all(input.sectionId, input.sectionId) as Array<{ year: number }>;
   for (const affected of affectedYears) {
-    const blocked = db.prepare("SELECT 1 FROM year_blocked_windows WHERE year = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?").get(affected.year, input.dayOfWeek, endHour, input.startHour);
+    const blocked = statements.yearBlocked.get(affected.year, input.dayOfWeek, endHour, input.startHour);
     if (blocked) warnings.push(`Year ${affected.year} is unavailable at this time`);
   }
 
   // 所选教室必须同时满足该课程的所有设施和容量要求；保存教室资料时已经保证
   // Smart Classroom 自动包含 Multi Projector 属性。
   if (input.roomId) {
-    const suitability = db.prepare(`SELECT rooms.code, rooms.capacity, rooms.has_multi_projector, rooms.is_lab, rooms.is_smart_classroom, rooms.is_active, courses.minimum_room_capacity, courses.requires_multi_projector, courses.requires_lab, courses.requires_smart_classroom FROM rooms JOIN course_sections sections ON sections.id = ? JOIN courses ON courses.id = sections.course_id WHERE rooms.id = ?`).get(input.sectionId, input.roomId) as { code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number; minimum_room_capacity: number | null; requires_multi_projector: number; requires_lab: number; requires_smart_classroom: number } | undefined;
+    const suitability = statements.roomSuitability.get(input.sectionId, input.roomId) as { code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number; minimum_room_capacity: number | null; requires_multi_projector: number; requires_lab: number; requires_smart_classroom: number } | undefined;
     if (!suitability || !suitability.is_active) warnings.push("Room is unavailable");
     else {
       if (suitability.minimum_room_capacity && suitability.capacity < suitability.minimum_room_capacity) warnings.push(`Room capacity too small (${suitability.capacity}/${suitability.minimum_room_capacity})`);
@@ -1869,19 +1930,10 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   // 院系偏好最早 09:00 开课；08:00 仍然允许使用，但会作为软规则产生提醒。
   if (input.startHour === 8 && enabledRules.has("prefer_9am")) warnings.push("08:00 start is discouraged");
 
-  const proposedRoom = input.roomId ? db.prepare("SELECT block FROM rooms WHERE id = ?").get(input.roomId) as { block: string | null } | undefined : undefined;
+  const proposedRoom = input.roomId ? statements.roomBlock.get(input.roomId) as { block: string | null } | undefined : undefined;
   const proposed = { startHour: input.startHour, durationHours: input.durationHours, block: proposedRoom?.block ?? null };
   if (input.teacherId) {
-    const teacherDay = db.prepare(`
-      SELECT lessons.start_hour, lessons.duration_hours, rooms.block
-      FROM scheduled_lessons lessons
-      JOIN course_sections sections ON sections.id = lessons.section_id
-      JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
-      LEFT JOIN rooms ON rooms.id = lessons.room_id
-      WHERE lessons.id <> ? AND sections.teacher_id = ? AND lessons.day_of_week = ?
-        AND (? IS NULL OR occupied_courses.week_start IS NULL
-          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
-    `).all(lessonId, input.teacherId, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ start_hour: number; duration_hours: number; block: string | null }>;
+    const teacherDay = statements.teacherDay.all(lessonId, input.teacherId, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ start_hour: number; duration_hours: number; block: string | null }>;
     const existing = teacherDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
     const combined = [...existing, proposed];
     if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
@@ -1892,19 +1944,9 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
 
   // 每个关联学生班级都要分别评估，因为一节跨年级课程的单次排课
   // 可能同时影响多个年级总表的每日时长和连续上课限制。
-  const proposedGroups = db.prepare("SELECT student_groups.id, student_groups.code FROM section_student_groups JOIN student_groups ON student_groups.id = section_student_groups.student_group_id WHERE section_id = ?").all(input.sectionId) as Array<{ id: string; code: string }>;
+  const proposedGroups = statements.proposedGroups.all(input.sectionId) as Array<{ id: string; code: string }>;
   for (const group of proposedGroups) {
-    const groupDay = db.prepare(`
-      SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block
-      FROM scheduled_lessons lessons
-      JOIN course_sections sections ON sections.id = lessons.section_id
-      JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
-      JOIN section_student_groups links ON links.section_id = lessons.section_id
-      LEFT JOIN rooms ON rooms.id = lessons.room_id
-      WHERE lessons.id <> ? AND links.student_group_id = ? AND lessons.day_of_week = ?
-        AND (? IS NULL OR occupied_courses.week_start IS NULL
-          OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
-    `).all(lessonId, group.id, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null }>;
+    const groupDay = statements.groupDay.all(lessonId, group.id, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null }>;
     const existing = groupDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
     const combined = [...existing, proposed];
     if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
@@ -1915,7 +1957,7 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   return warnings;
 }
 
-function refreshAllScheduleWarnings(db: DatabaseInstance) {
+function refreshAllScheduleWarnings(db: DatabaseInstance, warningStatements: PlacementWarningStatements = preparePlacementWarningStatements(db)) {
   // 课程位置、班次分配、教室或规则的任何变化都可能影响相邻卡片。
   // 修改后统一重新计算这个院系规模不大的时间表，使所有年级和个人视图
   // 读取同一份一致的警告快照。
@@ -1930,7 +1972,9 @@ function refreshAllScheduleWarnings(db: DatabaseInstance) {
   const saveWarnings = db.prepare("UPDATE scheduled_lessons SET warnings_json = ? WHERE id = ?");
   const refresh = db.transaction(() => {
     for (const lesson of lessons) {
-      const warnings = calculatePlacementWarnings(db, { sectionId: lesson.section_id, lessonId: lesson.id, teacherId: lesson.teacher_id, roomId: lesson.room_id, dayOfWeek: lesson.day_of_week, startHour: lesson.start_hour, durationHours: lesson.duration_hours });
+      // warningStatements 属于当前这一次刷新，不跨请求保存；每节课只更换参数，
+      // 既省去重复编译 SQL，又能读取本事务前面刚刚写入的最新资料。
+      const warnings = calculatePlacementWarnings({ sectionId: lesson.section_id, lessonId: lesson.id, teacherId: lesson.teacher_id, roomId: lesson.room_id, dayOfWeek: lesson.day_of_week, startHour: lesson.start_hour, durationHours: lesson.duration_hours }, warningStatements);
       saveWarnings.run(JSON.stringify(warnings), lesson.id);
       warningsByLesson.set(lesson.id, warnings);
     }
@@ -2044,12 +2088,15 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
   const rooms = db.prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom FROM rooms WHERE is_active = 1 ORDER BY code").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
   const slots: CandidateSlotRecord[] = [];
   const preferredStartRule = db.prepare("SELECT is_enabled FROM rule_settings WHERE rule_key = 'prefer_9am'").get() as { is_enabled: number } | undefined;
+  // 一次候选搜索会评估许多教室和时段。查询模板只在这里准备一次，
+  // 但每个组合仍完整执行全部规则，因此结果与逐项重新编译 SQL 时完全相同。
+  const warningStatements = preparePlacementWarningStatements(db);
   for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
     // 只有老师明确关闭“偏好 09:00 后开课”规则时，08:00 才会成为无警告候选；
     // 最终是否通过仍由统一警告引擎判断。
     for (let startHour = preferredStartRule?.is_enabled === 0 ? 8 : 9; startHour + section.duration_hours <= 18; startHour += 1) {
       for (const room of rooms) {
-        const warnings = calculatePlacementWarnings(db, { sectionId, teacherId: section.teacher_id, roomId: room.id, dayOfWeek, startHour, durationHours: section.duration_hours });
+        const warnings = calculatePlacementWarnings({ sectionId, teacherId: section.teacher_id, roomId: room.id, dayOfWeek, startHour, durationHours: section.duration_hours }, warningStatements);
         if (warnings.length > 0) continue;
         slots.push({
           dayOfWeek,
@@ -2159,7 +2206,10 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
       : undefined;
     if (input.roomId && !room) throw new ScheduledLessonPlacementInputError("Choose an active room.");
 
-    const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
+    // 首次放置会先计算新课程自身的警告，再在 INSERT 后刷新整张表。
+    // 两个阶段处于同一事务，可以安全共用已编译查询；INSERT 后再次执行时仍会看到新记录。
+    const warningStatements = preparePlacementWarningStatements(db);
+    const conflicts = calculatePlacementWarnings({ sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours }, warningStatements);
     const id = crypto.randomUUID();
     try {
       db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
@@ -2168,7 +2218,7 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
       throw error;
     }
 
-    const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
+    const refreshedWarnings = refreshAllScheduleWarnings(db, warningStatements).get(id) ?? conflicts;
     // 保存后连同关联班级编号一起返回，使界面无需再次请求，
     // 就能立即显示新课程分配的教师、班级和教室等完整资源。
     const studentGroupAssignments = listSectionStudentGroupAssignments(db, section.id);

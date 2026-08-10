@@ -2089,3 +2089,41 @@
 1. 复用 `calculatePlacementWarnings` 的 prepared statements 与批量上下文，降低 Clear slots 对大量教室／时段重复编译 SQL 的成本；现有 374 班次基线用于防止优化引入资料错误或数量级退化。
 2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
 3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并另建旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。
+
+## 2026-08-11｜复用警告查询模板并将候选搜索提速约三倍
+
+### 已完成
+
+- 把 `calculatePlacementWarnings` 使用的 16 条固定 SQL 集中到 `preparePlacementWarningStatements`。一次候选搜索或一次整表警告刷新只编译一组 Statement，后续每个日期、时间、教室和课次只替换绑定参数执行，不再重复编译相同 SQL。
+- 新增 `PlacementWarningInput` 与 `PlacementWarningStatements` 两个清晰类型；`calculatePlacementWarnings` 现在强制调用者显式传入 Statement 集合，未来开发者不能因为遗漏参数而悄悄退回“每次规则计算自动 prepare”的慢路径。
+- 本次只缓存 SQLite 编译后的 Statement handle，不缓存启用规则、课程、教师、班级、教室、不可用时段或排课结果。每次 `.get()`／`.all()` 仍读取当前连接和当前事务的最新资料，多账号修改后的数据不会被跨请求旧缓存覆盖。
+- 候选搜索在读取完整班次、Active 教师与 Active 教室后为本请求建立一组 Statement，并在全部 `day × hour × room` 组合中复用；候选排序、零 warning 筛选和所有英文提示保持不变。
+- 整表 warning 刷新每次建立一组 Statement，并在按 lesson ID 排序的全部课次中复用；warning 文字、加入数组的顺序、`warnings_json`、严重程度和事务回滚语义均未改变。
+- 首次排课在同一个 `IMMEDIATE` 事务中，于 INSERT 前建立 Statement、计算新课 warning、写入课次，再使用同一组 Statement 刷新整表。Statement 只保存编译 SQL而不保存查询结果，所以 INSERT 后重新执行能够看到刚写入的课次；新课与其他受影响课程仍一起提交或回滚。
+- 其余教师、班级、教室、规则、不可用时段、Course Setup、Course Sections、课程移动／删除和 Cycle Restore 的 warning 刷新入口继续在原有外层 `IMMEDIATE` 事务中运行，没有扩大跨进程缓存或改变锁边界。
+- 为 16 条警告 SQL 加入只供测试识别的注释 marker；SQLite 会忽略该注释，业务查询计划和返回结果不变。
+- 新增测试专用 `statement-reuse-audit-preload.cjs`。它只在明确的 performance test mode、64 位随机 token、系统临时目录、指定数据库直属路径、marker 与报告直属路径全部匹配时启动；普通 development／production 不会加载，HTTP 也不能启用。
+- 审计 preload 只记录带 marker 的 SQL 模板、prepare 次数和执行次数，不保存绑定参数或真实业务资料。Statement 原型包装通过 WeakMap 识别目标 Statement，并用 `Reflect.apply` 保留 better-sqlite3 原始 `this` 行为。
+- 性能脚本把“真实耗时”和“结构审计”完全分开：正常 production 服务不加载 preload，完成所有计时后停止；随后分别启动一个候选搜索审计进程和一个全量刷新审计进程，因此计数器开销不会污染加速前后的墙钟数据。
+- 两个审计进程各自使用新的随机 token 和报告文件。目标 HTTP 完整返回后，主测试通过 `SIGUSR2` 请求同步报告，并要求 `snapshotSequence` 增加后才读取，避免固定等待时间在慢速 CI 上误读半途或上一阶段的旧快照。
+- 自动门槛要求当前全量算法至少存在一条执行 32 次以上的热点 SQL，每条热点的执行／prepare 比例至少为 8；另用源码守卫禁止把 `.prepare()` 放回 `calculatePlacementWarnings` 主体。未来若改成真正的批量或增量算法，可同时更新这项明确契约，而不会依赖易抖动的固定加速百分比。
+- 所有新增生产代码、测试 preload 和性能门槛均加入面向基础开发人员的中文注释。老师尚未提交的 UX 两条 package 命令、脚本和文档保持不动。
+
+### 本次验证
+
+- `node --check scripts/verify-api-performance.mjs`、`node --check scripts/support/statement-reuse-audit-preload.cjs`、`git diff --check`、独立 TypeScript 检查、ESLint、production build 和最终 `npm run test:release` 全部通过。
+- 完整发布回归继续覆盖身份／Cookie、Excel 安全边界、Teaching allocation 重导关系、教师／班级／教室／课程／班次／排课 CRUD、revision CAS、warning 故障原子回滚、完整系统备份、Cycle、SQLite 外键和两个 production 进程的排课／Course Setup／Cycle／登录撤销竞态。
+- 在相同的 52 门课、374 个班次、360 条已排课、87 位教师、54 个学生班级和30间教室夹具中，优化前基线为候选搜索约 `554.3 ms`、整表 warning 刷新约 `186.3 ms`。
+- 最终无插桩发布回归中，30 间教室候选搜索中位为 `218.8 ms`，360 条课次 warning 刷新中位为 `61.5 ms`；多次单独复跑分别得到约 `192.6–201.3 ms` 与 `57.5–61.5 ms`。候选搜索约快 2.5–2.9 倍，警告刷新约快 3 倍。
+- 最终其他规模指标仍远低于宽松门槛：Issues p95 `29.8 ms`、Year timetable p95 `20.0 ms`、六账号30请求轮询整轮中位 `64.1 ms`、一个 warning 写入加十个读取中位 `100.7 ms`；没有 500、503或超时。
+- 独立候选审计精确记录 `16` 次 prepare、`12,600` 次目标 SQL 执行，最高单一模板复用 `900` 倍；独立全量刷新审计记录 `16` 次 prepare、`5,288` 次执行，最高复用 `600` 倍。若恢复旧的循环内 prepare，这两项会违反至少 8 倍复用门槛。
+- 固定资料数量、三个年级总表数量、14 个待排班次、270 条问题、候选保留教室、Personal timetable 跨年级关系、360 个不同 lesson 的 warning UPDATE、纯读写锁证明、最终 `integrity_check=ok` 与空 `foreign_key_check` 全部继续通过。
+- 所有测试数据库、随机 marker、审计 JSON 和 standalone 进程都位于 `os.tmpdir()` 的唯一目录并在成功／失败后清理；没有残留 `timetabling-api-performance-*`、`timetabling-api-crud-*` 或 `timetabling-api-concurrency-*`。
+- 正式 `web/data/timetabling.db` 修改时间仍为 `2026-08-11 04:45:51`、大小 544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空；本轮自动化没有连接或修改它。
+- 三项独立只读审查核对了16条SQL、positional参数、warning顺序、Statement跨INSERT可见性、13个刷新事务入口、两个 standalone 的连接隔离、preload路径安全和报告新鲜度；最终未发现 P0／P1。两项非阻断 P2 是 SIGUSR2 审计仅适用于当前 macOS／Linux 环境，以及直接手工运行旧 `.next` 时源码守卫可能与旧 bundle 不同；正式测试命令总会先 build，因此当前发布门槛不受影响。
+
+### 下一步
+
+1. 修复 Candidate API 的既有一致性边界：在短只读快照中一次读取候选所需资料，再在内存中计算，避免另一进程恰好修改课程或 Cycle 时单个响应混合两个版本；同时把未知数据库异常改为安全通用 500，不能原样当成 400 返回。
+2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
+3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并另建旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。

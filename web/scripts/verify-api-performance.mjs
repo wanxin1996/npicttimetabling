@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +12,7 @@ import Database from "better-sqlite3";
 // 操作系统临时目录。它不会连接 data/timetabling.db，也不会占用开发页面的 3000 端口。
 const projectRoot = process.cwd();
 const standaloneServerPath = path.join(projectRoot, ".next", "standalone", "server.js");
+const statementAuditPreloadPath = path.join(projectRoot, "scripts", "support", "statement-reuse-audit-preload.cjs");
 const requestTimeoutMilliseconds = 30_000;
 
 // 固定资料量接近老师真实 Teaching allocation：52 门课共 374 个班次。
@@ -49,6 +50,8 @@ let serverOutput = "";
 let serverProcessError;
 let temporaryDirectory;
 let testDatabasePath;
+let statementAuditToken = "";
+let statementAuditReportPath = "";
 let administratorCookie = "";
 let cleanupPromise;
 
@@ -113,7 +116,7 @@ async function stopServer() {
   }
 }
 
-async function startServer() {
+async function startServer({ auditStatements = false } = {}) {
   // 端口释放与 standalone 监听之间有极短竞争窗口；只有明确 EADDRINUSE 才重试。
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const port = await chooseAvailablePort();
@@ -132,8 +135,19 @@ async function startServer() {
       PORT: String(port),
       TIMETABLING_DATABASE_PATH: testDatabasePath,
     });
+    // 正常性能计时不加载任何插桩；只有最后两个结构审计进程显式传入随机 token 和临时报告路径。
+    if (auditStatements) {
+      Object.assign(environment, {
+        TIMETABLING_STATEMENT_AUDIT_MODE: "timetabling-statement-reuse-audit-v1",
+        TIMETABLING_STATEMENT_AUDIT_TOKEN: statementAuditToken,
+        TIMETABLING_STATEMENT_AUDIT_REPORT: statementAuditReportPath,
+      });
+    }
 
-    serverProcess = spawn(process.execPath, [standaloneServerPath], {
+    const serverArguments = auditStatements
+      ? ["--require", statementAuditPreloadPath, standaloneServerPath]
+      : [standaloneServerPath];
+    serverProcess = spawn(process.execPath, serverArguments, {
       cwd: projectRoot,
       env: environment,
       stdio: ["ignore", "pipe", "pipe"],
@@ -708,6 +722,112 @@ async function verifyWarningWritePerformance(schedulerCookies) {
   }
 }
 
+async function readStatementAuditReport() {
+  // 报告可能尚未由 preload 写出；调用方轮询时把“文件暂不存在”和“JSON 正在被原子替换”都视为继续等待。
+  try {
+    return JSON.parse(await readFile(statementAuditReportPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function captureCompletedStatementAudit() {
+  // 业务 HTTP 已经完整返回后才向测试进程发送 SIGUSR2。preload 在同一事件循环中同步
+  // 写入更高 snapshotSequence，主测试因此不会误读目标请求执行到一半时的旧定时快照。
+  const beforeSignal = await readStatementAuditReport();
+  const previousSequence = beforeSignal?.runToken === statementAuditToken ? beforeSignal.snapshotSequence : 0;
+  assert(serverProcess && serverProcess.kill("SIGUSR2"), "The statement audit server could not receive its snapshot signal.");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const auditReport = await readStatementAuditReport();
+    if (auditReport?.runToken === statementAuditToken && auditReport.snapshotSequence > previousSequence) return auditReport;
+    await delay(25);
+  }
+  throw new Error("The statement audit server did not publish a completed request snapshot.");
+}
+
+function assertPreparedStatementReuse(auditReport, label) {
+  // 报告只统计带 placement-warning marker 的规则 SQL，不会混入登录或页面查询。
+  assert.equal(auditReport.version, 1);
+  assert.equal(auditReport.runToken, statementAuditToken);
+  assert(Array.isArray(auditReport.statements));
+
+  const totalExecutions = auditReport.statements.reduce((total, row) => total + row.executions, 0);
+  const totalPrepares = auditReport.statements.reduce((total, row) => total + row.prepares, 0);
+  assert(totalExecutions > 0, `${label} did not execute marked warning statements.`);
+
+  // 本轮明确仍使用 rooms × slots 和全表刷新循环，所以至少应出现一条执行 32 次以上的热点 SQL。
+  // 每条热点必须达到至少 8 倍编译摊销，从而阻止代码退回“每个位置重新 prepare”。
+  const hotStatements = auditReport.statements.filter((row) => row.executions >= 32);
+  assert(hotStatements.length > 0, `${label} did not exercise the expected warning loop.`);
+  for (const row of hotStatements) {
+    const maximumAllowedPrepares = Math.max(2, Math.ceil(row.executions / 8));
+    assert(row.prepares <= maximumAllowedPrepares,
+      `${label} repeatedly compiled warning SQL: ${row.prepares} prepares for ${row.executions} executions.`);
+  }
+
+  const maximumReuse = Math.max(...auditReport.statements
+    .filter((row) => row.prepares > 0)
+    .map((row) => row.executions / row.prepares));
+  assert(maximumReuse >= 8, `${label} did not reach the required prepared statement reuse ratio.`);
+  report(`${label}：${totalPrepares} 次 prepare／${totalExecutions} 次执行，最高复用 ${maximumReuse.toFixed(1)} 倍`);
+}
+
+async function runStatementAudit(auditName, label, schedulerCookie, auditedRequest) {
+  // 每个目标请求使用独立 production 进程、随机 token 和报告文件；候选与全量刷新
+  // 不会共享旧计数，也不会把 preload 包装成本混入前面的正式耗时。
+  statementAuditToken = randomBytes(32).toString("hex");
+  statementAuditReportPath = path.join(temporaryDirectory, `statement-audit-${auditName}.json`);
+  await rm(statementAuditReportPath, { force: true });
+  await writeFile(path.join(temporaryDirectory, "statement-audit.marker"), statementAuditToken, { mode: 0o600 });
+  await startServer({ auditStatements: true });
+  try {
+    await auditedRequest(schedulerCookie);
+    const auditReport = await captureCompletedStatementAudit();
+    assertPreparedStatementReuse(auditReport, label);
+  } finally {
+    await stopServer();
+    serverProcess = undefined;
+  }
+}
+
+async function verifyPreparedStatementReuse(schedulerCookies) {
+  // 先停止没有插桩的计时服务；下面两个独立进程只负责结构审计。
+  await stopServer();
+  serverProcess = undefined;
+
+  await runStatementAudit("candidate", "候选搜索", schedulerCookies[0], async (cookie) => {
+    const result = await requestApi("/api/course-sections/perf-section-361/candidates?occurrence=1", { cookie });
+    assert(Array.isArray(result.body.slots) && result.body.slots.length > 0);
+  });
+
+  await runStatementAudit("warning-refresh", "全量警告刷新", schedulerCookies[1], async (cookie) => {
+    const lesson = readEditableLesson();
+    const result = await requestApi(`/api/schedule/lessons/${lesson.id}`, {
+      method: "PATCH",
+      cookie,
+      json: {
+        dayOfWeek: lesson.dayOfWeek,
+        startHour: lesson.startHour,
+        teacherId: lesson.teacherId,
+        roomId: lesson.roomId,
+        studentGroupIds: lesson.studentGroupIds,
+        revision: lesson.revision,
+      },
+    });
+    assert.equal(result.body.revision, lesson.revision + 1);
+  });
+
+  // TypeScript 强制每次计算显式接收 PlacementWarningStatements；再用一个小型源码守卫
+  // 防止未来开发者在 calculatePlacementWarnings 的循环主体中重新加入 db.prepare。
+  const databaseSource = await readFile(path.join(projectRoot, "src", "lib", "database.ts"), "utf8");
+  const calculationStart = databaseSource.indexOf("function calculatePlacementWarnings(");
+  const calculationEnd = databaseSource.indexOf("function refreshAllScheduleWarnings(", calculationStart);
+  assert(calculationStart >= 0 && calculationEnd > calculationStart, "Warning calculation source boundary was not found.");
+  const calculationSource = databaseSource.slice(calculationStart, calculationEnd);
+  assert(!calculationSource.includes(".prepare("), "calculatePlacementWarnings must reuse prepared statements instead of compiling SQL inside its loop.");
+}
+
 function cleanupTemporaryResources() {
   // 普通 finally、Ctrl-C 和 CI SIGTERM 共用同一个幂等 Promise，最多清理一次。
   if (!cleanupPromise) {
@@ -753,6 +873,7 @@ async function run() {
   const schedulerCookies = await createSchedulerCookies();
   await verifyReadPerformance(schedulerCookies);
   await verifyWarningWritePerformance(schedulerCookies);
+  await verifyPreparedStatementReuse(schedulerCookies);
   console.log("Scale and multi-account performance verification passed.");
 }
 
