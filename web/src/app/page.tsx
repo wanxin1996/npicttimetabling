@@ -87,6 +87,9 @@ function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
 function noticeTone(message: string) {
   const normalized = message.toLowerCase();
   if (["could not", "unable", "failed", "error", "interrupted", "expired"].some((word) => normalized.includes(word))) return "border-red-200 bg-red-50 text-red-900";
+  // Successful candidate placement says "no warnings". Recognise that explicit
+  // success before the generic warning word so a clear save never looks cautionary.
+  if (["no warnings", "successfully", "downloaded as", "full system restored"].some((phrase) => normalized.includes(phrase))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
   if (["warning", "mismatch", "no completely clear"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
   if (["saved", "success", "placed", "updated", "created", "ready", "signed in"].some((word) => normalized.includes(word))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
   return "border-slate-200 bg-white text-slate-800";
@@ -137,10 +140,11 @@ function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[
   return positioned;
 }
 
-function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
+function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }: {
   lessons: ScheduledLesson[];
   renderLesson: (lesson: ScheduledLesson) => React.ReactNode;
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
+  focusLesson?: { id: string; requestNumber: number } | null;
 }) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
@@ -149,6 +153,15 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
   const minimumGridWidth = 56 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(124, laneCount * 124), 0) + (timetableDays.length * 6);
   const timetableColumns = `56px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(124, laneCount * 124)}px, ${laneCount}fr)`).join(" ")}`;
+
+  useEffect(() => {
+    // After a successful save, find the exact rendered wrapper without interpolating
+    // its database id into a CSS selector, then reveal it across all scroll containers.
+    if (!focusLesson) return;
+    const scrollContainer = scrollContainerRef.current;
+    const savedLesson = Array.from(scrollContainer?.querySelectorAll<HTMLElement>("[data-lesson-id]") ?? []).find((element) => element.dataset.lessonId === focusLesson.id);
+    savedLesson?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  }, [focusLesson, positionedLessons]);
 
   const scrollTimetable = (direction: -1 | 1) => {
     // Move most of one visible width at a time. The remaining overlap preserves
@@ -210,7 +223,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
                   aria-label={`${lesson.sectionLabel}, ${lesson.durationHours} hours`}
                   onDragOver={onCellDrop ? (event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } : undefined}
                   onDrop={onCellDrop ? (event) => onCellDrop(event, lesson.dayOfWeek, lesson.startHour) : undefined}
-                  className="pointer-events-auto absolute"
+                  className={`pointer-events-auto absolute transition ${focusLesson?.id === lesson.id ? "z-20 rounded-md ring-4 ring-emerald-400 ring-offset-2" : ""}`}
                   style={{ top: `calc(${top}% + 3px)`, height: `calc(${height}% - 6px)`, left: `calc(${lane * laneWidth}% + 3px)`, width: `calc(${laneWidth}% - 6px)` }}
                 >
                   {renderLesson(lesson)}
@@ -255,6 +268,8 @@ export default function Home() {
   const [candidateSection, setCandidateSection] = useState<UnscheduledSection | null>(null);
   const [candidateSlots, setCandidateSlots] = useState<CandidateSlot[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
+  const [recentlySavedLesson, setRecentlySavedLesson] = useState<{ id: string; requestNumber: number } | null>(null);
+  const savedLessonRequestNumber = useRef(0);
   const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup" | "Room">("Teacher");
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
@@ -269,6 +284,21 @@ export default function Home() {
   const [restoringBackup, setRestoringBackup] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    // The green ring remains long enough to connect the toast to the timetable card,
+    // then clears automatically so it never looks like a permanent issue state.
+    if (!recentlySavedLesson) return;
+    const timeout = window.setTimeout(() => setRecentlySavedLesson(null), 6000);
+    return () => window.clearTimeout(timeout);
+  }, [recentlySavedLesson]);
+
+  function revealSavedLesson(id: string) {
+    // A new object is created for every save, even when the lesson id is unchanged.
+    // That restarts both scrolling and the six-second highlight after a quick edit.
+    savedLessonRequestNumber.current += 1;
+    setRecentlySavedLesson({ id, requestNumber: savedLessonRequestNumber.current });
+  }
 
   // Filter in the browser so searching feels instant and does not repeatedly query SQLite.
   const filteredTeachers = useMemo(
@@ -434,6 +464,7 @@ export default function Home() {
       if (!response.ok) return setNotice(body.error ?? "The lesson could not be moved.");
       setEditingLesson(null);
       await openTimetable(timetableYear);
+      revealSavedLesson(body.id);
       return setNotice(body.warnings.length ? `${body.sectionLabel} moved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} moved successfully.`);
     }
     const draggedSession = event.dataTransfer.getData("text/plain");
@@ -444,6 +475,7 @@ export default function Home() {
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
     await openTimetable(timetableYear);
+    revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully. Assign its room next.`);
   }
 
@@ -475,6 +507,7 @@ export default function Home() {
     setCandidateSection(null);
     setCandidateSlots([]);
     await openTimetable(timetableYear);
+    revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} changed while placing and now has warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed in ${slot.roomCode} with no warnings.`);
   }
 
@@ -498,6 +531,7 @@ export default function Home() {
     if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
     setPlacingSection(null);
     await openTimetable(timetableYear);
+    revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully.`);
   }
 
@@ -511,6 +545,7 @@ export default function Home() {
     if (!response.ok) return setNotice(body.error ?? "The lesson could not be updated.");
     setEditingLesson(null);
     await openTimetable(timetableYear);
+    revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} updated successfully.`);
   }
 
@@ -994,11 +1029,13 @@ export default function Home() {
     return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
   }
 
+  // On desktop, the scheduling workbench owns the viewport so its three panes can
+  // scroll independently without hiding navigation or save feedback below the fold.
   return (
-    <main className="min-h-screen bg-[#f6f8fb] text-slate-900">
+    <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "xl:flex xl:h-screen xl:min-h-0 xl:flex-col xl:overflow-hidden" : ""}`}>
       {notice && <div role="status" aria-live="polite" aria-atomic="true" className={`fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span>{notice}</div>}
       {/* Persistent identity header for the department workspace. */}
-      <header className="border-b border-slate-200 bg-white">
+      <header className="shrink-0 border-b border-slate-200 bg-white">
         <div className={`mx-auto flex items-center justify-between gap-4 px-4 py-3 ${view === "Year timetables" ? "max-w-[1800px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#153d75] text-sm font-black tracking-tight text-white">NP</div>
@@ -1020,7 +1057,7 @@ export default function Home() {
         </div>
       </header>
 
-      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1800px] gap-4 px-4 py-4 lg:grid-cols-[160px_minmax(0,1fr)]" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
+      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1800px] gap-4 px-4 py-4 lg:grid-cols-[160px_minmax(0,1fr)] xl:min-h-0 xl:w-full xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
         {/* Navigation reflects the future scheduling modules; only data management is active today. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
@@ -1046,7 +1083,7 @@ export default function Home() {
           {view !== "Year timetables" && <><div className="my-3 border-t border-slate-100" /><p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p><div className="rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">Working timetable · {courses.reduce((total, course) => total + course.configuredSections, 0)} generated sections</div></>}
         </aside>
 
-        <section className="min-w-0">
+        <section className={`min-w-0 ${view === "Year timetables" ? "xl:flex xl:min-h-0 xl:flex-col" : ""}`}>
           {/* Page title and the single action that applies to the selected data view. */}
           <div className={`${view === "Year timetables" ? "mb-3" : "mb-6"} flex flex-col justify-between gap-4 sm:flex-row sm:items-end`}>
             <div>
@@ -1105,7 +1142,7 @@ export default function Home() {
           )}
 
           {view === "Year timetables" && (
-            <div className="grid gap-3 xl:h-[calc(100vh-190px)] xl:min-h-[640px] xl:grid-cols-[220px_minmax(0,1fr)_250px]">
+            <div className="grid gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-[220px_minmax(0,1fr)_250px]">
               <aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
                 <div className="mb-2">
                   <p className="font-bold text-slate-950">Unscheduled sessions</p>
@@ -1141,6 +1178,7 @@ export default function Home() {
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto"><WeeklyTimetableGrid
                     lessons={lessons}
+                    focusLesson={recentlySavedLesson}
                     onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
                     renderLesson={(lesson) => {
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
