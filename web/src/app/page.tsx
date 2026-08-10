@@ -1360,15 +1360,16 @@ export default function Home() {
                     lessons={lessons}
                     focusLesson={recentlySavedLesson}
                     onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
-                    renderLesson={(lesson, isDense) => {
-                      // 总表卡片的实际高度已经表达两、三或四小时，因此不重复显示“3h”；
-                      // 无论同一时间有多少门课，都优先保留课程编号和教师姓名，教室与问题数排在其后。
+                    renderLesson={(lesson) => {
+                      // 总表卡片的实际高度已经表达两、三或四小时，因此不重复显示“3h”。
+                      // 课程编号使用最大的固定字号和最粗字重，让老师扫视满表时先认出课程；教师与教室使用统一的小字号作为第二层资料。
+                      // 同一小时即使出现很多横向通道，也只截断过长文字，不再缩小字号，避免不同繁忙程度的日期出现忽大忽小的字。
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowUnscheduledDrawer(false); setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded text-left ${isDense ? "p-0.5 text-[9px] leading-[1.05]" : "p-1 text-[10px] leading-tight"} shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
-                        <span className={`block font-black ${isDense ? "whitespace-nowrap text-[7px] tracking-[-0.06em]" : "truncate"}`}>{lesson.sectionLabel}</span>
-                        <span className={`mt-0.5 block ${isDense ? "break-words" : "truncate"}`}>{lesson.teacherName ?? "Teacher pending"}</span>
-                        <span className="block truncate font-semibold">{lesson.roomCode ?? "Room pending"}</span>
-                        {lesson.warnings.length > 0 && <span className={`mt-0.5 block font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length}</span>}
+                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowUnscheduledDrawer(false); setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
+                        <span className="block truncate text-[11px] font-black">{lesson.sectionLabel}</span>
+                        <span className="mt-0.5 block truncate text-[9px] font-medium">{lesson.teacherName ?? "Teacher pending"}</span>
+                        <span className="block truncate text-[9px] font-semibold">{lesson.roomCode ?? "Room pending"}</span>
+                        {lesson.warnings.length > 0 && <span className={`mt-0.5 block text-[9px] font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length}</span>}
                       </button>;
                     }}
                   /></div>
