@@ -133,6 +133,7 @@ model CourseSection {
   // 课程班次是可拖放的基本单位，例如 LEAD_01，并且只分配一位任课教师。
   id       String @id @default(uuid())
   sequence Int
+  revision Int    @default(1)
 
   courseId            String   @map("course_id")
   teacherId           String?  @map("teacher_id")

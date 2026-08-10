@@ -50,7 +50,15 @@ type Course = {
   allocationVarianceCount: number;
 };
 
-type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
+type CourseSection = {
+  id: string;
+  label: string;
+  teacherId: string | null;
+  teacherName: string | null;
+  studentGroupIds: string[];
+  studentGroupCodes: string[];
+  revision: number;
+};
 type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
@@ -349,6 +357,10 @@ export default function Home() {
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
   const [sections, setSections] = useState<CourseSection[]>([]);
   const [allocationVariances, setAllocationVariances] = useState<AllocationVariance[]>([]);
+  // ref 会在第一次点击时立即锁住班次，state 则负责把当前按钮显示为 Saving 并暂时停用其余 Save；
+  // 两者配合可阻止快速双击或连续点击两个班次时发出相互覆盖的请求。
+  const savingSectionIdRef = useRef<string | null>(null);
+  const [savingSectionId, setSavingSectionId] = useState<string | null>(null);
   const [timetableYear, setTimetableYear] = useState(1);
   const [lessons, setLessons] = useState<ScheduledLesson[]>([]);
   const [unscheduledSections, setUnscheduledSections] = useState<UnscheduledSection[]>([]);
@@ -1176,15 +1188,42 @@ export default function Home() {
   }
 
   async function saveSection(event: FormEvent<HTMLFormElement>, section: CourseSection) {
-    // 勾选的学生班级会成为该班次之后所有学生冲突、每日时数和个人课表检查的范围。
+    // 勾选的学生班级会成为该班次之后所有学生冲突、每日时数和个人课表检查的范围；
+    // revision 让服务器确认老师保存的正是当前看到的这一版资料。
     event.preventDefault();
+    if (savingSectionIdRef.current) return;
+    savingSectionIdRef.current = section.id;
+    setSavingSectionId(section.id);
     const data = new FormData(event.currentTarget);
-    const response = await fetch(`/api/course-sections/${section.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teacherId: String(data.get("teacherId") ?? "") || null, studentGroupIds: data.getAll("studentGroupIds").map(String) }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Section could not be saved.");
-    if (selectedCourse) await openSections(selectedCourse);
-    const mismatchCount = (body.allocationVariances as AllocationVariance[]).length;
-    setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`);
+    const courseAtStart = selectedCourse;
+    try {
+      const response = await fetch(`/api/course-sections/${section.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          teacherId: String(data.get("teacherId") ?? "") || null,
+          studentGroupIds: data.getAll("studentGroupIds").map(String),
+          revision: section.revision,
+        }),
+      });
+      const body = await response.json() as { error?: string; allocationVariances?: AllocationVariance[] };
+      if (!response.ok) {
+        // 409 表示另一位老师已经先保存；强制重新读取并用 revision 作为 form key，
+        // 让非受控下拉框和复选框也立刻显示最新资料，而不是继续保留旧选择。
+        if (response.status === 409 && courseAtStart) await openSections(courseAtStart);
+        setNotice(body.error ?? "Section could not be saved.");
+        return;
+      }
+      if (courseAtStart) await openSections(courseAtStart);
+      const mismatchCount = body.allocationVariances?.length ?? 0;
+      setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`);
+    } catch {
+      // 网络断开时必须解除 Saving 状态并告诉老师资料尚未确认，不能让按钮永久卡住。
+      setNotice("The section could not be saved because the connection was interrupted. Check the network and try again.");
+    } finally {
+      savingSectionIdRef.current = null;
+      setSavingSectionId(null);
+    }
   }
 
   // 页面主按钮根据当前资料类型自动显示新增教师、班级、教室或导入课程，减少需要记忆的不同操作入口。
@@ -1667,7 +1706,31 @@ export default function Home() {
                   <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
                 </form>
                 {allocationVariances.length > 0 && <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-3"><p className="text-sm font-black text-amber-950">Teaching allocation differs from current teachers</p><p className="mt-1 text-xs text-amber-800">Saving is allowed. Review these counts against the imported Teaching Members file.</p><div className="mt-2 grid gap-1">{allocationVariances.map((variance) => <p key={variance.teacherId} className="text-xs font-semibold text-amber-900">{variance.teacherName}: expected {variance.expectedSections}, currently {variance.actualSections}</p>)}</div></div>}
-                <div className="grid gap-3">{sections.map((section) => <form key={section.id} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3"><div className="grid gap-3 md:grid-cols-[130px_1fr_auto]"><p className="pt-2 font-bold text-slate-900">{section.label}</p><select name="teacherId" defaultValue={section.teacherId ?? ""} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select><button className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white" type="submit">Save</button></div><div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">{groups.map((group) => <label key={group.id} className="flex items-center gap-1.5"><input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" /> {group.code}</label>)}</div></form>)}</div>
+                <div className="grid gap-3">
+                  {sections.map((section) => (
+                    /* revision 放进 key 后，并发冲突重新载入时会重建表单，确保 defaultValue 与 defaultChecked 不残留旧资料。 */
+                    <form key={`${section.id}:${section.revision}`} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3">
+                      <div className="grid gap-3 md:grid-cols-[130px_1fr_auto]">
+                        <p className="pt-2 font-bold text-slate-900">{section.label}</p>
+                        <select name="teacherId" defaultValue={section.teacherId ?? ""} aria-label={`Teacher for ${section.label}`} className="rounded-lg border border-slate-200 px-3 py-2 text-sm">
+                          <option value="">Teacher pending</option>
+                          {teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}
+                        </select>
+                        <button disabled={savingSectionId !== null} className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit" aria-label={`Save ${section.label} assignments`}>
+                          {savingSectionId === section.id ? "Saving..." : "Save"}
+                        </button>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">
+                        {groups.map((group) => (
+                          <label key={group.id} className="flex items-center gap-1.5">
+                            <input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" />
+                            {group.code}
+                          </label>
+                        ))}
+                      </div>
+                    </form>
+                  ))}
+                </div>
               </div>
             )}
           </div>}

@@ -1688,3 +1688,34 @@
 
 1. 给 Course Sections 教师与学生班级编辑增加独立 revision，防止两位老师同时保存时后提交者静默覆盖。
 2. 修复待排课程首次放置的并发 409、停用教师规则和发布级 Excel 解析依赖。
+
+## 2026-08-11｜Course Sections 增加多人编辑 revision
+
+### 已完成
+
+- `course_sections` 新增独立 `revision`，专门保护一个班次共享的教师和学生班级；旧 SQLite 启动时自动补为 revision 1，新数据库和 Prisma 模型保持一致。
+- Course Sections API 现在要求客户端提交 revision，并用 `UPDATE ... WHERE id = ? AND revision = ?` 做数据库级 compare-and-swap；旧表单保存返回明确 409，不会覆盖另一位老师已经完成的修改。
+- 教师、班级关联、section revision、该班次全部课次 revision 与重新计算的 warnings 现在放在同一个外层事务中；任何一步失败都会整体回滚。
+- Inspector 会先比较教师和标准化后的班级集合：只有共享分配真的改变才增加 section 与其他 occurrence 的 revision；单纯移动时间或更换教室只增加当前课次 revision。
+- Teaching allocation 自动更新自己维护的教师时也会增加 section revision，使已经打开的 Sections 表单及时失效；教师没有变化时不制造无意义版本号。
+- 前端 CourseSection 类型和 PATCH body 增加 revision；409 时重新读取最新 Sections，表单使用 `section.id + revision` 作为 key，确保非受控下拉框与复选框真实重建为最新资料。
+- Save 增加即时 ref 锁与 Saving 状态，快速双击不会发出两个相同 revision 请求；网络中断通过 `catch/finally` 恢复按钮并显示可重试说明。
+- 把原本整行压缩的班次表单拆为易读 JSX 小区块，并补充中文业务注释、教师下拉可访问名称和包含班次编号的保存按钮名称。
+
+### 本次验证
+
+- `git diff --check`、`npm run lint`、`npm exec prisma validate` 与 `npm run build` 全部通过；24 个页面和 API 成功构建。
+- 在一次性旧数据库启动生产构建后，`course_sections` 自动出现 `allocation_teacher_id` 与 `revision` 两列；GET Sections 的全部旧班次均返回 revision 1。
+- 模拟两个账号同时读取 `BED_01` revision 1：第一位把学生班级改为 `CICTP_02` 后成功得到 revision 2，两条每周课次 revision 同步增加；第二位仍用 revision 1 保存时得到 409，数据库继续保持第一位的班级。
+- 缺少 revision 的请求得到受控 400，资料零变化。
+- 纯移动 occurrence 1 从周一 09:00 到周二 10:00 后，当前课次 revision 5→6；section 仍为 2、occurrence 2 仍为 2，证明没有错误影响共享资料或另一课次。
+- 从 Inspector 把学生班级改为 `CSF_03` 后，section revision 2→3、当前课次 6→7、另一课次 2→3；旧 Sections revision 2 随后得到 409。
+- 浏览器实际保留旧版 `BED_01` 表单，第二个会话先改回 `CICTP_02`；旧表单按 Save 后显示“changed by another scheduler”，并自动重载为 `CICTP_02` 已勾选，未覆盖最新资料。
+- 在一次性数据库执行 Start new cycle 后立即 Restore：`BED_01` section revision 4、两条课次 revision 8／4、`CICTP_02` 关联和 Excel 来源状态全部按快照恢复。
+- 最终 `PRAGMA integrity_check` 为 `ok`、`foreign_key_check` 为空；全部测试只修改 `/private/tmp` 下的一次性数据库。
+
+### 下一步
+
+1. 把待排课次首次放置的唯一键错误转换为清楚的 409，并让界面重新载入最新总表。
+2. 修复教师停用后的 warning、候选位置与 Inspector 显示语义。
+3. 升级存在漏洞的 Excel 解析依赖，并加入受控工作表和行数解析限制。
