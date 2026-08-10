@@ -239,14 +239,31 @@ function database() {
   const dataDirectory = path.dirname(databasePath);
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(databasePath);
-  db.pragma("foreign_keys = ON");
-  initializeTables(db);
-  globalForDatabase.timetableSchemaVersion = runtimeSchemaVersion;
-  // 示例数据只用于本地开发时快速查看界面。部署环境中的空数据库必须保持干净，
-  // 防止真实用户误把虚构的教师、学生班级或教室当成正式资料。
-  if (process.env.NODE_ENV !== "production") seed(db);
-  globalForDatabase.timetableDatabase = db;
-  return db;
+  try {
+    // 新连接只有完成外键设置、表结构初始化和本地示例资料后才会放进全局对象。
+    // 这样任一步失败时，下一次请求不会误用一个只初始化到一半的连接。
+    db.pragma("foreign_keys = ON");
+    initializeTables(db);
+    // 示例数据只用于本地开发时快速查看界面。部署环境中的空数据库必须保持干净，
+    // 防止真实用户误把虚构的教师、学生班级或教室当成正式资料。
+    if (process.env.NODE_ENV !== "production") seed(db);
+
+    // schema 版本与连接要在全部同步初始化成功后一起发布。若 seed 报错，
+    // 这里不会留下“版本已经完成、连接却不存在”的矛盾全局状态。
+    globalForDatabase.timetableDatabase = db;
+    globalForDatabase.timetableSchemaVersion = runtimeSchemaVersion;
+    return db;
+  } catch (initializationError) {
+    // 此处的 db 还没有发布给其他请求，可以安全关闭。已经在全局复用的连接走上方分支，
+    // 迁移失败时不会被这里误关掉，也不会让正在使用它的其他请求突然中断。
+    try {
+      db.close();
+    } catch (closeError) {
+      // 关闭失败只写入服务器日志；重新抛出的仍是最初初始化错误，便于定位真正根因。
+      console.error("A new SQLite connection could not be closed after database initialization failed.", closeError);
+    }
+    throw initializationError;
+  }
 }
 
 export function databaseHealth() {
@@ -459,6 +476,7 @@ function initializeTables(db: DatabaseInstance) {
   // CREATE ... IF NOT EXISTS 让初始化逻辑可以在每次启动时安全重复执行。
   // 下面这些表构成当前界面实际使用的排课数据模型。
   db.exec(`
+    /* timetabling:database-initialization */
     CREATE TABLE IF NOT EXISTS teachers (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,

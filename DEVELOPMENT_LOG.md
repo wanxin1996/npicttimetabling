@@ -2185,3 +2185,34 @@
 1. 修复数据库首次初始化失败时的新连接清理：只关闭尚未挂入 global 的局部连接，避免持续锁竞争累积文件描述符。
 2. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务加载完整快照 + 事务外纯内存计算”，进一步缩短 rollback journal 下其他老师 COMMIT 的等待。
 3. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，并继续统一首次排课、班次编辑等剩余写入口的安全 503 语义。
+
+## 2026-08-11｜初始化失败时主动关闭 SQLite 连接并验证干净重试
+
+### 已完成
+
+- 把首次打开数据库后的外键设置、表结构初始化、开发 seed 和全局发布放入同一个局部 `try` 边界。任一步失败都会主动关闭这条尚未发布的新连接，避免等待垃圾回收期间累积文件描述符或继续占用 SQLite 文件。
+- 关闭失败不会覆盖真正的初始化错误：服务器会记录关闭异常，但调用者继续收到最初的 pragma、schema 或 seed 错误，排查时不会被次要清理问题误导。
+- 只有表结构与开发示例资料全部成功后，才同时发布 `timetableDatabase` 和 `timetableSchemaVersion`。seed 中途失败时不会留下“版本已完成、连接却不存在”的矛盾热重载状态。
+- 已经发布并由开发热重载复用的 global 连接保持原边界：迁移失败时不关闭共享连接、不提高 schema 版本；下一次请求仍用同一条打开的连接重试，避免 global 指向已关闭连接后永久失效。
+- 为第一组真实 schema SQL 加入 SQLite 会忽略的内部 marker。双 standalone 测试 preload 会让 A 在这组 CREATE 已实际提交后故意失败一次，并且只有命中故障的同一 Database 实例完成真实 `close()` 后才生成 ready 证据。
+- A 的第一次 health 返回失败后，启动等待器不会重启进程，而是在同一个 child 中再次请求 health。第二次必须幂等补齐7条规则和 runtime 索引、通过 integrity／FK 检查，证明没有复用关闭对象，也不是只靠 `SELECT 1` 偶然成功。
+- 新增独立 `verify-database-initialization.mjs`，直接以 TypeScript `transpileModule` 加载真实 `database.ts`，因此能覆盖 production build 会裁掉的开发 seed 分支；测试只把 better-sqlite3 换成继承真实 Database 的计数子类，所有 SQL、事务和落盘行为仍由真实 SQLite 执行。
+- 独立回归覆盖三组确定性故障：fresh schema 在真实 DDL 后失败；development seed 在第二位教师真实 INSERT 后失败；已发布 global 连接在强制旧 schema 版本后迁移失败。分别断言 close 次数、`.open`、构造实例数、global 指针、schema 版本、seed 整体回滚和同连接重试。
+- 初始化脚本会在跨进程回归开始时先执行；现有 `test:integration`、`test:concurrency` 和 `test:release` 都会自然经过这项固定门槛，无需改动老师尚未提交的 package UX 区块。以后若有人把 schema 版本提前发布、删除主动 close、误关 global 连接或破坏 seed 事务，普通发布回归会直接失败。
+- 新增生产、测试和脚本区块都写入面向基础开发人员的中文注释。老师尚未提交的 UX 两条 package 命令、UX 脚本和文档保持不动。
+
+### 本次验证
+
+- `node scripts/verify-database-initialization.mjs` 三组故障全部通过：fresh 失败后实例1关闭且 global/version 未发布，实例2成功发布，第三次调用不再新建；seed 失败后教师／班级／教室均为0，重试后精确为4／4／3；global 迁移失败后实例数和 close 数不变，同一 open handle 重试成功。
+- `node --check` 两个相关脚本、`git diff --check`、独立 TypeScript 检查、ESLint、production build 和 `npm run test:concurrency` 全部通过。
+- 最终 `npm run test:release` 完整通过：数据库初始化、身份、Excel、Teaching allocation、全部 CRUD／revision、warning 原子回滚、完整备份、Cycle、Candidate 快照与故障、跨进程排课／Setup／认证竞态、外键和374班次规模性能均成功。
+- 最新满载结果为 Issues p95 `15.0 ms`、Year timetable p95 `12.7 ms`、30间教室候选中位 `144.0 ms`、六账号30请求轮询整轮 `59.6 ms`／请求 p95 `56.7 ms`、360条 warning 重算 `63.0 ms`、一个写入加十个读取 `99.0 ms`。
+- Prepared Statement 审计仍为候选 `16 prepare／12,600 execute`、全量刷新 `16／5,288`；初始化故障测试没有改变业务查询或性能基线。
+- 所有新测试数据库均位于 `os.tmpdir()` 的唯一目录，结束后没有残留 `timetabling-db-init-*` 或 `timetabling-api-*`。正式 `web/data/timetabling.db` 仍为 `2026-08-11 04:45:51`、544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空。
+- 两项独立只读审查核对了 close 错误不掩盖原错、fresh/global 分支隔离、同实例 ready 证据、seed 事务回滚、global schemaVersion 时点、临时路径和 package 接线，最终未发现 P0／P1。
+
+### 下一步
+
+1. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务加载完整快照 + 事务外纯内存计算”，进一步缩短 rollback journal 下其他老师 COMMIT 的等待。
+2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
+3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项。

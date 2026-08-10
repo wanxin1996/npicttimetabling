@@ -44,6 +44,48 @@ const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 const candidateEntrySqlMarker = "/* timetabling:candidate-entry */";
 const candidateSnapshotSqlMarker = "/* timetabling:candidate-snapshot */";
 const candidateRoomUpdateSqlMarker = "/* timetabling:candidate-race-room-update */";
+const databaseInitializationSqlMarker = "/* timetabling:database-initialization */";
+let pendingInitializationClose;
+
+function consumeDatabaseInitializationArm(database) {
+  // 只让 A 在首次空库启动时注入一次故障。真实 schema SQL 已执行后再抛错，
+  // 可以同时验证“部分初始化的连接被关闭”和“下一次健康检查能幂等重试”。
+  if (processLabel !== "A") return;
+  const armFile = path.join(controlDirectory, "database-initialization-arm-A.json");
+  let control;
+  try {
+    control = JSON.parse(fs.readFileSync(armFile, "utf8"));
+  } catch (error) {
+    // 没有 arm 表示普通启动；损坏的控制文件必须让测试安全失败，不能静默跳过。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!control || typeof control !== "object" || control.version !== 1) return;
+  if (control.runToken !== runToken || control.label !== processLabel) return;
+  if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+
+  // rename 在同一 control 目录内是原子的；arm 被消费后，后续健康检查不会再次注入。
+  const consumedFile = path.join(
+    controlDirectory,
+    `database-initialization-consumed-A-${control.nonce}.json`,
+  );
+  const readyFile = path.join(
+    controlDirectory,
+    `database-initialization-close-ready-A-${control.nonce}.json`,
+  );
+  fs.renameSync(armFile, consumedFile);
+  pendingInitializationClose = { database, control, consumedFile, readyFile };
+  throw new Error("Forced database initialization failure for isolated cleanup verification.");
+}
+
+function recordClosedInitializationConnection(database) {
+  // ready 只在命中故障的同一个 Database 实例完成真实 close 后建立。
+  // 若生产代码只等待垃圾回收而没有主动关闭，回归会因缺少这个证据而失败。
+  const pending = pendingInitializationClose;
+  if (!pending || pending.database !== database) return;
+  fs.renameSync(pending.consumedFile, pending.readyFile);
+  pendingInitializationClose = undefined;
+}
 
 function waitForRaceRelease(releaseFile, nonce, description) {
   // 所有同步屏障都要求 release 文件内容精确匹配随机 nonce；只创建文件名不能误放行。
@@ -153,10 +195,28 @@ function patchBetterSqlite3(Database) {
   if (!Database?.prototype || Database.prototype.__timetablingRacePatched) return Database;
   const originalTransaction = Database.prototype.transaction;
   const originalPrepare = Database.prototype.prepare;
+  const originalExec = Database.prototype.exec;
+  const originalClose = Database.prototype.close;
   Object.defineProperty(Database.prototype, "__timetablingRacePatched", { value: true });
+  Database.prototype.exec = function testAwareExec(...argumentsList) {
+    // 初始化 SQL 先真实执行，再注入一次异常。由生产 database() 自己负责关闭这条
+    // 尚未发布的连接；测试包装层只观察，不代替业务清理。
+    const result = Reflect.apply(originalExec, this, argumentsList);
+    const [sql] = argumentsList;
+    if (typeof sql === "string" && sql.includes(databaseInitializationSqlMarker)) {
+      consumeDatabaseInitializationArm(this);
+    }
+    return result;
+  };
+  Database.prototype.close = function testAwareClose(...argumentsList) {
+    // 必须先完成 better-sqlite3 的真实关闭，再写 ready；关闭本身失败不能算通过。
+    const result = Reflect.apply(originalClose, this, argumentsList);
+    recordClosedInitializationConnection(this);
+    return result;
+  };
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装三个内部 marker：Candidate 首条读取、Active rooms 读取，以及本回归使用的教室 UPDATE。
-    // 其他 SQL 和 Statement 方法完全透明。
+    // 只包装三个 Statement marker：Candidate 首条读取、Active rooms 读取，以及本回归
+    // 使用的教室 UPDATE。数据库初始化使用上方 exec marker，其余 SQL 保持透明。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;

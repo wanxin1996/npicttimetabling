@@ -172,6 +172,68 @@ async function startServer(label) {
   throw new Error(`Server ${label} could not obtain a usable port.`);
 }
 
+async function armDatabaseInitializationFailure() {
+  // A 启动前先准备一次性故障。Preload 会在第一组真实 CREATE TABLE 已执行后消费它，
+  // 因而第二次健康检查面对的是一个“表已部分建立、但连接已经关闭”的真实重试场景。
+  const nonce = randomBytes(16).toString("hex");
+  const control = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce,
+  };
+  const files = {
+    arm: path.join(authRaceControlDirectory, "database-initialization-arm-A.json"),
+    temporary: path.join(
+      authRaceControlDirectory,
+      `database-initialization-arm-A-${nonce}.tmp`,
+    ),
+    consumed: path.join(
+      authRaceControlDirectory,
+      `database-initialization-consumed-A-${nonce}.json`,
+    ),
+    ready: path.join(
+      authRaceControlDirectory,
+      `database-initialization-close-ready-A-${nonce}.json`,
+    ),
+  };
+  await writeFile(files.temporary, JSON.stringify(control), { flag: "wx", mode: 0o600 });
+  await rename(files.temporary, files.arm);
+  return { control, files };
+}
+
+async function verifyDatabaseInitializationRecovery(serverA, fault) {
+  try {
+    // ready 文件只会在命中故障的同一个 better-sqlite3 实例真实 close 后出现。
+    // startServer 已在同一个子进程里等到后续 health=200，因此也证明重试没有重启服务。
+    assert.deepEqual(JSON.parse(await readFile(fault.files.ready, "utf8")), fault.control);
+    assert.equal(serverA.child.exitCode, null);
+    assert.equal(serverA.child.signalCode, null);
+
+    // 第一次故障发生在建表 SQL 之后、规则与索引之前。成功重试必须补齐后续初始化，
+    // 而不只是让 SELECT 1 健康检查偶然通过。
+    const db = new Database(testDatabasePath, { readonly: true });
+    try {
+      assert.deepEqual(db.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      assert.deepEqual(db.pragma("foreign_key_check"), []);
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rule_settings").get().count, 7);
+      assert.equal(
+        db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = ?")
+          .get("auth_sessions_user_id_idx").count,
+        1,
+      );
+    } finally {
+      db.close();
+    }
+    report("首次数据库初始化失败会关闭局部连接并在同一服务进程中干净重试");
+  } finally {
+    // 成功和断言失败都删除本组一次性控制文件；顶层临时目录清理仍是最终保险。
+    await Promise.all(Object.values(fault.files).map((filename) => (
+      rm(filename, { force: true }).catch(() => undefined)
+    )));
+  }
+}
+
 async function requestApi(server, pathname, options = {}) {
   // 请求器强制显式传入目标服务器和 Cookie，防止两个端口意外共用全局登录状态。
   const {
@@ -1178,6 +1240,10 @@ async function run() {
     throw new Error("Standalone build or authentication race preload is missing. Run `npm run build` before this verification.");
   }
 
+  // 先执行源码级初始化故障回归，覆盖 production build 会裁掉的 development seed 分支。
+  // 现有 integration／release 都会运行本脚本，因此无需改动老师尚未提交的 package UX 区块。
+  await import("./verify-database-initialization.mjs");
+
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-api-concurrency-"));
   testDatabasePath = path.join(temporaryDirectory, "shared.sqlite");
   authRaceControlDirectory = path.join(temporaryDirectory, "auth-race-control");
@@ -1189,8 +1255,13 @@ async function run() {
     mode: 0o600,
   });
 
-  // A 先完成空库初始化和管理员 setup，B 再加载同一个数据库及测试专用 preload。
+  // A 首次 health 会在部分初始化后故意失败一次。生产代码必须主动关闭局部连接，
+  // 同一个进程的下一次 health 才能完成幂等初始化；整个过程只使用本轮临时 SQLite。
+  const initializationFault = await armDatabaseInitializationFailure();
   const serverA = await startServer("A");
+  await verifyDatabaseInitializationRecovery(serverA, initializationFault);
+
+  // A 完成空库初始化和管理员 setup 后，B 才加载同一个数据库及测试专用 preload。
   // B 必须在管理员 setup 之后启动，避免空库初始化本身成为本测试的竞争对象。
   const setup = await requestApi(serverA, "/api/auth/setup", {
     method: "POST",
