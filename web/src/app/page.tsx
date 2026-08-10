@@ -157,10 +157,13 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<TimetableDropTarget | null>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
-  // 冲突通道尽量保持窄小，方便一次扫视多门课；极端繁忙的日期仍可横向扩展，绝不为了省空间而覆盖课程卡。
+  // 先统计每天最多有多少门课同时上课，再只给繁忙日期有限的额外宽度；每条并排课程预留约 36px，但一天的最低宽度最多只增长到 252px。
+  // 旧版会继续按通道数无限放大繁忙日期；现在宽度增长有上限，并且普通日期缩到 104px，把有限屏幕优先留给需要显示教师姓名的卡片。
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
-  const minimumGridWidth = 48 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(104, laneCount * 54), 0) + (timetableDays.length * 4);
-  const timetableColumns = `48px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(104, laneCount * 54)}px, ${laneCount}fr)`).join(" ")}`;
+  const dayWidthWeights = laneCountsByDay.map((laneCount) => laneCount <= 2 ? 1 : Math.min(2.5, 1 + ((laneCount - 2) * 0.3)));
+  const dayMinimumWidths = laneCountsByDay.map((laneCount) => Math.min(252, Math.max(104, laneCount * 36)));
+  const minimumGridWidth = 48 + dayMinimumWidths.reduce((total, width) => total + width, 0) + (timetableDays.length * 4);
+  const timetableColumns = `48px ${dayMinimumWidths.map((width, index) => `minmax(${width}px, ${dayWidthWeights[index]}fr)`).join(" ")}`;
 
   useEffect(() => {
     // 无论拖动在表内完成还是在表外取消，都清除绿色目标行，避免页面残留一个实际上不会接收课程的错误时间提示。
@@ -214,17 +217,17 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 
   return (
     <div>
-      {/* 横向导航固定放在长总表上方；老师不需要先滚动到 18:00，才能发现底部还有浏览器横向滚动条。 */}
+      {/* 五天默认保持在同一屏；繁忙日期只取得有限的额外宽度，横向导航只作为小窗口的备用方式。 */}
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-        <span>{onCellDrop ? "Drag until the green row shows the exact start hour. Use arrows only when a very busy day still overflows." : "Use the arrows or a trackpad to view every day and overlapping lesson."}</span>
+        <span>{onCellDrop ? "All five days stay on screen. Busy days receive limited extra space for readable cards." : "All five days stay on screen; use the arrows only on a narrow window."}</span>
         <div className="flex gap-1">
           <button onClick={() => scrollTimetable(-1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable left">← Left</button>
           <button onClick={() => scrollTimetable(1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable right">Right →</button>
         </div>
       </div>
       <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-1">
-        {/* 每小时使用紧凑的 44px 高度，让普通笔记本尽量一次看见 08:00–18:00；课程卡仍严格按照 durationHours 跨越对应小时数。 */}
-        <div className="grid gap-x-1 text-[10px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "30px repeat(10, minmax(44px, 1fr))", minHeight: 470, minWidth: minimumGridWidth }}>
+        {/* 每小时压缩为 36px，使 08:00–18:00 和页面工具栏更容易同时留在大屏内；课程卡仍严格按照 durationHours 跨越对应小时数。 */}
+        <div className="grid gap-x-1 text-[10px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "28px repeat(10, minmax(36px, 1fr))", minHeight: 388, minWidth: minimumGridWidth }}>
         <div className="sticky left-0 z-20 bg-white pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
         {timetableDays.map((day, index) => <div key={day} className="rounded-md bg-slate-50 p-1.5 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
 
@@ -251,6 +254,8 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
             {dropTarget?.dayOfWeek === dayIndex + 1 && <div className="pointer-events-none absolute z-30 flex items-start rounded border-2 border-emerald-500 bg-emerald-200/70 px-1 py-0.5 font-black text-emerald-950 shadow-sm" style={{ top: `${((dropTarget.startHour - timetableHours[0]) / timetableHours.length) * 100}%`, height: `${100 / timetableHours.length}%`, left: 1, right: 1 }}><span className="rounded bg-white/90 px-1">Drop {String(dropTarget.startHour).padStart(2, "0")}:00</span></div>}
             {positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map(({ lesson, lane, laneCount }) => {
               const laneWidth = 100 / laneCount;
+              // 三条以上并排时把卡片之间的空隙从 4px 缩到 2px，把宝贵宽度留给课程编号和教师姓名；普通密度仍保留较清楚的分隔。
+              const laneGap = laneCount > 2 ? 1 : 2;
               const top = ((lesson.startHour - timetableHours[0]) / timetableHours.length) * 100;
               const height = (lesson.durationHours / timetableHours.length) * 100;
               return (
@@ -264,7 +269,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
                   onDragOver={onCellDrop ? (event) => allowCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
                   onDrop={onCellDrop ? (event) => finishCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
                   className={`pointer-events-auto absolute transition ${focusLesson?.id === lesson.id ? "z-20 rounded-md ring-4 ring-emerald-400 ring-offset-2" : ""}`}
-                  style={{ top: `calc(${top}% + 2px)`, height: `calc(${height}% - 4px)`, left: `calc(${lane * laneWidth}% + 2px)`, width: `calc(${laneWidth}% - 4px)` }}
+                  style={{ top: `calc(${top}% + 2px)`, height: `calc(${height}% - 4px)`, left: `calc(${lane * laneWidth}% + ${laneGap}px)`, width: `calc(${laneWidth}% - ${laneGap * 2}px)` }}
                 >
                   {renderLesson(lesson, laneCount > 2)}
                 </div>
@@ -1226,11 +1231,12 @@ export default function Home() {
                     focusLesson={recentlySavedLesson}
                     onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
                     renderLesson={(lesson, isDense) => {
-                      // 同时段达到三门课时切换窄卡，只保留扫视所需资料；完整内容放在鼠标提示和 Inspector。
+                      // 总表卡片的实际高度已经表达两、三或四小时，因此不重复显示“3h”；
+                      // 无论同一时间有多少门课，都优先保留课程编号和教师姓名，教室与问题数排在其后。
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left text-[10px] leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
-                        <span className={`font-black ${isDense ? "block break-all" : "flex items-start justify-between gap-1"}`}><span className={isDense ? "" : "truncate"}>{lesson.sectionLabel}</span><span className={`${isDense ? "mt-0.5 block" : "shrink-0"} opacity-70`}>{lesson.durationHours}h</span></span>
-                        {!isDense && <span className="mt-0.5 block truncate">{lesson.teacherName ?? "Teacher pending"}</span>}
+                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded text-left ${isDense ? "p-0.5 text-[9px] leading-[1.05]" : "p-1 text-[10px] leading-tight"} shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
+                        <span className={`block font-black ${isDense ? "whitespace-nowrap text-[7px] tracking-[-0.06em]" : "truncate"}`}>{lesson.sectionLabel}</span>
+                        <span className={`mt-0.5 block ${isDense ? "break-words" : "truncate"}`}>{lesson.teacherName ?? "Teacher pending"}</span>
                         <span className="block truncate font-semibold">{lesson.roomCode ?? "Room pending"}</span>
                         {lesson.warnings.length > 0 && <span className={`mt-0.5 block font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length}</span>}
                       </button>;
