@@ -59,6 +59,7 @@ type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; ro
 type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
 type CycleStatus = { courses: number; sections: number; lessons: number; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
 type PositionedLesson = { lesson: ScheduledLesson; lane: number; laneCount: number };
+type TimetableDropTarget = { dayOfWeek: number; startHour: number };
 
 const timetableDays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const timetableHours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
@@ -95,6 +96,17 @@ function noticeTone(message: string) {
   if (["warning", "mismatch", "no completely clear"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
   if (["saved", "success", "placed", "updated", "created", "ready", "signed in"].some((word) => normalized.includes(word))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
   return "border-slate-200 bg-white text-slate-800";
+}
+
+function setCompactDragPreview(event: DragEvent<HTMLElement>, label: string) {
+  // The browser normally drags a full-size copy of the course card, which hides the
+  // hour beneath the pointer. A small temporary label keeps the destination visible.
+  const preview = document.createElement("div");
+  preview.textContent = label;
+  preview.className = "fixed -left-[9999px] top-0 rounded-md bg-slate-900 px-2 py-1 text-xs font-bold text-white shadow-lg";
+  document.body.appendChild(preview);
+  event.dataTransfer.setDragImage(preview, 12, 12);
+  requestAnimationFrame(() => preview.remove());
 }
 
 function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[] {
@@ -146,19 +158,59 @@ function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[
 
 function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }: {
   lessons: ScheduledLesson[];
-  renderLesson: (lesson: ScheduledLesson) => React.ReactNode;
+  renderLesson: (lesson: ScheduledLesson, isDense: boolean) => React.ReactNode;
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
   focusLesson?: { id: string; requestNumber: number } | null;
 }) {
   // This shared grid renders both editable year timetables and read-only personal
   // timetables, while optional callbacks add drag-and-drop only where appropriate.
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [dropTarget, setDropTarget] = useState<TimetableDropTarget | null>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
-  // A day with deliberately saved conflicts needs extra horizontal room for its
-  // lanes. Normal days remain compact; conflict-heavy days make only the grid scroll.
+  // Conflict lanes stay narrow enough to scan together; a very busy day can still
+  // expand horizontally rather than drawing one lesson over another.
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
-  const minimumGridWidth = 56 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(124, laneCount * 124), 0) + (timetableDays.length * 6);
-  const timetableColumns = `56px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(124, laneCount * 124)}px, ${laneCount}fr)`).join(" ")}`;
+  const minimumGridWidth = 48 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(104, laneCount * 54), 0) + (timetableDays.length * 4);
+  const timetableColumns = `48px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(104, laneCount * 54)}px, ${laneCount}fr)`).join(" ")}`;
+
+  useEffect(() => {
+    // Clear the green destination marker when a drag finishes anywhere, including
+    // outside this timetable, so a cancelled move never leaves a false target behind.
+    if (!onCellDrop) return;
+    const clearDropTarget = () => setDropTarget(null);
+    window.addEventListener("dragend", clearDropTarget);
+    window.addEventListener("drop", clearDropTarget);
+    return () => {
+      window.removeEventListener("dragend", clearDropTarget);
+      window.removeEventListener("drop", clearDropTarget);
+    };
+  }, [onCellDrop]);
+
+  function allowCellDrop(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
+    // Every hour cell reports its exact destination and makes that row visible before
+    // the teacher releases the mouse.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDropTarget((current) => current?.dayOfWeek === dayOfWeek && current.startHour === startHour ? current : { dayOfWeek, startHour });
+  }
+
+  function hourInsideLesson(event: DragEvent<HTMLDivElement>, lesson: ScheduledLesson) {
+    // An existing multi-hour card covers several background cells. Divide its visible
+    // height into hour bands so dropping on its second or third row remains precise.
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const hourHeight = bounds.height / lesson.durationHours;
+    const offset = Math.min(lesson.durationHours - 1, Math.max(0, Math.floor((event.clientY - bounds.top) / hourHeight)));
+    return lesson.startHour + offset;
+  }
+
+  function finishCellDrop(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
+    // Clear visual guidance first, then hand the exact day and hour to the existing
+    // save workflow, which still performs every conflict and rule check.
+    event.preventDefault();
+    event.stopPropagation();
+    setDropTarget(null);
+    onCellDrop?.(event, dayOfWeek, startHour);
+  }
 
   useEffect(() => {
     // After a successful save, find the exact rendered wrapper without interpolating
@@ -182,21 +234,21 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
       {/* Keep horizontal navigation visible above the long timetable. This avoids
           making users scroll to 18:00 just to discover the browser scrollbar. */}
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-        <span>Use the arrows or a trackpad to view every day and overlapping lesson.</span>
+        <span>{onCellDrop ? "Drag until the green row shows the exact start hour. Use arrows only when a very busy day still overflows." : "Use the arrows or a trackpad to view every day and overlapping lesson."}</span>
         <div className="flex gap-1">
           <button onClick={() => scrollTimetable(-1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable left">← Left</button>
           <button onClick={() => scrollTimetable(1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable right">Right →</button>
         </div>
       </div>
-      <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-2">
-        {/* Fixed 72px hour tracks let each absolute lesson cover exactly the number of
-            hours stored in durationHours, while the outer wrapper handles small screens. */}
-        <div className="grid gap-x-1.5 text-[11px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "34px repeat(10, minmax(52px, 1fr))", minHeight: 554, minWidth: minimumGridWidth }}>
+      <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-1">
+        {/* Compact 44px hour tracks fit the full 08:00–18:00 day on a normal laptop;
+            durationHours still determines the exact number of rows each card spans. */}
+        <div className="grid gap-x-1 text-[10px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "30px repeat(10, minmax(44px, 1fr))", minHeight: 470, minWidth: minimumGridWidth }}>
         <div className="sticky left-0 z-20 bg-white pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
-        {timetableDays.map((day, index) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
+        {timetableDays.map((day, index) => <div key={day} className="rounded-md bg-slate-50 p-1.5 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
 
         {timetableHours.map((hour, hourIndex) => (
-          <div key={`time-${hour}`} className="sticky left-0 z-20 border-t border-slate-100 bg-white py-3 font-semibold text-slate-400" style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
+          <div key={`time-${hour}`} className="sticky left-0 z-20 border-t border-slate-100 bg-white py-2 font-semibold text-slate-400" style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
             {String(hour).padStart(2, "0")}:00
           </div>
         ))}
@@ -206,15 +258,18 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
         {timetableHours.flatMap((hour, hourIndex) => timetableDays.map((_, dayIndex) => (
           <div
             key={`cell-${dayIndex + 1}-${hour}`}
-            onDragOver={onCellDrop ? (event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } : undefined}
-            onDrop={onCellDrop ? (event) => onCellDrop(event, dayIndex + 1, hour) : undefined}
-            className={onCellDrop ? "m-0.5 rounded-lg border border-dashed border-slate-200 transition hover:border-blue-400 hover:bg-blue-50/40" : "m-0.5 rounded-lg border border-slate-100 bg-slate-50/50"}
+            onDragOver={onCellDrop ? (event) => allowCellDrop(event, dayIndex + 1, hour) : undefined}
+            onDrop={onCellDrop ? (event) => finishCellDrop(event, dayIndex + 1, hour) : undefined}
+            className={onCellDrop ? `m-px rounded-md border border-dashed transition ${dropTarget?.dayOfWeek === dayIndex + 1 && dropTarget.startHour === hour ? "border-emerald-500 bg-emerald-100" : "border-slate-200 hover:border-blue-400 hover:bg-blue-50/40"}` : "m-px rounded-md border border-slate-100 bg-slate-50/50"}
             style={{ gridColumn: dayIndex + 2, gridRow: hourIndex + 2 }}
           />
         )))}
 
         {timetableDays.map((_, dayIndex) => (
           <div key={`overlay-${dayIndex + 1}`} className="pointer-events-none relative z-10" style={{ gridColumn: dayIndex + 2, gridRow: "2 / span 10" }}>
+            {/* This marker sits above existing cards without catching pointer events,
+                so the teacher always sees the exact hour that will receive the drop. */}
+            {dropTarget?.dayOfWeek === dayIndex + 1 && <div className="pointer-events-none absolute z-30 flex items-start rounded border-2 border-emerald-500 bg-emerald-200/70 px-1 py-0.5 font-black text-emerald-950 shadow-sm" style={{ top: `${((dropTarget.startHour - timetableHours[0]) / timetableHours.length) * 100}%`, height: `${100 / timetableHours.length}%`, left: 1, right: 1 }}><span className="rounded bg-white/90 px-1">Drop {String(dropTarget.startHour).padStart(2, "0")}:00</span></div>}
             {positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map(({ lesson, lane, laneCount }) => {
               const laneWidth = 100 / laneCount;
               const top = ((lesson.startHour - timetableHours[0]) / timetableHours.length) * 100;
@@ -227,12 +282,12 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
                   data-start-hour={lesson.startHour}
                   data-duration-hours={lesson.durationHours}
                   aria-label={`${lesson.sectionLabel}, ${lesson.durationHours} hours`}
-                  onDragOver={onCellDrop ? (event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } : undefined}
-                  onDrop={onCellDrop ? (event) => onCellDrop(event, lesson.dayOfWeek, lesson.startHour) : undefined}
+                  onDragOver={onCellDrop ? (event) => allowCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
+                  onDrop={onCellDrop ? (event) => finishCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
                   className={`pointer-events-auto absolute transition ${focusLesson?.id === lesson.id ? "z-20 rounded-md ring-4 ring-emerald-400 ring-offset-2" : ""}`}
-                  style={{ top: `calc(${top}% + 3px)`, height: `calc(${height}% - 6px)`, left: `calc(${lane * laneWidth}% + 3px)`, width: `calc(${laneWidth}% - 6px)` }}
+                  style={{ top: `calc(${top}% + 2px)`, height: `calc(${height}% - 4px)`, left: `calc(${lane * laneWidth}% + 2px)`, width: `calc(${laneWidth}% - 4px)` }}
                 >
-                  {renderLesson(lesson)}
+                  {renderLesson(lesson, laneCount > 2)}
                 </div>
               );
             })}
@@ -268,6 +323,7 @@ export default function Home() {
   const [unscheduledGroupId, setUnscheduledGroupId] = useState("");
   const [unscheduledProgram, setUnscheduledProgram] = useState("");
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
+  const [showTimetableInspector, setShowTimetableInspector] = useState(false);
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [scheduleIssues, setScheduleIssues] = useState<ScheduleIssue[]>([]);
   const [placingSection, setPlacingSection] = useState<UnscheduledSection | null>(null);
@@ -403,6 +459,7 @@ export default function Home() {
     setPlacingSection(null);
     setCandidateSection(null);
     setCandidateSlots([]);
+    setShowTimetableInspector(true);
     setView("Year timetables");
     setShowForm(false);
     setNotice(`${issue.sectionLabel} opened from the issue list.`);
@@ -1073,7 +1130,7 @@ export default function Home() {
       {notice && <div role="status" aria-live="polite" aria-atomic="true" className={`fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span>{notice}</div>}
       {/* Persistent identity header for the department workspace. */}
       <header className="shrink-0 border-b border-slate-200 bg-white">
-        <div className={`mx-auto flex items-center justify-between gap-4 px-4 py-3 ${view === "Year timetables" ? "max-w-[1800px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
+        <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "max-w-[1920px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#153d75] text-sm font-black tracking-tight text-white">NP</div>
             <div>
@@ -1094,7 +1151,7 @@ export default function Home() {
         </div>
       </header>
 
-      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1800px] gap-4 px-4 py-4 lg:grid-cols-[160px_minmax(0,1fr)] xl:min-h-0 xl:w-full xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
+      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1920px] gap-3 px-3 py-3 lg:grid-cols-[140px_minmax(0,1fr)] xl:min-h-0 xl:w-full xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
         {/* Navigation reflects the future scheduling modules; only data management is active today. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
@@ -1179,7 +1236,7 @@ export default function Home() {
           )}
 
           {view === "Year timetables" && (
-            <div className="grid gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-[220px_minmax(0,1fr)_250px]">
+            <div className={`grid gap-2 xl:min-h-0 xl:flex-1 ${showTimetableInspector ? "xl:grid-cols-[190px_minmax(0,1fr)_220px]" : "xl:grid-cols-[190px_minmax(0,1fr)]"}`}>
               <aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
                 <div className="mb-2">
                   <p className="font-bold text-slate-950">Unscheduled sessions</p>
@@ -1195,11 +1252,11 @@ export default function Home() {
                 </div>
                 <div className="grid min-h-0 flex-1 content-start gap-2 overflow-y-auto pr-1">
                   {filteredUnscheduledSections.map((section) => (
-                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className={`cursor-grab rounded-xl border p-2.5 text-xs active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
+                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, section.label); }} className={`cursor-grab rounded-lg border p-2 text-[11px] active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
                       <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
                       <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
-                      <div className="mt-2 grid grid-cols-2 gap-1.5"><button draggable={false} onClick={(event) => { event.stopPropagation(); setPlacingSection(section); setEditingLesson(null); setCandidateSection(null); }} className="rounded-lg bg-[#153d75] px-2 py-1.5 font-bold text-white" type="button">Schedule</button><button draggable={false} onClick={(event) => { event.stopPropagation(); void findCandidateSlots(section); }} className="rounded-lg border border-blue-200 bg-white px-2 py-1.5 font-bold text-blue-800 hover:border-blue-400" type="button">Clear slots</button></div>
+                      <div className="mt-1.5 grid grid-cols-2 gap-1"><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); setPlacingSection(section); setEditingLesson(null); setCandidateSection(null); }} className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white" type="button">Schedule</button><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); void findCandidateSlots(section); }} className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400" type="button">Clear slots</button></div>
                     </div>
                   ))}
                   {filteredUnscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">{unscheduledSections.length === 0 ? "No configured sessions waiting for this year." : "No sessions match these filters."}</p>}
@@ -1209,28 +1266,31 @@ export default function Home() {
               {/* min-w-0 keeps a conflict-wide timetable inside this grid column, so
                   the timetable's own controls scroll it instead of widening the page. */}
               <div className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-                <div className="mb-2 flex items-center justify-between">
+                <div className="mb-2 flex items-center justify-between gap-2">
                   <div><p className="text-xs font-semibold text-blue-700">Master timetable</p><h2 className="text-lg font-black">Year {timetableYear}</h2></div>
-                  <div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-1.5 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div>
+                  <div className="flex items-center gap-2"><div className="hidden gap-1 sm:flex"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div><button onClick={() => setShowTimetableInspector((current) => !current)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button">{showTimetableInspector ? "Hide inspector" : "Show inspector"}</button><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-2.5 py-1.5 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto"><WeeklyTimetableGrid
                     lessons={lessons}
                     focusLesson={recentlySavedLesson}
                     onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
-                    renderLesson={(lesson) => {
+                    renderLesson={(lesson, isDense) => {
+                      // Three or more simultaneous lessons use narrow cards: keep the
+                      // identifiers visible here and move full details to the tooltip/editor.
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                      return <button draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => { setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded-md p-1.5 text-left shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
-                        <span className="block truncate font-black">{lesson.sectionLabel} · {lesson.durationHours}h</span>
-                        <span className="mt-0.5 block font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</span>
-                        <span className="mt-0.5 block truncate">{lesson.teacherName ?? "Teacher pending"}</span>
-                        <span className="block truncate">{lesson.roomCode ?? "Room pending"}</span>
-                        {lesson.warnings.length > 0 && <span className={`mt-0.5 block font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</span>}
+                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left text-[10px] leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
+                        <span className={`font-black ${isDense ? "block break-all" : "flex items-start justify-between gap-1"}`}><span className={isDense ? "" : "truncate"}>{lesson.sectionLabel}</span><span className={`${isDense ? "mt-0.5 block" : "shrink-0"} opacity-70`}>{lesson.durationHours}h</span></span>
+                        {!isDense && <span className="mt-0.5 block truncate">{lesson.teacherName ?? "Teacher pending"}</span>}
+                        <span className="block truncate font-semibold">{lesson.roomCode ?? "Room pending"}</span>
+                        {lesson.warnings.length > 0 && <span className={`mt-0.5 block font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length}</span>}
                       </button>;
                     }}
                   /></div>
               </div>
 
-              <aside className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-label="Timetable inspector">
+              {/* The inspector opens only when requested or when a course is selected,
+                  returning its width to the master timetable during overview work. */}
+              {showTimetableInspector && <aside className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-label="Timetable inspector">
                 <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div></div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
                   {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
@@ -1238,7 +1298,7 @@ export default function Home() {
                   : candidateSection ? <div><div className="flex items-start justify-between gap-2"><div><p className="font-black text-emerald-950">Clear slots</p><p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p> : <div className="mt-3 grid gap-2">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500" type="button"><span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span><span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span></button>)}</div>}</div>
                   : <div><p className="text-xs leading-5 text-slate-500">Select a lesson to edit it, or choose Schedule on an unscheduled session.</p><div className="my-3 border-t border-slate-100" /><div className="mb-2 flex items-center justify-between"><p className="text-sm font-black text-slate-950">Year {timetableYear} issues</p><button onClick={() => void openRules()} className="text-xs font-bold text-blue-700" type="button">All rules</button></div>{visibleYearIssues.length === 0 ? <p className="rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">No issues in this year.</p> : <div className="grid gap-2">{visibleYearIssues.map((issue) => <button key={issue.id} onClick={() => void openScheduleIssue(issue)} className="rounded-xl border border-slate-200 p-2.5 text-left text-xs hover:border-blue-300 hover:bg-blue-50" type="button"><span className="flex items-center justify-between gap-2"><span className="font-black text-slate-900">{issue.sectionLabel}</span><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill></span><span className="mt-1 block font-semibold text-slate-700">{issue.message}</span><span className="mt-1 block text-slate-500">{timetableDays[issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00</span></button>)}</div>}</div>}
                 </div>
-              </aside>
+              </aside>}
             </div>
           )}
 
