@@ -45,11 +45,13 @@
 - `PATCH`/`DELETE /api/schedule/lessons/:id`：编辑已排课程的时间、教师、教室，或将班次退回未排清单。
 - `GET /api/schedule/unscheduled?year=:year`：返回指定年级已完成课程配置、但尚未放入总表的班次，用于拖拽清单。
 - `GET`/`POST`/`DELETE /api/unavailability`：维护教师个人和 Year 1–3 的不可上课时段。
+- `GET /api/system-backup`：仅管理员下载经结构与外键检查的完整 SQLite 副本；账号保留，所有登录会话从副本清除并通过 `VACUUM` 移除空闲页。
+- `POST /api/system-backup`：仅管理员上传当前版本生成的 `.sqlite` 副本；固定短语和双确认后，先保存在线库安全副本，再以单一事务恢复全部表并撤销所有会话。
 
 排课写入与编辑共用同一警告引擎，当前检查教师／教室／学生班级重叠、资料缺失、教室容量和设施、08:00 开课、午餐时段、连续课时、每日总时数以及跨 Block 连堂。只有教学周范围实际重叠的课程才会互相影响；全部周课程会与任何范围重叠。问题会保存到排课记录并附带最高严重程度，年级总表、个人课表和集中问题清单共用红／黄／蓝标准；任何级别都不会阻止用户保存。
 - `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；所有有效行维护教师清单，只有正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
-本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。Railway 环境会自动读取 `RAILWAY_VOLUME_MOUNT_PATH`，并把数据库保存为挂载卷中的 `timetabling.db`；`TIMETABLING_DATABASE_PATH` 可作为明确覆盖。若 Railway 运行时没有挂载卷，启动检查会直接中止，避免误把正式资料写入部署容器的临时文件系统。首次运行时自动创建数据库；只有开发模式会插入最小示例资料，生产模式始终以空资料开始，避免真实系统混入演示教师、班级或教室。
+本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。每次完整恢复前，系统把已经清除会话且再次验证过的当前状态保存在数据库同目录的 `timetabling-restore-safety/`；文件使用仅拥有者可读写权限，供管理员在误选备份后回退。Railway 环境会自动读取 `RAILWAY_VOLUME_MOUNT_PATH`，并把数据库和恢复安全副本都保存到挂载卷；`TIMETABLING_DATABASE_PATH` 可作为明确覆盖。若 Railway 运行时没有挂载卷，启动检查会直接中止，避免误把正式资料写入部署容器的临时文件系统。首次运行时自动创建数据库；只有开发模式会插入最小示例资料，生产模式始终以空资料开始，避免真实系统混入演示教师、班级或教室。
 
 生产构建启用 Next.js standalone 输出。构建完成后，`scripts/prepare-standalone.mjs` 会把 `public/` 和 `.next/static/` 复制到自包含目录，避免部署后出现页面有 HTML 但缺少图标、CSS 或浏览器脚本的问题。
 
@@ -60,6 +62,8 @@
 - 登录同时按“来源地址 + 用户名”限制 5 次失败，并按来源地址限制 25 次失败；达到上限后暂停 15 分钟。计数只存在单实例内存中，重新部署会清空，符合当前单实例路线。
 - 全站返回 HSTS、`nosniff`、禁止 iframe、无 Referrer 和禁用摄像头/麦克风/定位权限；所有 API 返回 `Cache-Control: no-store`。
 - Teaching Members 仅接受 `.xlsx`，文件最大 20 MB、工作表最多 5,000 行，并继续校验固定工作表、必需列和每行资料。
+- 完整恢复仅接受 16 字节以上、20 MB 以下且带 SQLite 3 文件头的 `.sqlite`；继续检查完整性、外键、全部表与字段形状，以及至少一个可用管理员密码哈希，任何验证失败都不会开始替换资料。
+- 恢复复制在单一同步 SQLite 事务中完成，关系复检也在提交前执行；成功后不保留上传文件或任何旧会话，当前及其他浏览器都必须使用备份内账号重新登录。
 - 公网环境必须由托管平台提供 HTTPS；否则生产模式的 Secure Cookie 不会通过普通 HTTP 发送。
 
 ## 公网基础设施

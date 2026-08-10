@@ -84,6 +84,14 @@ function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
   return { card: "bg-blue-50 text-blue-900 ring-blue-300", message: "text-blue-700" };
 }
 
+function noticeTone(message: string) {
+  const normalized = message.toLowerCase();
+  if (["could not", "unable", "failed", "error", "interrupted", "expired"].some((word) => normalized.includes(word))) return "border-red-200 bg-red-50 text-red-900";
+  if (["warning", "mismatch", "no completely clear"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
+  if (["saved", "success", "placed", "updated", "created", "ready", "signed in"].some((word) => normalized.includes(word))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
+  return "border-slate-200 bg-white text-slate-800";
+}
+
 function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[] {
   const positioned: PositionedLesson[] = [];
 
@@ -139,8 +147,8 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
   // A day with deliberately saved conflicts needs extra horizontal room for its
   // lanes. Normal days remain compact; conflict-heavy days make only the grid scroll.
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
-  const minimumGridWidth = 64 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(150, laneCount * 150), 0) + (timetableDays.length * 8);
-  const timetableColumns = `64px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(150, laneCount * 150)}px, ${laneCount}fr)`).join(" ")}`;
+  const minimumGridWidth = 56 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(124, laneCount * 124), 0) + (timetableDays.length * 6);
+  const timetableColumns = `56px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(124, laneCount * 124)}px, ${laneCount}fr)`).join(" ")}`;
 
   const scrollTimetable = (direction: -1 | 1) => {
     // Move most of one visible width at a time. The remaining overlap preserves
@@ -164,7 +172,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
       <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-2">
         {/* Fixed 72px hour tracks let each absolute lesson cover exactly the number of
             hours stored in durationHours, while the outer wrapper handles small screens. */}
-        <div className="grid gap-x-2 text-xs" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "40px repeat(10, 72px)", minWidth: minimumGridWidth }}>
+        <div className="grid gap-x-1.5 text-[11px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "34px repeat(10, minmax(52px, 1fr))", minHeight: 554, minWidth: minimumGridWidth }}>
         <div className="sticky left-0 z-20 bg-white pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
         {timetableDays.map((day, index) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
 
@@ -219,7 +227,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
 
 export default function Home() {
   // View and form state control what the scheduler currently sees and edits.
-  const [view, setView] = useState<View>("Teachers");
+  const [view, setView] = useState<View>("Year timetables");
   const [query, setQuery] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [teachers, setTeachers] = useState<Teacher[]>([]);
@@ -243,6 +251,7 @@ export default function Home() {
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [scheduleIssues, setScheduleIssues] = useState<ScheduleIssue[]>([]);
+  const [placingSection, setPlacingSection] = useState<UnscheduledSection | null>(null);
   const [candidateSection, setCandidateSection] = useState<UnscheduledSection | null>(null);
   const [candidateSlots, setCandidateSlots] = useState<CandidateSlot[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
@@ -257,6 +266,7 @@ export default function Home() {
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [importing, setImporting] = useState(false);
   const [downloadingBackup, setDownloadingBackup] = useState(false);
+  const [restoringBackup, setRestoringBackup] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -292,6 +302,12 @@ export default function Home() {
         && (!unscheduledProgram || sectionGroups.some((group) => group.program === unscheduledProgram));
     });
   }, [groups, unscheduledGroupId, unscheduledProgram, unscheduledQuery, unscheduledSections, unscheduledStaffType]);
+  const visibleYearIssues = useMemo(() => {
+    const severityRank = { High: 0, Warning: 1, Advisory: 2 } as const;
+    return scheduleIssues
+      .filter((issue) => issue.primaryYear === timetableYear)
+      .sort((left, right) => severityRank[left.severity] - severityRank[right.severity] || left.dayOfWeek - right.dayOfWeek || left.startHour - right.startHour);
+  }, [scheduleIssues, timetableYear]);
 
   function openView(nextView: View) {
     // Moving between tables clears controls that belong only to the previous table.
@@ -305,17 +321,26 @@ export default function Home() {
     setSelectedCourse(null);
     setSections([]);
     setAllocationVariances([]);
+    setEditingLesson(null);
+    setPlacingSection(null);
+    setCandidateSection(null);
+    setCandidateSlots([]);
   }
 
   async function openTimetable(year: number) {
     // Load one year at a time because the department maintains three separate master tables.
-    const [lessonResponse, unscheduledResponse] = await Promise.all([fetch(`/api/schedule/lessons?year=${year}`), fetch(`/api/schedule/unscheduled?year=${year}`)]);
-    if (!lessonResponse.ok || !unscheduledResponse.ok) return setNotice("The year timetable could not be loaded.");
+    const [lessonResponse, unscheduledResponse, issuesResponse] = await Promise.all([fetch(`/api/schedule/lessons?year=${year}`), fetch(`/api/schedule/unscheduled?year=${year}`), fetch("/api/issues")]);
+    if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok) return setNotice("The year timetable could not be loaded.");
     setTimetableYear(year);
     setLessons(await lessonResponse.json());
     setUnscheduledSections(await unscheduledResponse.json());
+    setScheduleIssues(await issuesResponse.json());
     setView("Year timetables");
     setShowForm(false);
+    setEditingLesson(null);
+    setPlacingSection(null);
+    setCandidateSection(null);
+    setCandidateSlots([]);
   }
 
   async function openScheduleIssue(issue: ScheduleIssue) {
@@ -339,6 +364,7 @@ export default function Home() {
     setLessons(nextLessons);
     setUnscheduledSections(await unscheduledResponse.json() as UnscheduledSection[]);
     setEditingLesson(linkedLesson);
+    setPlacingSection(null);
     setCandidateSection(null);
     setCandidateSlots([]);
     setView("Year timetables");
@@ -425,6 +451,8 @@ export default function Home() {
     // Suggestions are requested only when needed and replace the previous section's
     // results, keeping the timetable sidebar compact for hundreds of sections.
     setCandidateSection(section);
+    setPlacingSection(null);
+    setEditingLesson(null);
     setCandidateSlots([]);
     setCandidatesLoading(true);
     const [sectionId] = section.id.split(":");
@@ -448,6 +476,29 @@ export default function Home() {
     setCandidateSlots([]);
     await openTimetable(timetableYear);
     setNotice(body.warnings.length ? `${body.sectionLabel} changed while placing and now has warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed in ${slot.roomCode} with no warnings.`);
+  }
+
+  async function placeSectionWithoutDrag(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!placingSection) return;
+    const data = new FormData(event.currentTarget);
+    const [sectionId] = placingSection.id.split(":");
+    const response = await fetch("/api/schedule/lessons", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sectionId,
+        occurrence: placingSection.occurrence,
+        dayOfWeek: Number(data.get("dayOfWeek")),
+        startHour: Number(data.get("startHour")),
+        roomId: String(data.get("roomId") ?? "") || null,
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
+    setPlacingSection(null);
+    await openTimetable(timetableYear);
+    setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully.`);
   }
 
   async function saveLesson(event: FormEvent<HTMLFormElement>) {
@@ -551,7 +602,7 @@ export default function Home() {
       // Poll only the currently visible scheduling projection. This keeps multiple
       // logged-in browsers current without repeatedly downloading unrelated tables.
       let responses: Response[] = [];
-      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`)]);
+      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues")]);
       if (view === "Personal timetables" && personalOwnerId) responses = [await fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`)];
       if (view === "Rules & issues") responses = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
       if (!active || responses.length === 0) return;
@@ -563,7 +614,7 @@ export default function Home() {
       if (responses.some((response) => !response.ok)) return;
       const payloads = await Promise.all(responses.map((response) => response.json()));
       if (!active) return;
-      if (view === "Year timetables") { setLessons(payloads[0]); setUnscheduledSections(payloads[1]); }
+      if (view === "Year timetables") { setLessons(payloads[0]); setUnscheduledSections(payloads[1]); setScheduleIssues(payloads[2]); }
       if (view === "Personal timetables") setPersonalLessons(payloads[0]);
       if (view === "Rules & issues") { setUnavailableWindows(payloads[0]); setScheduleIssues(payloads[1]); setRuleSettings(payloads[2]); }
       setLastSyncedAt(new Date());
@@ -680,6 +731,35 @@ export default function Home() {
     } finally {
       // Always re-enable the control, including when the network request itself fails.
       setDownloadingBackup(false);
+    }
+  }
+
+  async function restoreSystemBackup(event: FormEvent<HTMLFormElement>) {
+    // The browser preserves the selected file in FormData. The server independently
+    // repeats every confirmation and performs all trust-sensitive validation.
+    event.preventDefault();
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    setRestoringBackup(true);
+    setNotice("Validating the backup and saving the current system state...");
+    try {
+      const response = await fetch("/api/system-backup", { method: "POST", body: formData });
+      const body = await response.json();
+      if (!response.ok) return setNotice(body.error ?? "The full system backup could not be restored.");
+
+      // A successful restore removes this session and activates the accounts stored
+      // in the selected backup, so return immediately to the sign-in screen.
+      form.reset();
+      setCurrentUser(null);
+      setAccounts([]);
+      setAuthScreen("login");
+      setNotice(`Full system restored. All sessions were signed out. Server safety copy: ${body.safetyBackupFilename}.`);
+    } catch {
+      // Network interruption is not treated as success; the user can sign in again
+      // and inspect the data before deciding whether another restore is necessary.
+      setNotice("The restore response was interrupted. Sign in again and verify the current system before retrying.");
+    } finally {
+      setRestoringBackup(false);
     }
   }
 
@@ -916,9 +996,10 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-[#f6f8fb] text-slate-900">
+      {notice && <div role="status" aria-live="polite" aria-atomic="true" className={`fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span>{notice}</div>}
       {/* Persistent identity header for the department workspace. */}
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-6 px-6 py-4">
+        <div className={`mx-auto flex items-center justify-between gap-4 px-4 py-3 ${view === "Year timetables" ? "max-w-[1800px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#153d75] text-sm font-black tracking-tight text-white">NP</div>
             <div>
@@ -932,10 +1013,14 @@ export default function Home() {
             <button onClick={() => setView("Profile")} className="ml-2 text-sm font-bold text-slate-700 hover:text-blue-700" type="button">{currentUser?.username}</button>
             <button onClick={() => void logout()} className="rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Sign out</button>
           </div>
+          <div className="flex items-center gap-2 md:hidden">
+            <button onClick={() => setView("Profile")} className="max-w-28 truncate text-sm font-bold text-slate-700" type="button">{currentUser?.username}</button>
+            <button onClick={() => void logout()} className="rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-semibold text-slate-600" type="button">Sign out</button>
+          </div>
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]">
+      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1800px] gap-4 px-4 py-4 lg:grid-cols-[160px_minmax(0,1fr)]" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
         {/* Navigation reflects the future scheduling modules; only data management is active today. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
@@ -958,32 +1043,28 @@ export default function Home() {
             <span className="text-base">↻</span> New cycle & recovery
           </button>
           {currentUser?.isAdmin && <button onClick={() => void openAccounts()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Accounts" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button"><span className="text-base">⚿</span> Accounts</button>}
-          <div className="my-3 border-t border-slate-100" />
-          <p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p>
-          <div className="rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">No timetable is published yet. Start with the master data.</div>
+          {view !== "Year timetables" && <><div className="my-3 border-t border-slate-100" /><p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p><div className="rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">Working timetable · {courses.reduce((total, course) => total + course.configuredSections, 0)} generated sections</div></>}
         </aside>
 
         <section className="min-w-0">
           {/* Page title and the single action that applies to the selected data view. */}
-          <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+          <div className={`${view === "Year timetables" ? "mb-3" : "mb-6"} flex flex-col justify-between gap-4 sm:flex-row sm:items-end`}>
             <div>
               <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Cycle" ? "Cycle safety" : view === "Accounts" ? "Administration" : view === "Profile" ? "My account" : "Data management"}</p>
-              <h1 className="mt-1 text-3xl font-black tracking-tight text-slate-950">{view === "Year timetables" ? "Build the master timetable" : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Cycle" ? "Start a new scheduling cycle safely" : view === "Accounts" ? "Manage scheduler accounts" : view === "Profile" ? "Change my password" : "Build the scheduling foundation"}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">{view === "Year timetables" ? "Drag an unscheduled section into a weekday and whole-hour start time." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Cycle" ? "Back up and clear only cycle data, or restore the latest emergency snapshot." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
+              <h1 className={`${view === "Year timetables" ? "text-2xl" : "mt-1 text-3xl"} font-black tracking-tight text-slate-950`}>{view === "Year timetables" ? `Year ${timetableYear} scheduling workspace` : view === "Personal timetables" ? "View a teacher or class timetable" : view === "Rules & issues" ? "Review rules and timetable issues" : view === "Cycle" ? "Start a new scheduling cycle safely" : view === "Accounts" ? "Manage scheduler accounts" : view === "Profile" ? "Change my password" : "Build the scheduling foundation"}</h1>
+              <p className={`${view === "Year timetables" ? "mt-1" : "mt-2"} max-w-2xl text-sm leading-6 text-slate-500`}>{view === "Year timetables" ? "Choose a session, place it, and resolve issues without leaving this workspace." : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room." : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place." : view === "Cycle" ? "Back up and clear only cycle data, or restore the latest emergency snapshot." : view === "Accounts" ? "Create individual logins for the small scheduling team." : view === "Profile" ? "Changing your password signs out all existing sessions for this account." : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections."}</p>
             </div>
             {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Cycle" && view !== "Accounts" && view !== "Profile" && <button onClick={toggleForm} className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f]" type="button">
               {showForm ? "Close form" : `+ ${actionLabel}`}
             </button>}
           </div>
 
-          <div className="mb-6 grid gap-4 sm:grid-cols-3">
+          {!["Year timetables", "Personal timetables", "Rules & issues", "Cycle", "Accounts", "Profile"].includes(view) && <div className="mb-6 grid gap-4 sm:grid-cols-3">
             {/* At-a-glance counts confirm that import and master data are ready for scheduling. */}
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Teachers</p><p className="mt-1 text-2xl font-black">{teachers.length}</p><p className="mt-1 text-xs text-amber-700">{teachers.filter((teacher) => teacher.staffType === "PT").length} PT priority teachers</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Student groups</p><p className="mt-1 text-2xl font-black">{groups.length}</p><p className="mt-1 text-xs text-slate-500">Across Years 1–3</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
-          </div>
-
-          {view === "Year timetables" && editingLesson && <form id="lesson-editor" onSubmit={saveLesson} className="mb-4 scroll-mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm"><div className="mb-3 flex items-center justify-between"><div><p className="text-sm font-black text-amber-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-amber-800">Update the placement, teacher and room, or return it to the tray.</p></div><button onClick={() => setEditingLesson(null)} className="text-sm font-semibold text-amber-800" type="button">Close</button></div><div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label></div><div className="mt-3 flex justify-end gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-amber-700 px-4 py-2 text-sm font-bold text-white" type="submit">Save changes</button></div></form>}
+          </div>}
 
           {view === "Personal timetables" && (
             /* All three read-only projections come from the same saved lessons, so
@@ -1023,32 +1104,28 @@ export default function Home() {
             </div>
           )}
 
-          {view === "Year timetables" && candidateSection && <div className="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-sm"><div className="flex items-start justify-between gap-3"><div><p className="font-black text-emerald-950">Completely clear options for {candidateSection.label}</p><p className="mt-1 text-xs text-emerald-800">Only times and rooms with no conflict, warning or recommendation are shown.</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-sm font-semibold text-emerald-800" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-emerald-800">Checking every weekday, hour and active room...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-white/70 p-3 text-sm text-emerald-900">No completely clear option is available. Confirm the teacher, student groups, rooms and unavailable windows, then try again.</p> : <div className="mt-4 grid max-h-56 gap-2 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-white p-3 text-left text-sm transition hover:border-emerald-500 hover:shadow-sm" type="button"><p className="font-black text-emerald-950">{["Mon", "Tue", "Wed", "Thu", "Fri"][slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</p><p className="mt-1 font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</p><p className="mt-1 text-xs text-slate-500">{slot.roomFeatures.join(", ") || "Standard classroom"}</p></button>)}</div>}</div>}
-
           {view === "Year timetables" && (
-            /* The tray contains one card per required weekly session. The grid renders
-               every lesson starting in a cell, including deliberately saved conflicts. */
-            <div className="mb-6 grid gap-4 xl:grid-cols-[240px_1fr]">
-              <aside className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="mb-3">
+            <div className="grid gap-3 xl:h-[calc(100vh-190px)] xl:min-h-[640px] xl:grid-cols-[220px_minmax(0,1fr)_250px]">
+              <aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                <div className="mb-2">
                   <p className="font-bold text-slate-950">Unscheduled sessions</p>
                   <p className="text-xs text-slate-500">{filteredUnscheduledSections.length} of {unscheduledSections.length} ready to place</p>
                 </div>
                 {/* Tray filters run locally over the current year response, so hundreds
                     of sections can be narrowed instantly without extra API requests. */}
-                <div className="mb-3 grid gap-2 rounded-xl bg-slate-50 p-2">
+                <div className="mb-2 grid shrink-0 gap-2 rounded-xl bg-slate-50 p-2">
                   <input value={unscheduledQuery} onChange={(event) => setUnscheduledQuery(event.target.value)} placeholder="Course or teacher..." className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs" />
                   <div className="grid grid-cols-2 gap-2"><select value={unscheduledStaffType} onChange={(event) => setUnscheduledStaffType(event.target.value as "All" | "FT" | "PT")} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="All">FT + PT</option><option value="PT">PT priority</option><option value="FT">FT only</option></select><select value={unscheduledProgram} onChange={(event) => setUnscheduledProgram(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="">All programmes</option>{unscheduledPrograms.map((program) => <option key={program} value={program}>{program}</option>)}</select></div>
                   <select value={unscheduledGroupId} onChange={(event) => setUnscheduledGroupId(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="">All student groups</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.code} · {group.program}</option>)}</select>
                   {(unscheduledQuery || unscheduledStaffType !== "All" || unscheduledGroupId || unscheduledProgram) && <button onClick={() => { setUnscheduledQuery(""); setUnscheduledStaffType("All"); setUnscheduledGroupId(""); setUnscheduledProgram(""); }} className="text-left text-xs font-bold text-blue-700" type="button">Clear filters</button>}
                 </div>
-                <div className="grid max-h-[650px] gap-2 overflow-y-auto">
+                <div className="grid min-h-0 flex-1 content-start gap-2 overflow-y-auto pr-1">
                   {filteredUnscheduledSections.map((section) => (
-                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className={`cursor-grab rounded-xl border p-3 text-xs active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
+                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; }} className={`cursor-grab rounded-xl border p-2.5 text-xs active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
                       <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
                       <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
-                      <button draggable={false} onClick={(event) => { event.stopPropagation(); void findCandidateSlots(section); }} className="mt-2 rounded-lg border border-blue-200 bg-white px-2 py-1 font-bold text-blue-800 hover:border-blue-400" type="button">Find clear options</button>
+                      <div className="mt-2 grid grid-cols-2 gap-1.5"><button draggable={false} onClick={(event) => { event.stopPropagation(); setPlacingSection(section); setEditingLesson(null); setCandidateSection(null); }} className="rounded-lg bg-[#153d75] px-2 py-1.5 font-bold text-white" type="button">Schedule</button><button draggable={false} onClick={(event) => { event.stopPropagation(); void findCandidateSlots(section); }} className="rounded-lg border border-blue-200 bg-white px-2 py-1.5 font-bold text-blue-800 hover:border-blue-400" type="button">Clear slots</button></div>
                     </div>
                   ))}
                   {filteredUnscheduledSections.length === 0 && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">{unscheduledSections.length === 0 ? "No configured sessions waiting for this year." : "No sessions match these filters."}</p>}
@@ -1057,29 +1134,36 @@ export default function Home() {
 
               {/* min-w-0 keeps a conflict-wide timetable inside this grid column, so
                   the timetable's own controls scroll it instead of widening the page. */}
-              <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="mb-4 flex items-center justify-between">
-                  <div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div>
-                  <div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div>
+              <div className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                <div className="mb-2 flex items-center justify-between">
+                  <div><p className="text-xs font-semibold text-blue-700">Master timetable</p><h2 className="text-lg font-black">Year {timetableYear}</h2></div>
+                  <div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-1.5 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div>
                 </div>
-                <WeeklyTimetableGrid
-                  lessons={lessons}
-                  onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
-                  renderLesson={(lesson) => {
-                    // The card fills its duration-based wrapper. Explicit start/end
-                    // text reinforces the occupied hours even before reading the grid.
-                    const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                    return <div draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => setEditingLesson(lesson)} className={`h-full cursor-pointer overflow-y-auto rounded-md p-2 shadow-sm hover:ring-2 ${issueClasses.card}`}>
-                      <p className="font-bold">{lesson.sectionLabel} · {lesson.durationHours}h</p>
-                      <p className="mt-1 font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</p>
-                      <p className="mt-1">{lesson.teacherName ?? "Teacher pending"}</p>
-                      <p>{lesson.studentGroups.join(", ") || "Student group pending"}</p>
-                      <p>{lesson.roomCode ?? "Room pending"}</p>
-                      {lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.join(", ")}</p>}
-                    </div>;
-                  }}
-                />
+                <div className="min-h-0 flex-1 overflow-y-auto"><WeeklyTimetableGrid
+                    lessons={lessons}
+                    onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
+                    renderLesson={(lesson) => {
+                      const issueClasses = lessonIssueClasses(lesson.warningSeverity);
+                      return <button draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; }} onClick={() => { setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded-md p-1.5 text-left shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
+                        <span className="block truncate font-black">{lesson.sectionLabel} · {lesson.durationHours}h</span>
+                        <span className="mt-0.5 block font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</span>
+                        <span className="mt-0.5 block truncate">{lesson.teacherName ?? "Teacher pending"}</span>
+                        <span className="block truncate">{lesson.roomCode ?? "Room pending"}</span>
+                        {lesson.warnings.length > 0 && <span className={`mt-0.5 block font-bold ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</span>}
+                      </button>;
+                    }}
+                  /></div>
               </div>
+
+              <aside className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-label="Timetable inspector">
+                <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div></div>
+                <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                  {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
+                  : placingSection ? <form onSubmit={placeSectionWithoutDrag} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Schedule {placingSection.label}</p><p className="text-xs text-slate-500">Keyboard and click alternative to dragging</p></div><button onClick={() => setPlacingSection(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div><div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900"><p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p><p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p></div><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + placingSection.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Assign later</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><button className="rounded-lg bg-[#153d75] px-3 py-2.5 text-sm font-bold text-white" type="submit">Place session</button><button onClick={() => void findCandidateSlots(placingSection)} className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-bold text-emerald-800" type="button">Show only clear options</button></form>
+                  : candidateSection ? <div><div className="flex items-start justify-between gap-2"><div><p className="font-black text-emerald-950">Clear slots</p><p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p> : <div className="mt-3 grid gap-2">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500" type="button"><span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span><span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span></button>)}</div>}</div>
+                  : <div><p className="text-xs leading-5 text-slate-500">Select a lesson to edit it, or choose Schedule on an unscheduled session.</p><div className="my-3 border-t border-slate-100" /><div className="mb-2 flex items-center justify-between"><p className="text-sm font-black text-slate-950">Year {timetableYear} issues</p><button onClick={() => void openRules()} className="text-xs font-bold text-blue-700" type="button">All rules</button></div>{visibleYearIssues.length === 0 ? <p className="rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">No issues in this year.</p> : <div className="grid gap-2">{visibleYearIssues.map((issue) => <button key={issue.id} onClick={() => void openScheduleIssue(issue)} className="rounded-xl border border-slate-200 p-2.5 text-left text-xs hover:border-blue-300 hover:bg-blue-50" type="button"><span className="flex items-center justify-between gap-2"><span className="font-black text-slate-900">{issue.sectionLabel}</span><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill></span><span className="mt-1 block font-semibold text-slate-700">{issue.message}</span><span className="mt-1 block text-slate-500">{timetableDays[issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00</span></button>)}</div>}</div>}
+                </div>
+              </aside>
             </div>
           )}
 
@@ -1111,7 +1195,64 @@ export default function Home() {
 
           {view === "Profile" && <form onSubmit={changePassword} className="mb-6 max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Change password</p><p className="mt-1 text-xs text-slate-500">At least 10 characters. All logged-in browsers will be signed out.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Current password<input name="currentPassword" required autoComplete="current-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">New password<input name="newPassword" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Change password</button></form>}
 
-          {view === "Accounts" && <div className="mb-6 grid gap-4 lg:grid-cols-[360px_1fr]"><div className="grid content-start gap-4">{/* Full backup is grouped with administrator-only controls because it contains every account and department record. */}<section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 shadow-sm"><p className="font-black text-blue-950">Full system backup</p><p className="mt-1 text-xs leading-5 text-blue-800">Download a verified SQLite backup containing master data, rules, courses, timetables and accounts. Active login sessions are excluded.</p><p className="mt-3 text-xs font-semibold leading-5 text-amber-800">Keep this sensitive file in an access-controlled department folder.</p><button onClick={() => void downloadSystemBackup()} disabled={downloadingBackup} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="button">{downloadingBackup ? "Checking backup..." : "Download full backup"}</button></section><form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Create scheduler account</p><p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button></form><form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Reset scheduler password</p><div className="mt-4 grid gap-3"><select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select><input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" /></div><button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button></form></div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div><div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div></div></div>}
+          {view === "Accounts" && (
+            /* Full backup and restore stay with administrator-only account controls
+               because both operations contain passwords and all department records. */
+            <div className="mb-6 grid gap-4 lg:grid-cols-[400px_1fr]">
+              <div className="grid content-start gap-4">
+                <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 shadow-sm">
+                  <p className="font-black text-blue-950">Full system backup</p>
+                  <p className="mt-1 text-xs leading-5 text-blue-800">Download a verified SQLite backup containing master data, rules, courses, timetables and accounts. Active login sessions are excluded.</p>
+                  <p className="mt-3 text-xs font-semibold leading-5 text-amber-800">Keep this sensitive file in an access-controlled department folder.</p>
+                  <button onClick={() => void downloadSystemBackup()} disabled={downloadingBackup || restoringBackup} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="button">{downloadingBackup ? "Checking backup..." : "Download full backup"}</button>
+                </section>
+
+                <form onSubmit={restoreSystemBackup} className="rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
+                  {/* The server also saves a current-state copy, but the nearby download
+                      gives the administrator a separately controlled off-system copy. */}
+                  <p className="font-black text-red-950">Restore full system backup</p>
+                  <p className="mt-1 text-xs leading-5 text-red-800">The uploaded file replaces all current data and accounts. The server first retains an automatic safety copy of the current state.</p>
+                  <div className="mt-4 grid gap-3 text-sm text-red-950">
+                    <label className="font-semibold">Verified .sqlite backup<input name="backupFile" required accept=".sqlite,application/vnd.sqlite3" type="file" className="mt-1 block w-full rounded-xl border border-red-200 bg-white p-2 text-xs font-normal" /></label>
+                    <label className="flex items-start gap-2"><input name="understandReplace" type="checkbox" className="mt-1" /><span>I understand that all current timetable data and accounts will be replaced.</span></label>
+                    <label className="flex items-start gap-2"><input name="understandSignOut" type="checkbox" className="mt-1" /><span>I understand that every browser will be signed out and I must use an account from the backup.</span></label>
+                    <label className="font-semibold">Type RESTORE FULL BACKUP<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal" /></label>
+                  </div>
+                  <button disabled={restoringBackup || downloadingBackup} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{restoringBackup ? "Validating and restoring..." : "Restore and sign out everyone"}</button>
+                </form>
+
+                <form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  {/* Scheduler creation remains simple because only the initial
+                      administrator can reach this form. */}
+                  <p className="font-black">Create scheduler account</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p>
+                  <div className="mt-4 grid gap-3">
+                    <label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label>
+                    <label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label>
+                  </div>
+                  <button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button>
+                </form>
+
+                <form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  {/* Password reset invalidates sessions only for the selected normal
+                      scheduler and never changes the administrator account. */}
+                  <p className="font-black">Reset scheduler password</p>
+                  <div className="mt-4 grid gap-3">
+                    <select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select>
+                    <input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" />
+                  </div>
+                  <button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button>
+                </form>
+              </div>
+
+              {/* The account list is read-only except for normal scheduler status;
+                  the administrator cannot accidentally deactivate itself. */}
+              <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div>
+                <div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div>
+              </div>
+            </div>
+          )}
 
           {view === "Rules & issues" && (
             /* Optional policy rules are editable here; core collision checks remain fixed. */
@@ -1221,7 +1362,7 @@ export default function Home() {
             )}
           </div>}
 
-          <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">System status:</span> {notice}</p>
+          {view !== "Year timetables" && <p className="mt-4 text-sm text-slate-500"><span className="font-semibold text-slate-700">System status:</span> {notice}</p>}
         </section>
       </div>
     </main>

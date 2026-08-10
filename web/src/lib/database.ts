@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -187,6 +187,15 @@ const globalForDatabase = globalThis as unknown as {
   timetableDatabase: DatabaseInstance | undefined;
 };
 
+function databaseFilePath() {
+  // Keep path selection in one place so the live database and automatic restore
+  // safety copies always use the same local disk or Railway persistent volume.
+  const configuredPath = process.env.TIMETABLING_DATABASE_PATH?.trim();
+  const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH?.trim();
+  const selectedPath = configuredPath || (railwayVolumePath ? path.join(railwayVolumePath, "timetabling.db") : path.join(process.cwd(), "data", "timetabling.db"));
+  return path.resolve(selectedPath);
+}
+
 function database() {
   // Even an existing connection must run the table setup: this safely adds tables
   // after the application has been upgraded with a new feature.
@@ -198,9 +207,7 @@ function database() {
   // An explicit path is useful for isolated regression runs. On Railway, fall back
   // to its automatically injected volume mount so a correctly attached volume is
   // persistent without duplicating the mount path in another dashboard variable.
-  const configuredPath = process.env.TIMETABLING_DATABASE_PATH?.trim();
-  const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH?.trim();
-  const databasePath = configuredPath || (railwayVolumePath ? path.join(railwayVolumePath, "timetabling.db") : path.join(process.cwd(), "data", "timetabling.db"));
+  const databasePath = databaseFilePath();
   const dataDirectory = path.dirname(databasePath);
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(databasePath);
@@ -268,6 +275,139 @@ export async function createVerifiedSystemBackup() {
     // The response already owns an in-memory copy, so the sensitive temporary file
     // can always be removed immediately, including when validation throws an error.
     backupDatabase?.close();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+export class SystemBackupValidationError extends Error {
+  // A dedicated error type lets the API distinguish an unsafe uploaded file from an
+  // unexpected server failure without exposing SQLite implementation details.
+  constructor(message: string) {
+    super(message);
+    this.name = "SystemBackupValidationError";
+  }
+}
+
+type TableColumn = { cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number };
+type TableShape = { name: string; columns: TableColumn[] };
+
+function quoteIdentifier(value: string) {
+  // Table names come from SQLite metadata, but quoting them still prevents unusual
+  // names from changing the restore statements into a different SQL command.
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function tableShapes(db: DatabaseInstance) {
+  // Restore accepts only a database with exactly the same user tables and column
+  // order as the running application. Internal sqlite_* bookkeeping is never copied.
+  const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
+  return tables.map<TableShape>(({ name }) => ({
+    name,
+    columns: db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as TableColumn[],
+  }));
+}
+
+function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseInstance) {
+  // Structural and relationship checks happen before any current record is touched.
+  // Exact shapes also prove that the upload is a backup from this application version.
+  assertDatabaseIntegrity(source, "Uploaded backup");
+  const sourceShapes = tableShapes(source);
+  const liveShapes = tableShapes(live);
+  if (JSON.stringify(sourceShapes) !== JSON.stringify(liveShapes)) {
+    throw new SystemBackupValidationError("The selected file does not match this version of the timetabling system.");
+  }
+
+  // All sessions will be removed, so at least one active administrator with a valid
+  // password-hash shape must remain able to sign in after the restore completes.
+  const administrators = source.prepare("SELECT password_hash FROM app_users WHERE is_admin = 1 AND is_active = 1").all() as Array<{ password_hash: string }>;
+  const validPasswordHash = /^[0-9a-f]{32}:[0-9a-f]{128}$/i;
+  if (!administrators.some((administrator) => validPasswordHash.test(administrator.password_hash))) {
+    throw new SystemBackupValidationError("The selected backup has no usable active administrator account.");
+  }
+
+  return sourceShapes.map((table) => table.name);
+}
+
+function saveRestoreSafetyCopy(contents: Buffer, sourceFilename: string) {
+  // Store the pre-restore snapshot beside the live database so Railway keeps it on
+  // the mounted volume even if the application container restarts after a restore.
+  const livePath = databaseFilePath();
+  const databaseName = path.basename(livePath, path.extname(livePath));
+  const safetyDirectory = path.join(path.dirname(livePath), `${databaseName}-restore-safety`);
+  mkdirSync(safetyDirectory, { recursive: true });
+  const safetyFilename = `pre-restore-${randomBytes(4).toString("hex")}-${sourceFilename}`;
+  writeFileSync(path.join(safetyDirectory, safetyFilename), contents, { flag: "wx", mode: 0o600 });
+  return safetyFilename;
+}
+
+export async function restoreVerifiedSystemBackup(contents: Buffer) {
+  // The uploaded bytes live in a unique temporary file only long enough for SQLite
+  // to validate and read them. Permissions limit other local users from opening it.
+  const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-restore-"));
+  const uploadedPath = path.join(temporaryDirectory, "uploaded.sqlite");
+  writeFileSync(uploadedPath, contents, { mode: 0o600 });
+  let uploadedDatabase: DatabaseInstance | undefined;
+  let restoreAttached = false;
+  const liveDatabase = database();
+
+  try {
+    let tableNames: string[];
+    try {
+      // Read-only mode prevents validation from repairing or changing the file the
+      // administrator selected; invalid SQLite bytes become a controlled 400 error.
+      uploadedDatabase = new Database(uploadedPath, { readonly: true, fileMustExist: true });
+      uploadedDatabase.pragma("query_only = ON");
+      tableNames = assertRestorableSystemBackup(uploadedDatabase, liveDatabase);
+    } catch (error) {
+      if (error instanceof SystemBackupValidationError) throw error;
+      throw new SystemBackupValidationError("The selected file is not a valid verified timetabling backup.");
+    } finally {
+      uploadedDatabase?.close();
+      uploadedDatabase = undefined;
+    }
+
+    // Before destructive work, make and persist a separately verified snapshot of
+    // the current state. It deliberately excludes active session credentials.
+    const safetyBackup = await createVerifiedSystemBackup();
+    const safetyBackupFilename = saveRestoreSafetyCopy(safetyBackup.contents, safetyBackup.filename);
+
+    // Attach the already validated upload and replace every application table in one
+    // synchronous transaction. Any copy or constraint error rolls the whole change back.
+    liveDatabase.prepare("ATTACH DATABASE ? AS restore_source").run(uploadedPath);
+    restoreAttached = true;
+    liveDatabase.pragma("foreign_keys = OFF");
+    try {
+      const restoreAllTables = liveDatabase.transaction(() => {
+        for (const tableName of tableNames) liveDatabase.prepare(`DELETE FROM main.${quoteIdentifier(tableName)}`).run();
+        for (const tableName of tableNames) liveDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} SELECT * FROM restore_source.${quoteIdentifier(tableName)}`).run();
+
+        // Sessions from either database must never survive a full restore. Checking
+        // relationships inside the transaction makes a failure roll back all copies.
+        liveDatabase.prepare("DELETE FROM main.auth_sessions").run();
+        const relationshipProblems = liveDatabase.pragma("foreign_key_check") as unknown[];
+        if (relationshipProblems.length > 0) throw new Error("Restored data failed foreign-key check.");
+      });
+      restoreAllTables();
+    } finally {
+      liveDatabase.pragma("foreign_keys = ON");
+    }
+
+    // Apply any idempotent defaults and validate the committed live file before the
+    // API tells the browser that restoration succeeded.
+    initializeTables(liveDatabase);
+    assertDatabaseIntegrity(liveDatabase, "Restored database");
+    const counts = liveDatabase.prepare(`SELECT
+      (SELECT COUNT(*) FROM teachers) AS teachers,
+      (SELECT COUNT(*) FROM courses) AS courses,
+      (SELECT COUNT(*) FROM course_sections) AS sections,
+      (SELECT COUNT(*) FROM scheduled_lessons) AS lessons,
+      (SELECT COUNT(*) FROM app_users) AS accounts`).get() as { teachers: number; courses: number; sections: number; lessons: number; accounts: number };
+    return { safetyBackupFilename, ...counts };
+  } finally {
+    // Detach the upload before deleting its temporary folder. Cleanup runs for valid,
+    // rejected and failed restores without touching the retained safety snapshot.
+    if (restoreAttached) liveDatabase.exec("DETACH DATABASE restore_source");
+    uploadedDatabase?.close();
     rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 }

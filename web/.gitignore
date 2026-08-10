@@ -42,3 +42,6 @@ next-env.d.ts
 
 /generated/prisma
 /data/*.db
+# Full-restore safety copies contain accounts and business data; keep every generated
+# directory local just like the primary SQLite database.
+/data/*-restore-safety/
