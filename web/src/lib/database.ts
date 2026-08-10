@@ -2129,7 +2129,6 @@ function calculateCandidateSlotsFromSnapshot(db: DatabaseInstance, sectionId: st
   // 候选搜索读取班次已保存的教师、学生班级、时长及教室要求。
   // 资料不完整时不返回可能误导用户的候选结果。
   const section = db.prepare(`
-    /* timetabling:candidate-entry */
     SELECT sections.id, sections.sequence, sections.teacher_id, courses.code,
       courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end
     FROM course_sections sections
@@ -2184,15 +2183,54 @@ function calculateCandidateSlotsFromSnapshot(db: DatabaseInstance, sectionId: st
   return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, occurrence, sessionsPerWeek: section.sessions_per_week, slots };
 }
 
+function serializeCandidateDatabaseSnapshot(db: DatabaseInstance, sectionId: string) {
+  // 第一条真实 SELECT 会固定当前已提交版本；测试 marker 也让 BUSY 回归能够在
+  // 取得读锁前暂停。这里仅提前处理不存在班次，其他资料与规则仍由内存快照统一计算。
+  const copyCurrentVersion = db.transaction(() => {
+    const section = db.prepare(`
+      /* timetabling:candidate-entry */
+      SELECT id FROM course_sections WHERE id = ?
+    `).get(sectionId);
+    // 不存在的班次无需复制整个数据库；404 仍来自这一个已固定的正式库快照，
+    // 另一账号同时开始新周期时也不会把两个版本拼在一起。
+    if (!section) throw new CandidateSlotsNotFoundError();
+
+    // serialize 会把这个短事务看到的 SQLite 版本复制成内存 Buffer。完整复制而不是
+    // 手工挑选几张表，能继续复用唯一警告引擎，也不会因以后新增规则依赖而漏资料。
+    // Buffer 只留在本次服务器请求的内存中，不写入临时文件，也不会返回给浏览器。
+    return db.serialize();
+  });
+  return copyCurrentVersion.deferred();
+}
+
+function openCandidateDatabaseSnapshot(snapshotBuffer: Buffer) {
+  try {
+    // better-sqlite3 会同步复制传入的 Buffer，之后的查询只访问自己的只读内存库。
+    return new Database(snapshotBuffer, { readonly: true });
+  } finally {
+    // 完整 SQLite 镜像也含有本次版本的账号摘要等非候选资料；构造器完成复制后立刻
+    // 覆写原始 Buffer，尽量缩短额外副本在 Node 内存中的停留时间。
+    snapshotBuffer.fill(0);
+  }
+}
+
 export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
   const db = candidateSlotsDatabase();
-  // SQLite 的 DEFERRED 只读事务在第一条 SELECT 时固定一致快照。候选计算约两百毫秒，
-  // 期间另一进程可以先取得 RESERVED 写锁，但提交会等本次读取结束；一个响应不会混合修改前后的规则或课程。
+  // SQLite 的 DEFERRED 只读事务只负责复制一个一致版本，随后立刻释放正式数据库读锁。
+  // 较慢的“日期 × 时间 × 教室”评估在独立只读内存库中完成，因此一个响应仍然不会
+  // 混合修改前后的资料，同时另一位老师不必等候整个候选计算才可提交。
   try {
     // transaction wrapper 的建立和执行都放进同一个错误边界；未来 SQLite 若在准备
     // BEGIN／COMMIT 控制语句时遇到锁，也会稳定转换为安全 503。
-    const readConsistentSnapshot = db.transaction(() => calculateCandidateSlotsFromSnapshot(db, sectionId, occurrence));
-    return readConsistentSnapshot.deferred();
+    const snapshotBuffer = serializeCandidateDatabaseSnapshot(db, sectionId);
+    const snapshotDatabase = openCandidateDatabaseSnapshot(snapshotBuffer);
+    try {
+      return calculateCandidateSlotsFromSnapshot(snapshotDatabase, sectionId, occurrence);
+    } finally {
+      // 内存数据库同样包含本次快照中的账号与排课资料；计算结束立即关闭并释放 native 内存，
+      // 不跨请求缓存，也不让一位老师的旧快照影响下一位老师。
+      snapshotDatabase.close();
+    }
   } catch (error) {
     if (error instanceof CandidateSlotsInputError || error instanceof CandidateSlotsNotFoundError
       || error instanceof CandidateSlotsStateConflictError || error instanceof CandidateSlotsBusyError) throw error;

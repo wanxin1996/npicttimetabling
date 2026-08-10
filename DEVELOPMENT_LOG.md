@@ -2216,3 +2216,34 @@
 1. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务加载完整快照 + 事务外纯内存计算”，进一步缩短 rollback journal 下其他老师 COMMIT 的等待。
 2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
 3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项。
+
+## 2026-08-11｜Candidate 使用短 SQLite 镜像并在事务外完成规则计算
+
+### 已完成
+
+- Candidate／Clear slots 不再让正式数据库的 `DEFERRED` 读事务覆盖整段日期、时间和教室组合计算。事务现在只执行第一条班次 SELECT、固定当前已提交版本并调用 `db.serialize()` 复制一致 SQLite 镜像，随后立即 COMMIT／释放正式库读锁。
+- 不存在的班次会在短事务的第一条查询后直接返回安全 404，不复制整库；其余课程时长、每周课次、教师状态、房间、规则和冲突资料都继续从同一个已固定快照判断。
+- 镜像 Buffer 会同步构造一个独立 readonly 内存 SQLite。原 `calculatePlacementWarnings` 和16条 prepared SQL 在这个内存库上原样运行，因此周次重叠、教师／班级／教室冲突、不可用时段、午餐、连续时长、每日上限、跨楼、警告文字和加入顺序都没有复制成第二套规则。
+- 完整镜像而不是手工维护“候选需要哪些表”的白名单，可避免以后新增规则依赖后忘记同步候选数据；镜像只存在于本次服务器请求内存，不写临时文件、不返回浏览器、不写日志，也不跨请求缓存。
+- better-sqlite3 从 Buffer 同步复制完内存库后，系统立即用 `fill(0)` 覆写原 Buffer；候选计算无论成功或报错，readonly 内存库都在 `finally` 中关闭并释放 native 内存，尽量缩短账号摘要、会话摘要和备份等非候选资料额外副本的驻留时间。
+- `candidate-entry` 故障 marker 移到正式数据库短事务的第一条 SELECT，真实 EXCLUSIVE 锁仍能稳定验证 BUSY 503；Active rooms marker 则自然命中内存库，能确定性暂停事务外计算。
+- 跨进程回归现在要求：A 已复制容量20的内存快照并暂停计算时，B 的正式 Room PATCH 必须在2秒内完整返回200，数据库容量已经是40，而 A 仍未结束；释放后 A 的响应必须逐字段等于旧 baseline，随后 A／B 都返回35个容量40的新候选。
+- 这条竞态会同时抓住两类回归：若候选重新把计算放回正式库长事务，B 会在2秒门槛超时；若没有一致快照而继续读取 live 数据，A 会产生“显示旧容量20、却按新容量40放行”的混合响应。
+- 原 Candidate 400／404／409／503／固定500、纯读取、无 warning 写入、prepared statement 复用和所有清理路径保持不变。新增及修改区块继续写入面向基础开发人员的中文注释，老师未提交的 package UX 命令和4个 UX 文件保持不动。
+
+### 本次验证
+
+- `git diff --check`、两个脚本 `node --check`、独立 TypeScript 检查、ESLint、production build、`npm run test:concurrency` 和最终 `npm run test:release` 全部通过。
+- 完整发布回归继续覆盖数据库初始化、身份、Excel、Teaching allocation、CRUD／revision、warning 原子回滚、完整备份、Cycle、Candidate BUSY／500、跨进程排课／Setup／认证竞态、SQLite 外键和374班次规模性能。
+- 最终满载结果为 Issues p95 `16.3 ms`、Year timetable p95 `12.6 ms`、30间教室候选中位 `139.1 ms`、六账号30请求轮询整轮 `53.6 ms`／请求 p95 `51.7 ms`、360条 warning 重算 `60.5 ms`、一个写入加十个读取 `93.3 ms`。
+- Candidate 的结构审计仍精确得到 `16 prepare／12,600 execute`、最高复用900倍；全量刷新仍为 `16／5,288`、最高600倍，证明内存计算没有绕开或简化统一警告引擎。
+- 新竞态直接确认 B 的 Room PATCH 在 A 计算完成前已经 HTTP 200且正式库容量为40；A 返回旧 baseline，随后两个 standalone 返回完全相同的新35项，没有锁等待、混合版本或缓存残留。
+- 正式数据库当前约0.55 MB，单次镜像额外内存很小；方案的峰值额外内存约为数据库大小的两份，若未来数据库长期增长到几十 MB，需要增加镜像大小／RSS监控或改成经过规则依赖审计的白名单快照。同步规则计算仍会占用单实例 Node 事件循环约139 ms，本次解决的是 SQLite COMMIT 等待而不是 CPU 并行。
+- 当前正式和测试 SQLite 都是 `journal_mode=delete`；未来若迁移到 WAL，需要重新验证 serialize／反序列化一致性竞态。正式 `web/data/timetabling.db` 仍为 `2026-08-11 04:45:51`、544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空；临时目录没有残留。
+- 三项独立只读审查核对了 SQLite pager 快照、serialize／deserialize 内存所有权、16条规则语义、marker时序、writer COMMIT、清理和prepared审计，最终未发现 P0／P1。
+
+### 下一步
+
+1. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
+2. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项。
+3. 在规模资料明显增长前加入 Candidate 镜像大小／RSS趋势报告；若超过当前院系规模，再评估 worker 或经过规则依赖审计的白名单内存快照。

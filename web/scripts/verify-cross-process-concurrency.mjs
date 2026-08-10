@@ -506,8 +506,8 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
   const resetBaseline = await requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie });
   assertCandidateSnapshot(resetBaseline.body, fixture, 20);
 
-  // A 会在 Active rooms 已按容量20物化后暂停；B 随后真实执行容量40的 UPDATE。
-  // 没有一致读事务时，后续 warning SQL 可能看到40，却把旧 rooms 行的20写入响应。
+  // A 会在“已经复制完成的内存快照”中物化容量20的 Active rooms 后暂停；
+  // B 随后必须能在 A 尚未完成候选计算时提交容量40，证明正式库读锁已经释放。
   const snapshotNonce = randomBytes(16).toString("hex");
   const updateNonce = randomBytes(16).toString("hex");
   const snapshotControl = {
@@ -565,26 +565,31 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
       () => { roomUpdateSettled = true; },
       () => { roomUpdateSettled = true; },
     );
-    await waitForRaceReady(
-      serverB,
-      files.updateReady,
-      updateControl,
-      () => roomUpdateSettled,
-      "Candidate snapshot consistency",
-      "the applied room UPDATE",
+
+    // A 仍暂停在内存计算中时，B 的正式 UPDATE 和 COMMIT 必须在宽松的2秒内完成。
+    // 旧的长读事务实现会让 B 一直等待 release，因此会稳定在这里超时。
+    const writerStartedAt = Date.now();
+    const roomUpdate = await Promise.race([
+      pendingRoomUpdate,
+      delay(2_000).then(() => {
+        throw new Error("Room update stayed blocked while Candidate was calculating from its snapshot.");
+      }),
+    ]);
+    assert.equal(roomUpdate.body.ok, true);
+    assert(Date.now() - writerStartedAt < 2_000, "Room update took too long after Candidate captured its snapshot.");
+    assert.equal(roomUpdateSettled, true);
+    assert.equal(candidateSettled, false, "Candidate request left its calculation barrier before the writer committed.");
+    assert.deepEqual(JSON.parse(await readFile(files.updateReady, "utf8")), updateControl);
+    assert.equal(
+      readDatabaseValue("SELECT capacity FROM rooms WHERE id = ?", fixture.candidateRoom.id).capacity,
+      40,
     );
 
-    // UPDATE 已执行但 A 仍持有 DELETE-journal 的 SHARED 快照；B 的 COMMIT 必须等候。
-    // 四百毫秒与现有双写重叠测试使用相同宽松窗口，且远低于 SQLite 的5秒 busy timeout。
-    const writerReadyAt = Date.now();
-    await delay(overlapHoldMilliseconds);
-    assert.equal(candidateSettled, false, "Candidate request left its snapshot barrier too early.");
-    assert.equal(roomUpdateSettled, false, "Room update committed while the candidate read snapshot was still paused.");
+    // B 已提交新容量，但 A 必须继续用自己复制的旧版本完成，绝不能返回35项却显示旧容量20。
     await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
-    const [raceCandidate, roomUpdate] = await Promise.all([pendingCandidate, pendingRoomUpdate]);
-    assert.equal(roomUpdate.body.ok, true);
-    assert(Date.now() - writerReadyAt < 2_000, "Room update waited too long for the candidate snapshot to finish.");
+    const raceCandidate = await pendingCandidate;
     assertCandidateSnapshot(raceCandidate.body, fixture, 20);
+    assert.deepEqual(raceCandidate.body, resetBaseline.body);
 
     // A 的旧响应完成后，两个独立进程都必须立即看到同一个完整新版本。
     const [latestA, latestB] = await Promise.all([
@@ -601,7 +606,7 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
     await Promise.allSettled([pendingCandidate, pendingRoomUpdate].filter(Boolean));
     await Promise.all(Object.values(files).map((filename) => rm(filename, { force: true }).catch(() => undefined)));
   }
-  report("候选建议在跨进程教室更新期间保持单一 SQLite 读快照");
+  report("候选建议使用单一内存快照计算，且不阻塞另一进程提交教室更新");
 }
 
 async function armCandidateEntryFault(fixture, fault) {

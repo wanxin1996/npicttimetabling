@@ -103,8 +103,8 @@ function waitForRaceRelease(releaseFile, nonce, description) {
 }
 
 function consumeCandidateSnapshotArm(rooms) {
-  // 只有 A 进程负责候选读取竞态。带 marker 的 Active rooms 查询已经完整返回后，
-  // 原子建立 ready 并暂停，使主测试可以让 B 在同一时刻修改教室容量。
+  // 只有 A 进程负责候选读取竞态。带 marker 的 Active rooms 已从内存快照完整返回后，
+  // 原子建立 ready 并暂停；此时主测试可以证明 B 不受正式数据库读锁阻塞。
   if (processLabel !== "A") return;
   const candidateArmFile = path.join(controlDirectory, "candidate-snapshot-arm-A.json");
   try {
@@ -154,7 +154,7 @@ function consumeCandidateEntryArm(sectionId) {
 
 function consumeCandidateRoomUpdateArm(roomId, changes) {
   // B 的真实 UPDATE 已经在 IMMEDIATE 事务内改到目标教室后才建立 ready。
-  // 此时 HTTP 若仍未返回，说明 A 的候选读快照正在阻止这笔修改提交。
+  // 主测试还会等待 HTTP 200，分别证明 UPDATE 已发生和整笔事务已经成功 COMMIT。
   if (processLabel !== "B" || changes !== 1) return;
   const updateArmFile = path.join(controlDirectory, "candidate-room-update-arm-B.json");
   try {
