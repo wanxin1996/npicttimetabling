@@ -256,6 +256,7 @@ export default function Home() {
   const [accounts, setAccounts] = useState<AppUser[]>([]);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [importing, setImporting] = useState(false);
+  const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -645,6 +646,41 @@ export default function Home() {
     if (!response.ok) return setNotice(body.error ?? "Password could not be reset.");
     event.currentTarget.reset();
     setNotice("Password reset. Existing sessions for that account were signed out.");
+  }
+
+  async function downloadSystemBackup() {
+    // Fetching the file in the page lets authorization and integrity-check failures
+    // appear as a readable notice instead of navigating away to a JSON error screen.
+    setDownloadingBackup(true);
+    setNotice("Creating and checking the full system backup...");
+    try {
+      const response = await fetch("/api/system-backup", { cache: "no-store" });
+      if (!response.ok) {
+        const body = await response.json();
+        return setNotice(body.error ?? "The full system backup could not be downloaded.");
+      }
+
+      // The server supplies a safe dated filename. The temporary browser URL starts
+      // the normal download and is revoked immediately after the click is dispatched.
+      const disposition = response.headers.get("Content-Disposition") ?? "";
+      const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "timetabling-backup.sqlite";
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const downloadLink = document.createElement("a");
+      downloadLink.href = objectUrl;
+      downloadLink.download = filename;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      downloadLink.remove();
+      URL.revokeObjectURL(objectUrl);
+      setNotice(`Full system backup downloaded as ${filename}.`);
+    } catch {
+      // A disconnected local server or interrupted network request should leave the
+      // page usable and explain that no successful download can be assumed.
+      setNotice("The full system backup could not be downloaded. Check the connection and try again.");
+    } finally {
+      // Always re-enable the control, including when the network request itself fails.
+      setDownloadingBackup(false);
+    }
   }
 
   async function beginNewCycle(event: FormEvent<HTMLFormElement>) {
@@ -1075,7 +1111,7 @@ export default function Home() {
 
           {view === "Profile" && <form onSubmit={changePassword} className="mb-6 max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Change password</p><p className="mt-1 text-xs text-slate-500">At least 10 characters. All logged-in browsers will be signed out.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Current password<input name="currentPassword" required autoComplete="current-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">New password<input name="newPassword" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Change password</button></form>}
 
-          {view === "Accounts" && <div className="mb-6 grid gap-4 lg:grid-cols-[360px_1fr]"><div className="grid content-start gap-4"><form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Create scheduler account</p><p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button></form><form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Reset scheduler password</p><div className="mt-4 grid gap-3"><select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select><input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" /></div><button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button></form></div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div><div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div></div></div>}
+          {view === "Accounts" && <div className="mb-6 grid gap-4 lg:grid-cols-[360px_1fr]"><div className="grid content-start gap-4">{/* Full backup is grouped with administrator-only controls because it contains every account and department record. */}<section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 shadow-sm"><p className="font-black text-blue-950">Full system backup</p><p className="mt-1 text-xs leading-5 text-blue-800">Download a verified SQLite backup containing master data, rules, courses, timetables and accounts. Active login sessions are excluded.</p><p className="mt-3 text-xs font-semibold leading-5 text-amber-800">Keep this sensitive file in an access-controlled department folder.</p><button onClick={() => void downloadSystemBackup()} disabled={downloadingBackup} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="button">{downloadingBackup ? "Checking backup..." : "Download full backup"}</button></section><form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Create scheduler account</p><p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button></form><form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Reset scheduler password</p><div className="mt-4 grid gap-3"><select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select><input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" /></div><button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button></form></div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div><div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div></div></div>}
 
           {view === "Rules & issues" && (
             /* Optional policy rules are editable here; core collision checks remain fixed. */

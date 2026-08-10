@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
@@ -217,6 +218,58 @@ export function databaseHealth() {
   // without exposing timetable counts, account details or the server file path.
   const row = database().prepare("SELECT 1 AS healthy").get() as { healthy: number };
   return row.healthy === 1;
+}
+
+function assertDatabaseIntegrity(db: DatabaseInstance, stage: string) {
+  // SQLite returns one or more problem descriptions when the file structure is
+  // damaged. A healthy database returns exactly one row containing "ok".
+  const integrityRows = db.pragma("integrity_check") as Array<Record<string, unknown>>;
+  const integrityMessages = integrityRows.flatMap((row) => Object.values(row).map(String));
+  if (integrityMessages.length !== 1 || integrityMessages[0].toLowerCase() !== "ok") {
+    throw new Error(`${stage} failed SQLite integrity check.`);
+  }
+
+  // Foreign-key problems can exist even when the file itself is structurally
+  // healthy, so this separate check protects relationships such as lessons to rooms.
+  const foreignKeyProblems = db.pragma("foreign_key_check") as unknown[];
+  if (foreignKeyProblems.length > 0) throw new Error(`${stage} failed foreign-key check.`);
+}
+
+export async function createVerifiedSystemBackup() {
+  // A unique operating-system temporary folder keeps simultaneous downloads apart
+  // and ensures the generated file never appears beside the live database.
+  const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-backup-"));
+  const backupPath = path.join(temporaryDirectory, "timetabling.sqlite");
+  let backupDatabase: DatabaseInstance | undefined;
+
+  try {
+    // Check the source first, then use SQLite's online backup API instead of copying
+    // a possibly active database and its write-ahead log as ordinary files.
+    const sourceDatabase = database();
+    assertDatabaseIntegrity(sourceDatabase, "Source database");
+    await sourceDatabase.backup(backupPath);
+
+    // Existing browser sessions are operational secrets rather than department
+    // records. Remove them from the copy and vacuum it so deleted pages are rebuilt.
+    backupDatabase = new Database(backupPath);
+    backupDatabase.pragma("foreign_keys = ON");
+    backupDatabase.prepare("DELETE FROM auth_sessions").run();
+    backupDatabase.exec("VACUUM");
+
+    // Validate the exact sanitized file that will be downloaded, then close it before
+    // reading the bytes so every SQLite write is flushed into the response payload.
+    assertDatabaseIntegrity(backupDatabase, "Generated backup");
+    backupDatabase.close();
+    backupDatabase = undefined;
+    const contents = readFileSync(backupPath);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return { contents, filename: `timetabling-backup-${timestamp}.sqlite` };
+  } finally {
+    // The response already owns an in-memory copy, so the sensitive temporary file
+    // can always be removed immediately, including when validation throws an error.
+    backupDatabase?.close();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 }
 
 function initializeTables(db: DatabaseInstance) {
