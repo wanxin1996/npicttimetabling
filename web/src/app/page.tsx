@@ -51,7 +51,7 @@ type Course = {
 
 type CourseSection = { id: string; label: string; teacherId: string | null; teacherName: string | null; studentGroupIds: string[]; studentGroupCodes: string[] };
 type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
-type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
+type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
@@ -90,6 +90,39 @@ function WorkspaceMenuButton({ active, icon, label, onClick }: { active: boolean
       <span className="text-sm" aria-hidden="true">{icon}</span>
       <span>{label}</span>
     </button>
+  );
+}
+
+function StudentGroupSelector({ groups, selectedIds }: { groups: StudentGroup[]; selectedIds: string[] }) {
+  // Inspector 需要同时选择一个或多个学生班级；复选框比单选下拉更适合跨年级课程，也能让老师一眼看清当前全部关联。
+  // 这里使用 defaultChecked，让原生 FormData 在提交时收集所有勾选值；调用位置以课程编号和修订号作为 key，切换课程时会重新建立正确默认状态。
+  const selectedIdSet = new Set(selectedIds);
+
+  return (
+    <fieldset className="rounded-xl border border-slate-200 p-2.5">
+      <legend className="px-1 text-xs font-semibold text-slate-700">Student groups</legend>
+      <p className="mb-2 text-[11px] leading-4 text-slate-500">Changes apply to every weekly occurrence of this section.</p>
+      <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
+        {groups.length === 0 ? (
+          <p className="rounded-lg bg-slate-50 p-2 text-xs text-slate-500">Create student groups before assigning them here.</p>
+        ) : groups.map((group) => (
+          <label key={group.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-slate-700 hover:bg-blue-50">
+            <input
+              form="lesson-editor"
+              name="studentGroupIds"
+              value={group.id}
+              defaultChecked={selectedIdSet.has(group.id)}
+              className="h-4 w-4 rounded border-slate-300 text-blue-700"
+              type="checkbox"
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-bold text-slate-900">{group.code}</span>
+              <span className="block truncate text-[10px] text-slate-500">Year {group.year} · {group.program}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
   );
 }
 
@@ -640,11 +673,24 @@ export default function Home() {
   }
 
   async function saveLesson(event: FormEvent<HTMLFormElement>) {
-    // 编辑面板一次保存星期、开始时间、教师和教室；成功后重新载入总表，使最新 warning 和 revision 立即显示。
+    // 编辑面板一次保存星期、开始时间、教师、教室和全部已勾选学生班级；成功后重新载入总表，使最新 warning 和 revision 立即显示。
     event.preventDefault();
     if (!editingLesson) return;
     const data = new FormData(event.currentTarget);
-    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), teacherId: String(data.get("teacherId") ?? "") || null, roomId: String(data.get("roomId") ?? "") || null, revision: editingLesson.revision }) });
+    // getAll 会保留每个复选框的值；没有勾选时传空数组，服务器就会把该班次明确设为“学生班级待分配”。
+    const studentGroupIds = data.getAll("studentGroupIds").map(String);
+    const response = await fetch(`/api/schedule/lessons/${editingLesson.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dayOfWeek: Number(data.get("dayOfWeek")),
+        startHour: Number(data.get("startHour")),
+        teacherId: String(data.get("teacherId") ?? "") || null,
+        roomId: String(data.get("roomId") ?? "") || null,
+        studentGroupIds,
+        revision: editingLesson.revision,
+      }),
+    });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "The lesson could not be updated.");
     setEditingLesson(null);
@@ -1389,6 +1435,8 @@ export default function Home() {
                 >
                 <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p id="timetable-inspector-title" className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex items-center gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill><button ref={inspectorCloseButtonRef} onClick={closeInspectorAndRestoreFocus} className="ml-1 rounded-md px-2 py-1 text-base font-bold leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-900" type="button" aria-label="Close inspector">×</button></div></div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                  {/* 学生班级选择器使用 form 属性连接到下方编辑表单，因此可以保持独立、易读的代码区块，同时仍由同一个 Save changes 一次提交。 */}
+                  {editingLesson && <div className="mb-3"><StudentGroupSelector key={`${editingLesson.id}:${editingLesson.revision}`} groups={groups} selectedIds={editingLesson.studentGroupIds} /></div>}
                   {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
                   : placingSection ? <form onSubmit={placeSectionWithoutDrag} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Schedule {placingSection.label}</p><p className="text-xs text-slate-500">Keyboard and click alternative to dragging</p></div><button onClick={() => setPlacingSection(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div><div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900"><p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p><p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p></div><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + placingSection.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Assign later</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><button className="rounded-lg bg-[#153d75] px-3 py-2.5 text-sm font-bold text-white" type="submit">Place session</button><button onClick={() => void findCandidateSlots(placingSection)} className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-bold text-emerald-800" type="button">Show only clear options</button></form>
                   : candidateSection ? <div><div className="flex items-start justify-between gap-2"><div><p className="font-black text-emerald-950">Clear slots</p><p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p> : <div className="mt-3 grid gap-2">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500" type="button"><span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span><span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span></button>)}</div>}</div>

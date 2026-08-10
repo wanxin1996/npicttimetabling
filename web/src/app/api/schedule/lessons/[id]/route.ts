@@ -4,10 +4,11 @@ import { removeScheduledLesson, updateScheduledLesson } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  // 冲突检查前只接受整点时间和格式正确的可选 ID，避免无效输入进入排课逻辑。
+  // 冲突检查前只接受整点时间、格式正确的可选 ID，以及由字符串 ID 组成的学生班级清单，避免无效输入进入排课逻辑。
   const { id } = await context.params;
   const body = await request.json();
-  if (!Number.isInteger(body.dayOfWeek) || !Number.isInteger(body.startHour) || !Number.isInteger(body.revision) || !(body.roomId === null || typeof body.roomId === "string") || !(body.teacherId === null || typeof body.teacherId === "string")) return Response.json({ error: "Day, start hour, teacher, room and revision are invalid." }, { status: 400 });
+  const hasValidStudentGroups = Array.isArray(body.studentGroupIds) && body.studentGroupIds.every((studentGroupId: unknown) => typeof studentGroupId === "string");
+  if (!Number.isInteger(body.dayOfWeek) || !Number.isInteger(body.startHour) || !Number.isInteger(body.revision) || !(body.roomId === null || typeof body.roomId === "string") || !(body.teacherId === null || typeof body.teacherId === "string") || !hasValidStudentGroups) return Response.json({ error: "Day, start hour, teacher, room, student groups and revision are invalid." }, { status: 400 });
   try {
     return Response.json(updateScheduledLesson(id, body));
   } catch (error) {

@@ -93,6 +93,7 @@ export type ScheduledLessonRecord = {
   durationHours: number;
   roomId: string | null;
   roomCode: string | null;
+  studentGroupIds: string[];
   studentGroups: string[];
   occurrence: number;
   sessionsPerWeek: number;
@@ -1202,6 +1203,10 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
       lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week,
       courses.week_start, courses.week_end,
       rooms.code AS room_code,
+      (SELECT GROUP_CONCAT(groups.id, ',')
+        FROM section_student_groups links
+        JOIN student_groups groups ON groups.id = links.student_group_id
+        WHERE links.section_id = sections.id) AS student_group_ids,
       (SELECT GROUP_CONCAT(groups.code, ', ')
         FROM section_student_groups links
         JOIN student_groups groups ON groups.id = links.student_group_id
@@ -1212,12 +1217,12 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
-  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_group_ids: string | null; student_groups: string | null }>;
   return rows.map((row) => {
     // 把该课程最高严重等级附加到结果中，使时间表卡片和综合问题清单使用同一套颜色标准，
     // 前端不必再次解析规则文字来判断颜色。
     const warnings = JSON.parse(row.warnings_json) as string[];
-    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroupIds: row.student_group_ids ? row.student_group_ids.split(",") : [], studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
@@ -1239,6 +1244,10 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
       lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week,
       courses.week_start, courses.week_end,
       rooms.code AS room_code,
+      (SELECT GROUP_CONCAT(groups.id, ',')
+        FROM section_student_groups links
+        JOIN student_groups groups ON groups.id = links.student_group_id
+        WHERE links.section_id = sections.id) AS student_group_ids,
       (SELECT GROUP_CONCAT(groups.code, ', ')
         FROM section_student_groups links
         JOIN student_groups groups ON groups.id = links.student_group_id
@@ -1250,12 +1259,12 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE ${ownerFilter}
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
+  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_group_ids: string | null; student_groups: string | null }>;
   return rows.map((row) => {
     // 教师、学生和教室个人视图使用服务器计算出的同一个问题等级，
     // 与年级总表的卡片颜色和警告含义完全一致。
     const warnings = JSON.parse(row.warnings_json) as string[];
-    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroupIds: row.student_group_ids ? row.student_group_ids.split(",") : [], studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
@@ -1597,6 +1606,17 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
   return { sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, occurrence, sessionsPerWeek: section.sessions_per_week, slots };
 }
 
+function listSectionStudentGroupAssignments(db: DatabaseInstance, sectionId: string) {
+  // 多个排课接口都需要同时返回学生班级的稳定数据库 ID 和给老师看的编号；集中查询可避免两份清单顺序或内容不一致。
+  return db.prepare(`
+    SELECT groups.id, groups.code
+    FROM section_student_groups links
+    JOIN student_groups groups ON groups.id = links.student_group_id
+    WHERE links.section_id = ?
+    ORDER BY groups.year, groups.program, groups.code
+  `).all(sectionId) as Array<{ id: string; code: string }>;
+}
+
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
   // 即使存在警告，也按用户要求创建整点课程并保存警告内容；
   // 随后返回完整卡片数据，让浏览器立即展示排课结果和提醒。
@@ -1612,33 +1632,50 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
   // 保存后连同关联班级编号一起返回，使界面无需再次请求，
   // 就能立即显示新课程分配的教师、班级和教室等完整资源。
-  const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(section.id) as Array<{ code: string }>).map((group) => group.code);
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  const studentGroupAssignments = listSectionStudentGroupAssignments(db, section.id);
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
-export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
-  // 修订版本检查防止多人编辑时静默覆盖；教师和课程位置一起保存，
+export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; studentGroupIds: string[]; revision: number }): ScheduledLessonRecord {
+  // 修订版本检查防止多人编辑时静默覆盖；教师、学生班级和课程位置一起保存，
   // 确保重新计算的冲突始终与界面显示的卡片资料一致。
   const db = database();
-  // 编辑器在同一事务中更新班次教师和课程位置，避免卡片短暂显示一位教师，
-  // 而冲突检查实际使用另一位教师的中间状态。
+  // 先读取课程班次和当前修订号；学生班级属于班次而非单次课程，所以后面还要同步更新同班次的其他每周课次。
   const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
   if (!lesson) throw new Error("Scheduled lesson not found.");
   if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
   const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
   if (input.teacherId && !teacher) throw new Error("Choose an active teacher.");
-  const warnings = calculatePlacementWarnings(db, { sectionId: lesson.section_id, lessonId: id, teacherId: input.teacherId, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours });
+
+  // 去重后确认每个 ID 都来自现有学生班级，避免拼写错误或过期页面把无效关联写进数据库。
+  const studentGroupIds = [...new Set(input.studentGroupIds)];
+  if (studentGroupIds.length > 0) {
+    const placeholders = studentGroupIds.map(() => "?").join(", ");
+    const validGroups = db.prepare(`SELECT id FROM student_groups WHERE id IN (${placeholders})`).all(...studentGroupIds) as Array<{ id: string }>;
+    if (validGroups.length !== studentGroupIds.length) throw new Error("Choose valid student groups.");
+  }
+
+  // 教师、班级关联和当前课次位置必须在同一个事务中完成；任何一步失败都会整体回滚，不会留下只更新一半的排课资料。
   db.transaction(() => {
     db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
-    db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, warnings_json = ?, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.dayOfWeek, input.startHour, input.roomId, JSON.stringify(warnings), id, input.revision);
+    db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(lesson.section_id);
+    const addStudentGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
+    for (const studentGroupId of studentGroupIds) addStudentGroup.run(lesson.section_id, studentGroupId);
+
+    // 同一班次每周可能上两次；班级改变后，其他课次的旧 Inspector 也必须失效，防止稍后用旧 revision 静默覆盖新分配。
+    db.prepare("UPDATE scheduled_lessons SET revision = revision + 1 WHERE section_id = ? AND id <> ?").run(lesson.section_id, id);
+    const updateResult = db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.dayOfWeek, input.startHour, input.roomId, id, input.revision);
+    if (updateResult.changes !== 1) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
   })();
-  const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? warnings;
+
+  // 必须在新学生班级关联写入后统一刷新；这样当前课次、同班次其他课次以及与这些班级冲突的其他课程都会同时得到最新警告。
+  const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? [];
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
   // 修改操作的返回结构与普通时间表查询保持一致，使卡片编辑后立刻保留学生班级信息，
   // 不必等待下一次轮询刷新。
-  const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(lesson.section_id) as Array<{ code: string }>).map((group) => group.code);
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  const studentGroupAssignments = listSectionStudentGroupAssignments(db, lesson.section_id);
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
