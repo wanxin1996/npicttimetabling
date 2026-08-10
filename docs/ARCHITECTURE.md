@@ -7,7 +7,7 @@
 - 数据模型：Prisma ORM schema，与当前 SQLite 的真实表名、字段、关系和删除策略保持一致，用作后续迁移来源。
 - 本地开发数据访问：Node.js SQLite（`better-sqlite3`）及 Next.js Route Handlers。
 - 本地开发数据库：SQLite。
-- 生产数据存储待决策：当前规模推荐单实例 SQLite 持久卷；账号量或高可用要求增长时迁移 PostgreSQL。
+- 生产数据存储：已选择 Railway 单实例 SQLite 持久卷；账号量或高可用要求增长时迁移 PostgreSQL。
 
 当前业务读写仍集中在 `src/lib/database.ts` 的同步 SQLite 查询中；Prisma Client 尚未接管 API 数据访问。迁移 PostgreSQL 时必须把这些查询改为异步数据访问，不能只修改 datasource provider。
 
@@ -27,7 +27,7 @@
 
 - `npm run lint`：检查代码风格。
 - `npm run build`：生产构建（使用 Webpack 兼容模式）。
-- `npm run start:standalone`：启动构建后的自包含生产服务器；`PORT`、`HOSTNAME` 与 `TIMETABLING_DATABASE_PATH` 可由托管平台注入。
+- `npm start` 或 `npm run start:standalone`：先验证数据库目录可写，再启动构建后的自包含生产服务器；`PORT`、`HOSTNAME` 与数据库路径可由托管平台注入。
 - `npm run db:generate`：生成 Prisma Client。
 - `npm run db:check`：校验 Prisma schema，并从空数据库生成 SQLite 建表 SQL，用于验证模型、关系和索引。
 
@@ -48,7 +48,7 @@
 排课写入与编辑共用同一警告引擎，当前检查教师／教室／学生班级重叠、资料缺失、教室容量和设施、08:00 开课、午餐时段、连续课时、每日总时数以及跨 Block 连堂。只有教学周范围实际重叠的课程才会互相影响；全部周课程会与任何范围重叠。问题会保存到排课记录并附带最高严重程度，年级总表、个人课表和集中问题清单共用红／黄／蓝标准；任何级别都不会阻止用户保存。
 - `POST /api/imports/teaching-members`：读取 `Teaching Members` 工作表；所有有效行维护教师清单，只有正数的 `# of grps teaching` 建立课程、教师分配及预分配的课程班次。导入会更新本次分配与班次，但保留课程日后手工配置的时长、频次及教室要求字段。
 
-本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。首次运行时自动创建；只有开发模式会插入最小示例资料，生产模式始终以空资料开始，避免真实系统混入演示教师、班级或教室。后续真实资料会保留在该文件中。
+本地数据库保存为 `web/data/timetabling.db`，不纳入 Git。Railway 环境会自动读取 `RAILWAY_VOLUME_MOUNT_PATH`，并把数据库保存为挂载卷中的 `timetabling.db`；`TIMETABLING_DATABASE_PATH` 可作为明确覆盖。若 Railway 运行时没有挂载卷，启动检查会直接中止，避免误把正式资料写入部署容器的临时文件系统。首次运行时自动创建数据库；只有开发模式会插入最小示例资料，生产模式始终以空资料开始，避免真实系统混入演示教师、班级或教室。
 
 生产构建启用 Next.js standalone 输出。构建完成后，`scripts/prepare-standalone.mjs` 会把 `public/` 和 `.next/static/` 复制到自包含目录，避免部署后出现页面有 HTML 但缺少图标、CSS 或浏览器脚本的问题。
 
@@ -61,6 +61,6 @@
 - Teaching Members 仅接受 `.xlsx`，文件最大 20 MB、工作表最多 5,000 行，并继续校验固定工作表、必需列和每行资料。
 - 公网环境必须由托管平台提供 HTTPS；否则生产模式的 Secure Cookie 不会通过普通 HTTP 发送。
 
-## 后续基础设施决策
+## 公网基础设施
 
-首版的多人协作、跨设备访问和正式账号认证需要公网运行环境与持久数据存储。该线上环境尚未创建；当前推荐 Railway 单实例 + SQLite 持久卷，保留现有 5 秒同步与 revision 防覆盖机制。若项目负责人选择 PostgreSQL，则需先把当前同步 SQLite 数据访问层改写为异步 PostgreSQL 查询。两条路线的依据与上线条件见 `docs/DEPLOYMENT_DECISION.md`。
+首版公网环境已确定为 Railway 单实例 + SQLite 持久卷，保留现有 5 秒同步与 revision 防覆盖机制。仓库根目录下的 `web/railway.json` 固定 Railpack 构建、standalone 启动、健康检查和失败重启策略；详细控制台步骤见 `docs/RAILWAY_DEPLOYMENT.md`。真实线上环境、平台备份和双账号验收仍待完成。未来若改用 PostgreSQL，需先把当前同步 SQLite 数据访问层改写为异步 PostgreSQL 查询；两条路线的依据见 `docs/DEPLOYMENT_DECISION.md`。

@@ -194,10 +194,12 @@ function database() {
     return globalForDatabase.timetableDatabase;
   }
 
-  // Store normal development data inside the project. A dedicated path may be
-  // supplied for isolated regression runs so tests never touch the real timetable.
+  // An explicit path is useful for isolated regression runs. On Railway, fall back
+  // to its automatically injected volume mount so a correctly attached volume is
+  // persistent without duplicating the mount path in another dashboard variable.
   const configuredPath = process.env.TIMETABLING_DATABASE_PATH?.trim();
-  const databasePath = configuredPath || path.join(process.cwd(), "data", "timetabling.db");
+  const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH?.trim();
+  const databasePath = configuredPath || (railwayVolumePath ? path.join(railwayVolumePath, "timetabling.db") : path.join(process.cwd(), "data", "timetabling.db"));
   const dataDirectory = path.dirname(databasePath);
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(databasePath);

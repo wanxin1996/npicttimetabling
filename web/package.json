@@ -2,11 +2,14 @@
   "name": "web",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build --webpack && node scripts/prepare-standalone.mjs",
-    "start": "next start",
-    "start:standalone": "node .next/standalone/server.js",
+    "start": "node scripts/verify-persistent-storage.mjs && node .next/standalone/server.js",
+    "start:standalone": "node scripts/verify-persistent-storage.mjs && node .next/standalone/server.js",
     "lint": "eslint",
     "db:generate": "prisma generate",
     "db:check": "prisma validate && prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script"

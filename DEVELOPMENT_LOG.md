@@ -1065,3 +1065,30 @@
 
 1. 本地 MVP 核心与当前已发现的课表 UI 缺口均已补齐；回到公网托管路线选择。
 2. 项目负责人确认 Railway + SQLite 或 PostgreSQL 后，完成实际平台配置、备份恢复和双账号跨浏览器验收。
+
+## 2026-08-10｜Railway + SQLite 持久卷部署配置
+
+### 已完成
+
+- 项目负责人已确认 Railway + SQLite 路线；更新部署决策与架构文档，不再把公网数据库方案标记为待定。
+- 新增 `web/railway.json`，固定使用 Railpack 执行生产构建、standalone 服务器启动、`/api/health` 健康检查和失败重启策略。
+- 数据库路径优先读取明确配置的 `TIMETABLING_DATABASE_PATH`，否则自动使用 Railway 提供的 `RAILWAY_VOLUME_MOUNT_PATH/timetabling.db`，本机开发仍回退到 `web/data/timetabling.db`。
+- 新增生产启动前存储检查：Railway 环境没有持久卷时直接拒绝启动；有卷时先确认目录可建立且可写，避免正式资料误存到部署容器的临时文件系统。
+- `npm start` 和 `npm run start:standalone` 统一经过存储检查后启动 standalone 服务器，并声明当前 Next.js 构建所需的 Node.js 最低版本。
+- 新增中文 `docs/RAILWAY_DEPLOYMENT.md`，记录仓库根目录、单实例、`/data` 挂载点、首次上线、平台备份、恢复演练与双账号验收步骤。
+- 本阶段只使用独立临时数据库验证，没有上传或修改本机正式排课数据库，也尚未创建会产生费用的 Railway 云资源。
+
+### 本次验证
+
+- `npm run lint`、`npm run build` 与 `npx prisma validate` 全部通过。
+- 模拟 Railway 且没有卷时，启动检查按预期以清晰错误中止；提供自动卷路径或明确数据库路径时均确认目录可写。
+- 使用隔离持久卷启动真实 production standalone 服务，健康检查返回 HTTP 200，并成功建立临时管理员和学生班级 `PERSIST_01`。
+- 停止服务后使用同一个卷重新启动；原会话仍可认证，`PERSIST_01` 仍可读取，确认 SQLite 数据与会话跨应用重启保留。
+- 隔离数据库的外键检查为 0；临时生产服务、临时卷和测试 Cookie 均已删除，正式数据库未被触碰。
+
+### 下一步
+
+1. 在 Railway 连接 GitHub 仓库，设置服务 Root Directory 为 `/web`，挂载 `/data` 持久卷并生成公网域名。
+2. 完成公网 HTTPS、安全 Cookie、干净首次启动和真实 Teaching Members 导入验收。
+3. 启用 Daily、Weekly 和手工备份，实际完成一次替代卷恢复演练。
+4. 建立两个验收账号，用两个浏览器验证 5 秒同步与 revision 防覆盖，再清除测试资料。
