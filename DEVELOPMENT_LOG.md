@@ -1092,3 +1092,28 @@
 2. 完成公网 HTTPS、安全 Cookie、干净首次启动和真实 Teaching Members 导入验收。
 3. 启用 Daily、Weekly 和手工备份，实际完成一次替代卷恢复演练。
 4. 建立两个验收账号，用两个浏览器验证 5 秒同步与 revision 防覆盖，再清除测试资料。
+
+## 2026-08-10｜可重复执行的公网部署验收
+
+### 已完成
+
+- 新增 `npm run verify:deployment -- https://部署域名`，把每次上线都必须执行的公网基础检查收敛为一个命令。
+- 默认只读检查应用与 SQLite 健康状态、HSTS 等安全响应头、API 禁止缓存、公开认证状态，以及未登录访问教师资料必须返回 HTTP 401。
+- 非 localhost 地址严格要求 HTTPS，防止把未加密的临时网址误当成可交付环境；每个网络请求有 15 秒超时，部署或 DNS 故障时不会无限等待。
+- 可通过 `TIMETABLING_SMOKE_USERNAME` 与 `TIMETABLING_SMOKE_PASSWORD` 临时增加真实账号检查；脚本验证 Secure、HttpOnly、SameSite=Strict Cookie 和认证后的业务 API，并自动退出该次会话。
+- 账号与密码必须同时提供，脚本不会输出或保存密码；即使 Cookie 或认证 API 检查失败，也会先尝试注销已建立的短期会话。
+- 更新中文 Railway 部署清单和技术架构，记录无账号与有账号两种命令，并明确自动脚本不能替代双浏览器协作和平台备份恢复演练。
+
+### 本次验证
+
+- `node --check scripts/verify-deployment.mjs`、`npm run lint`、`npm run build` 与 `npx prisma validate` 全部通过。
+- 在独立空生产数据库上，无账号模式确认健康检查、安全响应头、`setupRequired=true` 和未登录 HTTP 401 后通过。
+- 建立临时管理员后，有账号模式确认 `setupRequired=false`、安全 Cookie、认证教师 API 和注销均通过；脚本结束后 `auth_sessions` 数量为 0，外键检查为 0。
+- 非 localhost 的 HTTP 地址按预期在发出请求前拒绝；只提供一个账号环境变量时也按预期拒绝，避免不完整配置。
+- 首次运行暴露出认证状态真实契约为 `user: null` 而不是推测的 `authenticated` 字段；脚本已经按真实 API 修正并重新完成全部验证。
+- 隔离服务、临时管理员、Cookie、响应文件与数据库均已删除，正式本机数据库未被触碰。
+
+### 下一步
+
+1. 获得 Railway 登录授权后创建真实项目，连接 GitHub 分支、设置 `/web` 根目录并挂载 `/data` 持久卷。
+2. 对公网域名执行本次新增的两种验收命令，再进行 Teaching Members 导入、平台备份恢复和双账号协作验收。

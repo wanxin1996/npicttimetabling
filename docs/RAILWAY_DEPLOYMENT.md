@@ -36,6 +36,22 @@
 
 ## 5. 发布验收
 
+部署后在 `web/` 目录运行自动验收；该命令不会修改教师、课程、班级、教室或课表资料：
+
+```bash
+npm run verify:deployment -- https://你的Railway域名
+```
+
+建立验收账号后，可临时通过环境变量增加登录验证。脚本会检查 Secure、HttpOnly、SameSite=Strict Cookie 和认证后的教师 API，并在结束前自动退出该次会话；不要把真实密码写入 Git、文档或终端截图：
+
+```bash
+TIMETABLING_SMOKE_USERNAME=验收账号 \
+TIMETABLING_SMOKE_PASSWORD=验收密码 \
+npm run verify:deployment -- https://你的Railway域名
+```
+
+自动脚本覆盖下列基础门槛，其余多人协作和平台备份仍需在 Railway 与两个浏览器中实际操作：
+
 - Railway deployment 状态为 Active，健康检查为 HTTP 200。
 - 服务只有一个实例，数据库实际位于挂载卷。
 - HTTPS、Secure/HttpOnly/SameSite Cookie 与安全响应头生效。

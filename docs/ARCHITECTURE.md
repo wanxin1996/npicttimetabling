@@ -28,6 +28,7 @@
 - `npm run lint`：检查代码风格。
 - `npm run build`：生产构建（使用 Webpack 兼容模式）。
 - `npm start` 或 `npm run start:standalone`：先验证数据库目录可写，再启动构建后的自包含生产服务器；`PORT`、`HOSTNAME` 与数据库路径可由托管平台注入。
+- `npm run verify:deployment -- https://部署域名`：只读验证健康检查、安全响应头、公开认证状态和业务 API 的未登录保护；提供临时验收账号环境变量时，再验证安全 Cookie、认证访问和自动退出。
 - `npm run db:generate`：生成 Prisma Client。
 - `npm run db:check`：校验 Prisma schema，并从空数据库生成 SQLite 建表 SQL，用于验证模型、关系和索引。
 
