@@ -2049,3 +2049,43 @@
 1. 把登录密码重置／停用与登录完成的跨进程竞态加入双 standalone 可重复测试；当前事务顺序已由代码审查和单进程 production 回归确认。
 2. 复用 `calculatePlacementWarnings` 的 prepared statements／批量上下文，减少候选搜索和满载 warning 重算仍会重复编译 SQL 的成本；当前 374 班次基线充足，但索引不是最终算法优化。
 3. 建立双进程共享 SQLite 的首次排课、Course Setup、Cycle 和登录并发回归，并明确部署始终保持单应用实例。
+
+## 2026-08-11｜建立双 production 进程共享 SQLite 的确定性并发回归
+
+### 已完成
+
+- 新增独立 `verify-cross-process-concurrency.mjs`，在操作系统临时目录建立唯一 SQLite，并启动 A、B 两个真正的 Next.js production standalone；两个进程使用不同随机端口、不同普通排课账号和不同 Cookie，但共同读取同一数据库。
+- A 先完成空库初始化和管理员 setup，B 才顺序启动；业务竞态不会被第一次建表／建索引的冷启动竞争污染。两位普通排课账号分别通过 A、B 登录，再把 Cookie 交叉发送到另一进程，证明账号和 session 来自共享 SQLite，而不是 Node 进程内存。
+- 四组业务写入都使用第三条 SQLite 连接先取得 `BEGIN IMMEDIATE` 写锁；A、B 请求发出后必须分别提供已经到达真实 `.immediate()` 调用的 ready 证据，主测试看到两份完整证据且两个请求都仍未结束后才释放锁。
+- Ready 证据由仅测试使用的 CommonJS preload 生成。它拦截 standalone 实际加载的 `better-sqlite3`，完整保留 transaction 的 callable、`default`／`deferred`／`immediate`／`exclusive`、调用者 `this` 和 `database` API，只在命中本轮随机 arm 时于真实 `immediate` 之前原子改名。
+- 每个进程拥有独立 writer arm，内容同时绑定随机 run token、A／B 标签和随机 nonce；每轮结束都会删除 arm、临时 arm 与 ready。不存在 arm 时 preload 完全透明，不能把后台无关事务误认为目标请求。
+- 首次排课竞态让 A、B 对同一 `section + occurrence` 选择不同星期／时间，严格得到一个 201 和一个带 `LESSON_ALREADY_SCHEDULED` 的 409；数据库只有赢家一行，ID／位置等于赢家，时长、revision、warning JSON 正确，败方顺序重试仍为 409且完整行不变。
+- Course Setup 竞态让两个旧表单用同一 course revision 保存两组完全不同的时长、每周次数、主年级、容量、设施、分日和教学周设置，严格得到一个 `{ok:true, changed:true}` 200 和一个带 `COURSE_SETUP_CHANGED` 的 409。
+- Course Setup 赢家 revision 只增加 1，最终全部字段整组来自同一赢家；已排 lesson 的冗余时长与 winner 相同、lesson revision 只增加 1、section revision 不变。败方旧 revision 顺序重试仍为 409，五张周期表逐字段零变化。
+- Cycle Start 竞态让两个账号使用同一个非空 `currentToken`，严格得到一个 200 和一个“current cycle changed”409；赢家响应为 0 门课／0 个班次／0 条课次，数据库五张周期表全部为空且只有一份 backup。
+- Start 建立的 backup JSON 与竞争前课程、Teaching allocation、班次、班级关联和课次五表逐字段相同；教师、学生班级、教室、不可用时段、规则、账号和全部 session 在竞争前后保持不变，赢家 token 与两个进程随后读取结果一致。
+- Cycle Restore 竞态使用同一个空周期 token 与同一 backup ID，仍严格得到一个 200 和一个 409；恢复后五张周期表逐字段回到 Start 前版本，backup ID／JSON／时间完全不变，保留资料与 session 不变，恢复 token 等于两进程 GET 且回到 Start 前 token。
+- 登录撤销竞态不使用随机 `Promise.all` 猜测时序。测试专用 preload 只在真实 `timingSafeEqual` 已经返回成功、两端都是 64-byte Scrypt 结果、数据库旧哈希二次指纹匹配后，才把 `arm` 原子改名成 `ready` 并同步暂停登录。
+- Auth arm 不保存明文密码，并绑定 run token、目标进程 B、随机 nonce 和旧密码哈希指纹；release 文件内容必须精确等于同一 nonce。主测试还会直接读取管理员已经提交的新密码哈希／Inactive 状态和零 session，才允许旧登录继续。
+- 密码重置竞态稳定证明“旧密码已验证成功 → 管理员新哈希提交并撤销 session → 登录继续 → 401、无 Set-Cookie、零 session”；之后旧密码继续 401，新密码可以正常登录。
+- 账号停用竞态使用相同屏障，稳定证明 Inactive 已提交后旧登录不能补回会话；之后账号保持 Inactive、旧密码 401，重新启用后原密码恢复正常登录。
+- Preload 只能由测试命令显式 `node --require` 加载；启动时必须同时满足精确测试模式、64 位随机 run token、私有 marker、A／B 标签、系统临时目录前缀、数据库直属路径和 control 直属路径，否则 fail closed。HTTP 请求无法启用这些同步点，正常 development／production 启动不会加载该文件。
+- 两个服务在 spawn 后立即登记到统一清理清单；普通完成、断言失败、Ctrl-C、SIGTERM、认证暂停和端口启动失败都共用幂等 cleanup。清理会先用匹配 nonce 释放认证屏障，再 TERM／必要时 KILL 两个进程，关闭 blocker 并删除整个临时目录。
+- 新增 `test:concurrency`；日常 `test:integration` 在同一次 build 后依次运行 CRUD 与跨进程回归，`test:release` 在同一次 build 后依次运行 CRUD、跨进程和 374 班次规模性能回归。老师尚未提交的两条 UX 命令继续保留在工作树，本次只会选择性暂存自己的 package 行。
+- 双进程本机回归只证明同一主机、同一文件、短事务下的 SQLite 串行化和业务 CAS 正确；它不改变部署约束。Railway／其他托管环境仍必须保持单应用实例、单持久化 volume，不能把同一 SQLite 文件用于多副本或网络文件系统横向扩容。
+
+### 本次验证
+
+- `node --check scripts/verify-cross-process-concurrency.mjs`、`node --check scripts/support/auth-race-preload.cjs`、两文件 ESLint 和 `git diff --check` 全部通过；独立审查在 writer-ready、auth barrier、API 语义、快照和清理边界中未发现 P0／P1。
+- `npm run test:concurrency` 在收尾前后各完整通过一次；每次都重新生成 24 个 production 页面／API，然后通过共享账号、首次排课、Course Setup、Cycle Start／Restore、密码重置和账号停用六组检查。
+- 完整 `npm run test:release` 通过：身份、Excel 安全边界、Teaching allocation 重导关系、CRUD／revision、主资料 warning 回滚、完整备份、Cycle、SQLite 外键、双进程并发和规模性能全部成功。
+- 本轮规模性能基线为 Issues p95 中位 `16.4 ms`、Year timetable p95 `13.6 ms`、30 间教室候选中位 `554.3 ms`、六账号 30 请求轮询整轮 `48.5 ms`／请求 p95 `46.2 ms`、360 条 warning 重算 `186.3 ms`、一个写入加十个读取 `222.1 ms`。
+- 并发响应没有出现 500、503、SQLite、UNIQUE、constraint、表名或列名泄露；所有赢家／败家结论均根据实际 HTTP 状态反推，测试不假定 A 或 B 固定获胜。
+- 两个 standalone 停止后，临时数据库 `integrity_check=ok`、`foreign_key_check` 为空；最终仍为 1 门课程、2 个班次、1 条已排课和 1 份应急备份。
+- `os.tmpdir()` 中没有残留 `timetabling-api-concurrency-*`、`timetabling-api-crud-*` 或 `timetabling-api-performance-*` 目录。正式 `web/data/timetabling.db` 修改时间仍为 `2026-08-11 04:45:51`、大小 544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空；本轮自动化没有连接或修改它。
+
+### 下一步
+
+1. 复用 `calculatePlacementWarnings` 的 prepared statements 与批量上下文，降低 Clear slots 对大量教室／时段重复编译 SQL 的成本；现有 374 班次基线用于防止优化引入资料错误或数量级退化。
+2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
+3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并另建旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。
