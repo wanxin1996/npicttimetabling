@@ -66,7 +66,7 @@ type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
 type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
-type CycleStatus = { courses: number; sections: number; lessons: number; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
+type CycleStatus = { courses: number; sections: number; lessons: number; currentToken: string; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
 type PositionedLesson = { lesson: ScheduledLesson; lane: number; laneCount: number };
 type TimetableDropTarget = { dayOfWeek: number; startHour: number };
 
@@ -1190,7 +1190,9 @@ export default function Home() {
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.");
-    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? "") }) });
+    // 把老师打开页面时看到的周期指纹交给服务器；若另一账号已经修改课程，
+    // 服务器会要求刷新复核，而不是把老师没有确认过的新资料直接清空。
+    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? ""), currentToken: currentCycle?.currentToken ?? "" }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "A new cycle could not be started.");
     setCurrentCycle(body);
@@ -1210,7 +1212,9 @@ export default function Home() {
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.");
-    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? "") }) });
+    // 同时提交页面显示的备份 ID 与当前周期指纹，防止多人操作时恢复了另一份新备份，
+    // 或覆盖另一位老师在本页面打开后刚保存的课程工作。
+    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? ""), backupId: currentCycle?.backup?.id ?? "", currentToken: currentCycle?.currentToken ?? "" }) });
     const body = await response.json();
     if (!response.ok) return setNotice(body.error ?? "The emergency backup could not be restored.");
     setCurrentCycle(body);

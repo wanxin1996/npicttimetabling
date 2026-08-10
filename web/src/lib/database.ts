@@ -157,6 +157,7 @@ export type CycleStatusRecord = {
   courses: number;
   sections: number;
   lessons: number;
+  currentToken: string;
   backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number };
 };
 
@@ -997,63 +998,145 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
   };
 }
 
+function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
+  // 紧急备份是数据库内部 JSON，但升级、磁盘损坏或人工维护都可能留下无效内容。
+  // 这里只接受具有五个必需数组的对象；读取状态时把无效备份隐藏，恢复时则返回明确冲突。
+  try {
+    const parsed: unknown = JSON.parse(snapshotJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const candidate = parsed as Partial<Record<keyof CycleSnapshot, unknown>>;
+    if (![candidate.courses, candidate.allocations, candidate.sections, candidate.sectionGroups, candidate.lessons].every(Array.isArray)) return null;
+    return candidate as CycleSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+export class CycleActionConflictError extends Error {
+  // 空周期、缺少备份、旧页面确认了已被替换的备份等都属于当前资料状态冲突，
+  // 可以安全显示为 409；未知 SQLite 或 trigger 故障必须由 API 隐藏成通用 500。
+  constructor(message: string) {
+    super(message);
+    this.name = "CycleActionConflictError";
+  }
+}
+
+export class CycleActionBusyError extends Error {
+  // 另一个服务进程正在执行写事务时，老师可以稍后重试；它不同于资料状态冲突，
+  // API 使用 503 表达临时不可用，同时不暴露 SQLite 锁文字。
+  constructor() {
+    super("Another scheduler is updating the cycle. Try again in a moment.");
+    this.name = "CycleActionBusyError";
+  }
+}
+
+function isSqliteBusyError(error: unknown) {
+  return error instanceof Database.SqliteError && (error.code.startsWith("SQLITE_BUSY") || error.code.startsWith("SQLITE_LOCKED"));
+}
+
+function cycleDatabase() {
+  // database() 每次都会执行幂等结构检查，其中也可能短暂取得写锁；把连接初始化
+  // 一并纳入 BUSY 转换，确保锁竞争不会在事务建立前漏成通用 500。
+  try {
+    return database();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new CycleActionBusyError();
+    throw error;
+  }
+}
+
 function backupSummary(id: string, createdAt: string, snapshot: CycleSnapshot) {
   // 周期管理页面只显示记录数量和快照时间，不把体积较大的 JSON 快照内容发送给浏览器。
   return { id, createdAt, courses: snapshot.courses.length, sections: snapshot.sections.length, lessons: snapshot.lessons.length };
 }
 
+function cycleSnapshotToken(snapshot: CycleSnapshot) {
+  // 浏览器只持有不可逆 SHA-256 指纹，不接收完整课程资料。恢复或清空时在写锁内重算，
+  // 若另一个账号已经修改当前周期，旧页面的确认就会得到 409，而不会覆盖未见过的新工作。
+  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
 export function cycleStatus(): CycleStatusRecord {
   // 返回当前排课数据总数，以及开始新周期后可用于一次撤销操作的最新紧急快照。
-  const db = database();
-  // 只提供最新紧急快照，不把它做成可浏览的完整版本历史，保持首个版本的功能范围简单明确。
-  const current = db.prepare("SELECT (SELECT COUNT(*) FROM courses) AS courses, (SELECT COUNT(*) FROM course_sections) AS sections, (SELECT COUNT(*) FROM scheduled_lessons) AS lessons").get() as { courses: number; sections: number; lessons: number };
-  const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
-  if (!backup) return { ...current, backup: null };
+  const db = cycleDatabase();
+  const statusTransaction = db.transaction(() => {
+    // 当前五张周期表和最新备份都在同一个只读事务快照中读取，避免 GET 把两个并发版本拼在一起。
+    const currentSnapshot = readCycleSnapshot(db);
+    const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
+    const backupSnapshot = backup ? parseCycleSnapshot(backup.snapshot_json) : null;
+    // 即使备份内容损坏，也不能阻止老师打开周期页；此时仅把它视为不可恢复。
+    return {
+      courses: currentSnapshot.courses.length,
+      sections: currentSnapshot.sections.length,
+      lessons: currentSnapshot.lessons.length,
+      currentToken: cycleSnapshotToken(currentSnapshot),
+      backup: backup && backupSnapshot && backupSnapshot.courses.length > 0 ? backupSummary(backup.id, backup.created_at, backupSnapshot) : null,
+    };
+  });
   try {
-    return { ...current, backup: backupSummary(backup.id, backup.created_at, JSON.parse(backup.snapshot_json) as CycleSnapshot) };
-  } catch {
-    // 即使快照内容损坏，也不能阻止老师打开周期管理页面；此时仅把快照视为不可恢复。
-    return { ...current, backup: null };
+    return statusTransaction.deferred();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new CycleActionBusyError();
+    throw error;
   }
 }
 
-export function startNewCycle(): CycleStatusRecord {
+export function startNewCycle(expectedCurrentToken: string): CycleStatusRecord {
   // 先快照当前排课工作，再在一个事务中清空课程、生成班次和排课记录；
   // 教师、学生班级、教室、规则及账号继续保留供新周期使用。
-  const db = database();
-  const snapshot = readCycleSnapshot(db);
-  if (snapshot.courses.length === 0) throw new Error("There is no current course cycle to clear.");
-  const backupId = crypto.randomUUID();
-  const createdAt = new Date().toISOString();
-
-  // 保存完整快照与清空当前周期在同一事务中原子执行。任一步失败都会一起回滚，
-  // 避免老师得到“资料已清空但备份不完整”的系统。
+  const db = cycleDatabase();
   const replaceCycle = db.transaction(() => {
+    // 取得 IMMEDIATE 写锁之后再执行五张表的快照查询，保证数组彼此来自同一数据库版本；
+    // 其他账号不能在快照完成后、清空之前再插入一门不在备份里的课程。
+    const snapshot = readCycleSnapshot(db);
+    if (cycleSnapshotToken(snapshot) !== expectedCurrentToken) throw new CycleActionConflictError("The current cycle changed. Refresh this page and review the latest contents before starting a new cycle.");
+    if (snapshot.courses.length === 0) throw new CycleActionConflictError("There is no current course cycle to clear.");
+    const backupId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    // 保存完整快照、替换旧备份和清空当前周期属于一个不可分割动作。
+    // 任一步失败都会恢复原课程和原备份，避免“资料清空但备份不完整”。
     db.prepare("DELETE FROM schedule_backups").run();
     db.prepare("INSERT INTO schedule_backups (id, snapshot_json, created_at) VALUES (?, ?, ?)").run(backupId, JSON.stringify(snapshot), createdAt);
     db.prepare("DELETE FROM courses").run();
+    // 在事务函数内构造响应，避免提交后再查状态失败而出现“接口说失败但周期已经清空”。
+    const clearedSnapshot = readCycleSnapshot(db);
+    return {
+      courses: clearedSnapshot.courses.length,
+      sections: clearedSnapshot.sections.length,
+      lessons: clearedSnapshot.lessons.length,
+      currentToken: cycleSnapshotToken(clearedSnapshot),
+      backup: backupSummary(backupId, createdAt, snapshot),
+    };
   });
-  replaceCycle();
-  return cycleStatus();
+  try {
+    return replaceCycle.immediate();
+  } catch (error) {
+    if (error instanceof CycleActionConflictError) throw error;
+    if (isSqliteBusyError(error)) throw new CycleActionBusyError();
+    throw error;
+  }
 }
 
-export function restoreLastCycleBackup(): CycleStatusRecord {
+export function restoreLastCycleBackup(expectedBackupId: string, expectedCurrentToken: string): CycleStatusRecord {
   // 在单一事务中用最新紧急 JSON 快照替换当前周期数据，随后根据目前保留的规则
   // 和不可用时段重新计算全部警告。
-  const db = database();
-  const backup = db.prepare("SELECT snapshot_json FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { snapshot_json: string } | undefined;
-  if (!backup) throw new Error("No emergency cycle backup is available.");
-  let snapshot: CycleSnapshot;
-  try {
-    snapshot = JSON.parse(backup.snapshot_json) as CycleSnapshot;
-  } catch {
-    throw new Error("The emergency backup is not valid.");
-  }
-  if (![snapshot.courses, snapshot.allocations, snapshot.sections, snapshot.sectionGroups, snapshot.lessons].every(Array.isArray)) throw new Error("The emergency backup is not valid.");
-
-  // 按父表到子表的顺序恢复，确保每一步外键都有效。清空和重建在同一事务中执行；
-  // 如果依赖的基础资料已经不存在，整个恢复会回滚。
+  const db = cycleDatabase();
   const restore = db.transaction(() => {
+    // 在取得 IMMEDIATE 写锁后才选择最新备份，并与页面确认的稳定 ID 比较。
+    // 如果另一账号已开始了新周期，旧页面不能悄悄恢复一个用户从未确认过的新备份。
+    const currentSnapshot = readCycleSnapshot(db);
+    if (cycleSnapshotToken(currentSnapshot) !== expectedCurrentToken) throw new CycleActionConflictError("The current cycle changed. Refresh this page and review the latest contents before restoring.");
+    const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
+    if (!backup) throw new CycleActionConflictError("No emergency cycle backup is available.");
+    if (backup.id !== expectedBackupId) throw new CycleActionConflictError("The emergency backup changed. Refresh this page and review the latest backup before restoring.");
+    const snapshot = parseCycleSnapshot(backup.snapshot_json);
+    // 正常 Start 从不允许空课程周期，因此零课程快照一定是损坏或不兼容资料；
+    // 不能把它当成有效恢复并静默清空老师当前工作。
+    if (!snapshot || snapshot.courses.length === 0) throw new CycleActionConflictError("The emergency backup is not valid.");
+
+    // 按父表到子表的顺序恢复，确保每一步外键都有效。清空、重建和 warning 重算
+    // 都在同一个事务中；如果基础资料已经不存在或任一步失败，当前周期完整回滚。
     db.prepare("DELETE FROM courses").run();
     const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const row of snapshot.courses) {
@@ -1075,12 +1158,30 @@ export function restoreLastCycleBackup(): CycleStatusRecord {
     for (const row of snapshot.sectionGroups) insertSectionGroup.run(row.section_id, row.student_group_id);
     const insertLesson = db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const row of snapshot.lessons) insertLesson.run(row.id, row.section_id, row.occurrence, row.day_of_week, row.start_hour, row.duration_hours, row.room_id, row.warnings_json, row.revision);
+    // 基础资料或政策规则可能在备份后变化，所以用当前规则重新评估；嵌套 transaction
+    // 会使用 SAVEPOINT，任何重算异常都会继续向外抛并撤销整次周期恢复。
+    refreshAllScheduleWarnings(db);
+    const restoredSnapshot = readCycleSnapshot(db);
+    return {
+      courses: restoredSnapshot.courses.length,
+      sections: restoredSnapshot.sections.length,
+      lessons: restoredSnapshot.lessons.length,
+      currentToken: cycleSnapshotToken(restoredSnapshot),
+      backup: backupSummary(backup.id, backup.created_at, snapshot),
+    };
   });
-  restore();
-  // 紧急快照生成后，基础资料或政策规则可能已经变化。因此先准确恢复原排课位置，
-  // 再用当前保留的最新规则重新评估警告。
-  refreshAllScheduleWarnings(db);
-  return cycleStatus();
+  try {
+    return restore.immediate();
+  } catch (error) {
+    if (error instanceof CycleActionConflictError) throw error;
+    if (isSqliteBusyError(error)) throw new CycleActionBusyError();
+    // 备份引用的教师、学生班级或教室在新周期期间可能被物理删除；这是可解释的
+    // 当前状态冲突。只转换稳定外键错误代码，不把 trigger 等未知约束误报成 409。
+    if (error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_FOREIGNKEY") {
+      throw new CycleActionConflictError("The emergency backup depends on master data that no longer exists.");
+    }
+    throw error;
+  }
 }
 
 export function listCourses(): CourseRecord[] {

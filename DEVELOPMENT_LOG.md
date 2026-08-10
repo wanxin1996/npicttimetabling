@@ -1926,3 +1926,41 @@
 1. 把新周期建立和上次周期恢复中的资料写入、快照与 warning 重算合并为同一个可回滚事务。
 2. 把课程配置与相关课次 revision／warning 重算合并为同一个原子事务，并增加 trigger 故障回归。
 3. 把 `/api/issues` 改为纯读取已保存 warning，避免每个账号五秒一次全库写入；随后补齐运行时索引和满负载性能基准。
+
+## 2026-08-11｜新周期快照与恢复改为原子且防旧页面覆盖
+
+### 已完成
+
+- `Start new cycle` 现在先取得 SQLite `IMMEDIATE` 写锁，再从课程、Teaching allocation、班次、班级关联和已排课程五张表读取同一个版本的快照；其他账号不能在快照的多次查询之间写入，也不能在快照完成后、清空前加入一门不在备份中的课程。
+- 空周期检查、删除旧应急备份、写入新快照和级联清空课程全部位于同一个事务；任何 trigger、磁盘或数据库错误都会同时恢复原课程与原备份。
+- `Restore emergency backup` 在取得写锁后才读取并验证最新备份；当前活动周期删除、课程／分配／班次／排课恢复和当前规则下的全部 warning 重算位于同一个外层事务，重算失败时整次恢复完整回滚。
+- 周期写事务直接返回自己刚建立的状态，不再提交后重新调用状态查询；避免操作已成功提交、但第二次读取失败后界面却收到失败的假失败。
+- Cycle GET 把五张当前周期表和最新备份放入同一个只读事务快照，课程数量、班次数量、课次数量和备份不会再来自两个并发版本。
+- Cycle 状态新增不可逆的 `currentToken`（稳定周期快照 SHA-256）。Start 和 Restore 都必须提交老师打开页面时看到的 token；另一个账号保存课程后，旧页面得到 409 并要求刷新复核，不会清空或覆盖老师未见过的新工作。
+- Restore 额外提交页面显示的 `backupId`，并在写锁内核对当前最新备份；若另一账号已经开始了新周期并替换应急快照，旧页面不能悄悄恢复一份从未确认过的新备份。
+- Cycle 页面已把 `currentToken` 和 `backupId` 自动加入现有三重确认请求；界面仍只显示计数、时间和确认短语，不显示完整备份内容或 hash 技术细节。
+- 损坏、`null`、数组 JSON、错误 action、错误确认短语和缺少绑定字段统一得到 JSON 400；空周期、无备份、备份改变、当前周期改变和无效快照使用明确 409。
+- 未知 SQLite／trigger 故障只写服务器日志并返回固定通用 500；稳定识别到 `SQLITE_BUSY`／`SQLITE_LOCKED` 时返回安全 503，提示另一位老师正在更新周期，且连接初始化阶段的锁错误也不会漏成 500。
+- 无效备份解析新增“至少一门课程”不变量。合法 Start 永远不会为零课程建立备份，因此五个空数组不能被当成有效恢复并静默清空当前周期。
+- 自动化完整快照新增 `schedule_backups` 和账号资料，并把多表读取本身放入同一个只读事务；测试断言不会因为跨两个数据库版本而产生假阳性。
+
+### 本次验证
+
+- `node --check scripts/verify-api-crud.mjs`、`git diff --check`、`npm run lint`、独立 TypeScript 检查和完整 `npm test` 全部通过；production build 的 24 个页面／API 成功生成。
+- 管理员建立一个普通 scheduler 并取得独立 Cookie；未登录 GET／POST Cycle 得到 401，普通账号完整执行 GET、Start、Restore 后主动注销，证明“所有账号可排课、仅账号创建受管理员限制”的权限保持不变。
+- `null`、数组、损坏 JSON、未知 action、两种错误确认短语、缺少 `currentToken` 和缺少 `backupId` 均得到 400；每次请求后的完整业务快照与请求前逐字段相同。
+- 页面取得 token T0 后，经 production API 新增 `CYCLE_TOKEN_MARKER`；使用旧 T0 Start 得到明确 409，marker 完整保留。重新 GET 的 T1 为不同的 64 位 SHA-256，连续两次无修改 GET 返回相同 token。
+- Start 故障测试先直接加入一份合法旧备份 sentinel，再用 `BEFORE DELETE ON courses` trigger 强制清空中途失败；接口只返回固定通用 500，当前五张周期表、全部基础资料和旧备份逐字段完全不变。
+- 移除 trigger 后用同一 T1 正常 Start：当前五张周期表全部为空，新备份原子替换 sentinel；解析后的 snapshot JSON 与清空前课程、分配、班次、学生班级关联、排课位置、warning 和 revision 完全相同。
+- 空周期再次 Start 得到 409，已建立的新备份没有被替换；使用随机错误 `backupId` Restore 也得到 409，当前周期与备份均零变化。
+- 临时把备份内容改成五个空数组后 Restore 得到 `The emergency backup is not valid.`，没有清空资料；测试随后原样还原合法 snapshot JSON。
+- 空活动区建立 `RESTORE_CURRENT`，取得旧 token 后再建立 `RESTORE_STALE_MARKER`；旧页面 Restore 得到明确 409，两门新课程和全部关系都完整保留。
+- Restore 故障测试在备份排序最后一条课程的 warning UPDATE 上建立 trigger；接口返回固定通用 500，恢复前的两门活动课程、备份 JSON、全部 ID／revision／warning 和保留资料逐字段完全相同，证明前面已执行的恢复写入也全部回滚。
+- 删除 trigger 后使用相同 token 正常 Restore：两门临时活动课程消失，备份中的五张周期表逐字段恢复，原 backup ID／JSON 保持；POST 响应和后续 GET 的数量、token 与备份一致。
+- 完整测试末尾原有 SQLite `RESTRICT`／`SET NULL`／`CASCADE`、`integrity_check` 与 `foreign_key_check` 继续通过，两个登录会话均已注销；正式数据库修改时间仍为 `2026-08-11 01:06:13`。
+
+### 下一步
+
+1. 把课程配置、相关课次 revision 和 warning 重算合并为一个 `IMMEDIATE` 事务，并增加中途故障回滚测试。
+2. 把 `/api/issues` 改为纯读取已保存 warning，避免每个账号五秒一次全库写入；同时确认所有资料变更入口都主动刷新必要 warning。
+3. 补齐运行时数据库索引，并用接近实际 374 个班次、多账号轮询的资料量建立性能基准。

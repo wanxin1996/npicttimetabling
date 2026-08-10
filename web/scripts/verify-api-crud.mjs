@@ -153,9 +153,12 @@ async function requestApi(pathname, options = {}) {
     headers = {},
     expectedStatus = 200,
     authenticated = true,
+    cookie = sessionCookie,
   } = options;
   const requestHeaders = new Headers(headers);
-  if (authenticated && sessionCookie) requestHeaders.set("Cookie", sessionCookie);
+  // 默认使用管理员 Cookie；多人回归可传入普通 scheduler 的独立 Cookie，
+  // 仍由同一个请求器验证状态码和 JSON，不需要改写全局管理员会话。
+  if (authenticated && cookie) requestHeaders.set("Cookie", cookie);
   if (json !== undefined) requestHeaders.set("Content-Type", "application/json");
 
   const response = await fetch(new URL(pathname, baseUrl), {
@@ -189,7 +192,7 @@ function readBusinessSnapshot() {
   assert(testDatabasePath, "The temporary database path is not ready.");
   const db = new Database(testDatabasePath, { readonly: true });
   try {
-    return {
+    const readSnapshot = db.transaction(() => ({
       teachers: db.prepare("SELECT * FROM teachers ORDER BY id").all(),
       studentGroups: db.prepare("SELECT * FROM student_groups ORDER BY id").all(),
       rooms: db.prepare("SELECT * FROM rooms ORDER BY id").all(),
@@ -201,10 +204,39 @@ function readBusinessSnapshot() {
       teacherUnavailableWindows: db.prepare("SELECT * FROM teacher_unavailable_windows ORDER BY id").all(),
       yearBlockedWindows: db.prepare("SELECT * FROM year_blocked_windows ORDER BY id").all(),
       ruleSettings: db.prepare("SELECT * FROM rule_settings ORDER BY rule_key").all(),
-    };
+      scheduleBackups: db.prepare("SELECT * FROM schedule_backups ORDER BY created_at, id").all(),
+      appUsers: db.prepare("SELECT * FROM app_users ORDER BY id").all(),
+    }));
+    // 多表断言也必须来自同一个 SQLite 读快照，否则并发请求可能让测试自身比较混合版本。
+    return readSnapshot.deferred();
   } finally {
     db.close();
   }
+}
+
+function cyclePayloadFromSnapshot(snapshot) {
+  // 紧急备份只允许包含这五组周期资料；共用转换器让测试与数据库 JSON 按同一字段名比较，
+  // 不会把教师、教室、账号等应跨周期保留的资料误算进快照。
+  return {
+    courses: snapshot.courses,
+    allocations: snapshot.allocations,
+    sections: snapshot.sections,
+    sectionGroups: snapshot.sectionGroups,
+    lessons: snapshot.lessons,
+  };
+}
+
+function retainedPayloadFromSnapshot(snapshot) {
+  // Start／Restore 之外的基础资料必须逐字段保持；backup 独立比较，因为 Start 会有意替换它。
+  return {
+    teachers: snapshot.teachers,
+    studentGroups: snapshot.studentGroups,
+    rooms: snapshot.rooms,
+    teacherUnavailableWindows: snapshot.teacherUnavailableWindows,
+    yearBlockedWindows: snapshot.yearBlockedWindows,
+    ruleSettings: snapshot.ruleSettings,
+    appUsers: snapshot.appUsers,
+  };
 }
 
 function executeTestDatabase(callback) {
@@ -1023,6 +1055,249 @@ async function verifyAtomicMasterDataWarnings(ids) {
   report("主资料、规则和不可用时段 warning 重算原子回滚及安全 JSON 错误");
 }
 
+async function verifyAtomicCycleActions(ids) {
+  // 新周期功能按产品要求允许所有排课账号使用。先由管理员建立一个普通账号，
+  // 后面的 GET、Start 和 Restore 全部使用独立 Cookie 走真实 production proxy。
+  const schedulerPassword = "CycleScheduler123!";
+  await requestApi("/api/auth/accounts", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { username: "cycle-scheduler", password: schedulerPassword },
+  });
+  const schedulerLogin = await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    json: { username: "cycle-scheduler", password: schedulerPassword },
+  });
+  const schedulerCookie = (schedulerLogin.response.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert(schedulerCookie.includes("="), "The normal scheduler login did not return a session cookie.");
+
+  await requestApi("/api/cycle", { authenticated: false, expectedStatus: 401 });
+  await requestApi("/api/cycle", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 401,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: "0".repeat(64) },
+  });
+  const initialStatus = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert.match(initialStatus.body.currentToken, /^[0-9a-f]{64}$/);
+  assert.equal(initialStatus.body.backup, null);
+
+  // 损坏 JSON、非对象、错误 action／短语以及缺少绑定字段都必须在任何写入前返回 400。
+  const stateBeforeInputErrors = readBusinessSnapshot();
+  const invalidRequests = [
+    { json: null },
+    { json: [] },
+    { json: { action: "unknown" } },
+    { json: { action: "start", confirmation: "WRONG", currentToken: initialStatus.body.currentToken } },
+    { json: { action: "restore", confirmation: "WRONG", currentToken: initialStatus.body.currentToken, backupId: randomUUID() } },
+    { json: { action: "start", confirmation: "START NEW CYCLE" } },
+    { json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: initialStatus.body.currentToken } },
+  ];
+  for (const request of invalidRequests) {
+    await requestApi("/api/cycle", { method: "POST", cookie: schedulerCookie, expectedStatus: 400, ...request });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeInputErrors);
+  }
+  await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 400,
+    headers: { "Content-Type": "application/json" },
+    body: "{broken",
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInputErrors);
+
+  // 尚未开始过新周期时没有应急备份；这是当前资料状态冲突，而不是服务器故障。
+  const noBackup = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: initialStatus.body.currentToken, backupId: randomUUID() },
+  });
+  assert.deepEqual(noBackup.body, { error: "No emergency cycle backup is available." });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInputErrors);
+
+  // 页面取得 T0 后，另一请求新增课程。旧 T0 的 Start 必须被拒绝，不能清空老师
+  // 从未在确认页面看过的 marker；重新 GET 才得到新的稳定 T1。
+  const tokenBeforeMarker = initialStatus.body.currentToken;
+  await requestApi("/api/courses", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 201,
+    json: { code: "CYCLE_TOKEN_MARKER", catalog: "Cycle stale-token marker", sectionCount: 1 },
+  });
+  const stateAfterMarker = readBusinessSnapshot();
+  const staleStart = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: tokenBeforeMarker },
+  });
+  assert.deepEqual(staleStart.body, { error: "The current cycle changed. Refresh this page and review the latest contents before starting a new cycle." });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  const statusBeforeStart = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert.match(statusBeforeStart.body.currentToken, /^[0-9a-f]{64}$/);
+  assert.notEqual(statusBeforeStart.body.currentToken, tokenBeforeMarker);
+  assert.equal((await requestApi("/api/cycle", { cookie: schedulerCookie })).body.currentToken, statusBeforeStart.body.currentToken);
+
+  // 先直接加入一份合法旧 backup 夹具；若 Start 将删除旧备份放在事务外，后面的
+  // courses DELETE 故障就会让这份 sentinel 丢失，完整快照断言会立即失败。
+  const expectedCyclePayload = cyclePayloadFromSnapshot(stateAfterMarker);
+  const oldBackupId = randomUUID();
+  executeTestDatabase((db) => {
+    db.prepare("INSERT INTO schedule_backups (id, snapshot_json, created_at) VALUES (?, ?, ?)")
+      .run(oldBackupId, JSON.stringify(expectedCyclePayload), "2000-01-01T00:00:00.000Z");
+    const courseIdLiteral = db.prepare("SELECT quote(?) AS value").get(ids.courseId).value;
+    db.exec(`CREATE TRIGGER zz_fail_cycle_clear BEFORE DELETE ON courses WHEN OLD.id = ${courseIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced cycle clear failure'); END;`);
+  });
+  const stateBeforeFailedStart = readBusinessSnapshot();
+  try {
+    const failedStart = await requestApi("/api/cycle", {
+      method: "POST",
+      cookie: schedulerCookie,
+      expectedStatus: 500,
+      json: { action: "start", confirmation: "START NEW CYCLE", currentToken: statusBeforeStart.body.currentToken },
+    });
+    assert.deepEqual(failedStart.body, { error: "The cycle action could not be completed. Try again." });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeFailedStart);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_cycle_clear"));
+  }
+
+  // 同一个 token 正常 Start 后，活动周期五表必须全空，新 backup 必须逐字段等于
+  // 清空前资料并原子替换旧 sentinel；教师、教室、规则和账号完全保留。
+  const retainedBeforeStart = retainedPayloadFromSnapshot(stateBeforeFailedStart);
+  const started = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: statusBeforeStart.body.currentToken },
+  });
+  assert.equal(started.body.courses, 0);
+  assert.equal(started.body.sections, 0);
+  assert.equal(started.body.lessons, 0);
+  assert.match(started.body.currentToken, /^[0-9a-f]{64}$/);
+  const stateAfterStart = readBusinessSnapshot();
+  for (const rows of Object.values(cyclePayloadFromSnapshot(stateAfterStart))) assert.equal(rows.length, 0);
+  assert.deepEqual(retainedPayloadFromSnapshot(stateAfterStart), retainedBeforeStart);
+  assert.equal(stateAfterStart.scheduleBackups.length, 1);
+  assert.notEqual(stateAfterStart.scheduleBackups[0].id, oldBackupId);
+  assert.equal(stateAfterStart.scheduleBackups[0].id, started.body.backup.id);
+  assert.deepEqual(JSON.parse(stateAfterStart.scheduleBackups[0].snapshot_json), expectedCyclePayload);
+  assert.deepEqual(
+    { courses: started.body.backup.courses, sections: started.body.backup.sections, lessons: started.body.backup.lessons },
+    { courses: expectedCyclePayload.courses.length, sections: expectedCyclePayload.sections.length, lessons: expectedCyclePayload.lessons.length },
+  );
+
+  const stateBeforeEmptyStart = readBusinessSnapshot();
+  const emptyStart = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: started.body.currentToken },
+  });
+  assert.deepEqual(emptyStart.body, { error: "There is no current course cycle to clear." });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeEmptyStart);
+
+  // Restore 必须绑定页面显示的 backup ID。错误 ID 即使配合正确 current token，
+  // 也只能得到 409，不能恢复或替换任何课程。
+  const wrongBackup = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: started.body.currentToken, backupId: randomUUID() },
+  });
+  assert.deepEqual(wrongBackup.body, { error: "The emergency backup changed. Refresh this page and review the latest backup before restoring." });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeEmptyStart);
+
+  // 零课程 JSON 不可能来自合法 Start。即使五个字段都是数组，也必须视为损坏备份，
+  // 不能成功 DELETE 当前周期。测试后原样还原正式夹具 JSON。
+  const backupId = stateAfterStart.scheduleBackups[0].id;
+  const validBackupJson = stateAfterStart.scheduleBackups[0].snapshot_json;
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(JSON.stringify({ courses: [], allocations: [], sections: [], sectionGroups: [], lessons: [] }), backupId));
+  const stateWithInvalidBackup = readBusinessSnapshot();
+  const invalidBackup = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: started.body.currentToken, backupId },
+  });
+  assert.deepEqual(invalidBackup.body, { error: "The emergency backup is not valid." });
+  assert.deepEqual(readBusinessSnapshot(), stateWithInvalidBackup);
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(validBackupJson, backupId));
+
+  // 在空活动区建立两门替换课程；R0 之后新增第二门，旧 R0 Restore 必须保留两门，
+  // 防止旧页面无提示覆盖另一位老师刚保存的周期工作。
+  await requestApi("/api/courses", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 201,
+    json: { code: "RESTORE_CURRENT", catalog: "Current work before restore", sectionCount: 1 },
+  });
+  const statusBeforeSecondCurrentCourse = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  await requestApi("/api/courses", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 201,
+    json: { code: "RESTORE_STALE_MARKER", catalog: "Must survive stale restore", sectionCount: 1 },
+  });
+  const stateBeforeStaleRestore = readBusinessSnapshot();
+  const staleRestore = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeSecondCurrentCourse.body.currentToken, backupId },
+  });
+  assert.deepEqual(staleRestore.body, { error: "The current cycle changed. Refresh this page and review the latest contents before restoring." });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeStaleRestore);
+  const statusBeforeRestore = await requestApi("/api/cycle", { cookie: schedulerCookie });
+
+  // 让 warning 重算在排序最后一条备份课程上失败，可证明前面已执行的 warning UPDATE、
+  // 全部恢复 INSERT 和原活动周期 DELETE 会被同一个外层事务一起回滚。
+  const lastBackupLesson = expectedCyclePayload.lessons.at(-1);
+  assert(lastBackupLesson, "The cycle backup needs at least one scheduled lesson for warning rollback verification.");
+  executeTestDatabase((db) => {
+    const lessonIdLiteral = db.prepare("SELECT quote(?) AS value").get(lastBackupLesson.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_cycle_restore_warning BEFORE UPDATE OF warnings_json ON scheduled_lessons WHEN NEW.id = ${lessonIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced cycle restore warning failure'); END;`);
+  });
+  const stateBeforeFailedRestore = readBusinessSnapshot();
+  try {
+    const failedRestore = await requestApi("/api/cycle", {
+      method: "POST",
+      cookie: schedulerCookie,
+      expectedStatus: 500,
+      json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeRestore.body.currentToken, backupId },
+    });
+    assert.deepEqual(failedRestore.body, { error: "The cycle action could not be completed. Try again." });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeFailedRestore);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_cycle_restore_warning"));
+  }
+
+  // 故障回滚后同一 current token 仍然有效。正常 Restore 必须移除两门替换课程，
+  // 精确恢复 backup 中的 ID、revision、关联与 warning，并继续保留同一备份。
+  const restored = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeRestore.body.currentToken, backupId },
+  });
+  const stateAfterRestore = readBusinessSnapshot();
+  assert.deepEqual(cyclePayloadFromSnapshot(stateAfterRestore), expectedCyclePayload);
+  assert.deepEqual(retainedPayloadFromSnapshot(stateAfterRestore), retainedBeforeStart);
+  assert.deepEqual(stateAfterRestore.scheduleBackups, stateAfterStart.scheduleBackups);
+  assert.equal(restored.body.courses, expectedCyclePayload.courses.length);
+  assert.equal(restored.body.sections, expectedCyclePayload.sections.length);
+  assert.equal(restored.body.lessons, expectedCyclePayload.lessons.length);
+  assert.equal(restored.body.backup.id, backupId);
+  assert.match(restored.body.currentToken, /^[0-9a-f]{64}$/);
+  const finalCycleStatus = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert.deepEqual(finalCycleStatus.body, restored.body);
+
+  // 注销普通排课账号，避免它的测试会话影响最终 auth_sessions=0 外键验收。
+  await requestApi("/api/auth/logout", { method: "POST", cookie: schedulerCookie });
+  await requestApi("/api/cycle", { cookie: schedulerCookie, expectedStatus: 401 });
+  report("普通账号的新周期快照、旧页面绑定、Start／Restore 原子回滚和完整恢复");
+}
+
 async function verifyLogout() {
   // 测试结束时删除服务器会话，再使用旧 Cookie 访问业务 API；401 证明注销不仅
   // 清除了浏览器 Cookie 响应，也确实删除了 SQLite 中的会话记录。
@@ -1123,6 +1398,7 @@ async function run() {
   await verifyTeachingAllocationReimport();
   const relationshipIds = await verifyCrudAndRevisions();
   await verifyAtomicMasterDataWarnings(relationshipIds);
+  await verifyAtomicCycleActions(relationshipIds);
   await verifyLogout();
 
   // 关闭应用连接后再直接验证数据库外键，避免后台请求或连接缓存干扰断言。
