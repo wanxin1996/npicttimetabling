@@ -1,6 +1,6 @@
 "use client";
 
-import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Each view uses the same page shell but displays a different master-data table.
 type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
@@ -134,6 +134,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
   renderLesson: (lesson: ScheduledLesson) => React.ReactNode;
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
 }) {
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
   // A day with deliberately saved conflicts needs extra horizontal room for its
   // lanes. Normal days remain compact; conflict-heavy days make only the grid scroll.
@@ -141,16 +142,34 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
   const minimumGridWidth = 64 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(150, laneCount * 150), 0) + (timetableDays.length * 8);
   const timetableColumns = `64px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(150, laneCount * 150)}px, ${laneCount}fr)`).join(" ")}`;
 
+  const scrollTimetable = (direction: -1 | 1) => {
+    // Move most of one visible width at a time. The remaining overlap preserves
+    // context, so schedulers can tell which day column they just moved away from.
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    container.scrollBy({ left: direction * Math.max(320, container.clientWidth * 0.75), behavior: "smooth" });
+  };
+
   return (
-    <div className="overflow-x-auto pb-2">
-      {/* Fixed 72px hour tracks let each absolute lesson cover exactly the number of
-          hours stored in durationHours, while the outer wrapper handles small screens. */}
-      <div className="grid gap-x-2 text-xs" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "40px repeat(10, 72px)", minWidth: minimumGridWidth }}>
-        <div className="pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
+    <div>
+      {/* Keep horizontal navigation visible above the long timetable. This avoids
+          making users scroll to 18:00 just to discover the browser scrollbar. */}
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+        <span>Use the arrows or a trackpad to view every day and overlapping lesson.</span>
+        <div className="flex gap-1">
+          <button onClick={() => scrollTimetable(-1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable left">← Left</button>
+          <button onClick={() => scrollTimetable(1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable right">Right →</button>
+        </div>
+      </div>
+      <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-2">
+        {/* Fixed 72px hour tracks let each absolute lesson cover exactly the number of
+            hours stored in durationHours, while the outer wrapper handles small screens. */}
+        <div className="grid gap-x-2 text-xs" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "40px repeat(10, 72px)", minWidth: minimumGridWidth }}>
+        <div className="sticky left-0 z-20 bg-white pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
         {timetableDays.map((day, index) => <div key={day} className="rounded-lg bg-slate-50 p-2 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
 
         {timetableHours.map((hour, hourIndex) => (
-          <div key={`time-${hour}`} className="border-t border-slate-100 py-3 font-semibold text-slate-400" style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
+          <div key={`time-${hour}`} className="sticky left-0 z-20 border-t border-slate-100 bg-white py-3 font-semibold text-slate-400" style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
             {String(hour).padStart(2, "0")}:00
           </div>
         ))}
@@ -192,6 +211,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop }: {
             })}
           </div>
         ))}
+        </div>
       </div>
     </div>
   );
@@ -999,7 +1019,9 @@ export default function Home() {
                 </div>
               </aside>
 
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+              {/* min-w-0 keeps a conflict-wide timetable inside this grid column, so
+                  the timetable's own controls scroll it instead of widening the page. */}
+              <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
                 <div className="mb-4 flex items-center justify-between">
                   <div><p className="text-sm font-semibold text-blue-700">Master timetable</p><h2 className="text-xl font-black">Year {timetableYear}</h2></div>
                   <div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div>
