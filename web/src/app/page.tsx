@@ -324,10 +324,24 @@ export default function Home() {
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
   const [notice, setNotice] = useState("Loading the local scheduling database...");
+  const [showNoticeToast, setShowNoticeToast] = useState(true);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // 保存后的绿色外框保留六秒，让老师能把右下角提示和总表课程对应起来；随后自动消失，避免被误认为永久冲突标记。
+    // 每次产生新的操作结果时重新显示浮动提示，八秒后只隐藏浮层而不删除 notice 内容。
+    // 因此其他页面底部的 System status 仍可保留完整结果，同时排课页不会长期被提示框遮挡。
+    if (!notice) return;
+    // 状态更新放进计时器回调，让 Effect 只负责同步浏览器计时器，避免在 Effect 本体中连续触发 React 重绘。
+    const showTimeout = window.setTimeout(() => setShowNoticeToast(true), 0);
+    const hideTimeout = window.setTimeout(() => setShowNoticeToast(false), 8000);
+    return () => {
+      window.clearTimeout(showTimeout);
+      window.clearTimeout(hideTimeout);
+    };
+  }, [notice]);
+
+  useEffect(() => {
+    // 保存后的绿色外框保留六秒，让老师能把右上角操作提示和总表课程对应起来；随后自动消失，避免被误认为永久冲突标记。
     if (!recentlySavedLesson) return;
     const timeout = window.setTimeout(() => setRecentlySavedLesson(null), 6000);
     return () => window.clearTimeout(timeout);
@@ -1062,10 +1076,11 @@ export default function Home() {
     return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
   }
 
-  // 桌面端年级排课工作区占满可视高度，待排区、总表和 Inspector 各自滚动，导航与保存提示不会被推到页面下方。
+  // 桌面端年级排课工作区占满可视高度，待排区、总表和 Inspector 各自滚动；
+  // 操作提示固定在顶部并可关闭，避免像旧版底部提示一样遮住 Inspector 的保存按钮。
   return (
     <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "xl:flex xl:h-screen xl:min-h-0 xl:flex-col xl:overflow-hidden" : ""}`}>
-      {notice && <div role="status" aria-live="polite" aria-atomic="true" className={`fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span>{notice}</div>}
+      {notice && showNoticeToast && <div className="pointer-events-none fixed inset-x-3 top-3 z-50 flex justify-end sm:left-auto sm:right-4 sm:max-w-sm"><div role="status" aria-live="polite" aria-atomic="true" className={`pointer-events-auto flex max-h-32 w-full items-start gap-3 overflow-hidden rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span><p className="min-w-0 flex-1 overflow-y-auto leading-5">{notice}</p><button onClick={() => setShowNoticeToast(false)} className="-mr-1 shrink-0 rounded-md px-2 py-1 text-base leading-none opacity-70 hover:bg-black/5 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current" type="button" aria-label="Dismiss notification">×</button></div></div>}
       {/* 顶部身份栏始终显示系统名称、同步时间和当前账号，让老师确认自己正在操作哪一个工作区。 */}
       <header className="shrink-0 border-b border-slate-200 bg-white">
         <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "max-w-[1920px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
