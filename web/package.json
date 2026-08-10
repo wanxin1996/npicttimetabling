@@ -11,6 +11,8 @@
     "start": "node scripts/verify-persistent-storage.mjs && node .next/standalone/server.js",
     "start:standalone": "node scripts/verify-persistent-storage.mjs && node .next/standalone/server.js",
     "verify:deployment": "node scripts/verify-deployment.mjs",
+    "test": "npm run test:integration",
+    "test:integration": "npm run build && node scripts/verify-api-crud.mjs",
     "lint": "eslint",
     "db:generate": "prisma generate",
     "db:check": "prisma validate && prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script"

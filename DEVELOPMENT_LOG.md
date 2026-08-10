@@ -1853,10 +1853,44 @@
 - 浏览器在独立 production 服务中实际打开 `ROOM_QA_01`：Inspector 的 Room 明确选中 `99-09-09 (Inactive — current assignment)`，没有落到 `Room pending`。把开始时间从 09:00 改到 10:00 保存并重新打开后，时间、相同 room ID 和停用标签全部保留，`Room is unavailable` 仍可见，控制台没有 error／warning。
 - 使用 SQLite trigger 人为让退回待排区后的 warning 更新失败：DELETE 返回通用 500，目标课程仍以相同 ID、位置和 revision 留在总表。删除 trigger 后，用同一 revision 重试即可正常退回待排区。
 - 两个并发首次排课请求仍严格得到一个 201 和一个带 `LESSON_ALREADY_SCHEDULED` 的 409；总表只存在赢家的一条记录，冲突响应不含 SQLite 或唯一键细节。
-- 最终 `PRAGMA integrity_check` 为 `ok`、`foreign_key_check` 为空；测试只使用 `/private/tmp` 下的一次性数据库，正式 `web/data/timetabling.db` 修改时间保持 `2026-08-11 01:06:13`，测试结束后临时目录为空。
+- 最终 `PRAGMA integrity_check` 为 `ok`、`foreign_key_check` 为空；测试只使用操作系统临时目录下的一次性数据库，正式 `web/data/timetabling.db` 修改时间保持 `2026-08-11 01:06:13`，测试结束后临时目录为空。
 
 ### 下一步
 
 1. 把本次使用的 API／SQLite 隔离回归脚本正式加入项目，并接入统一 `npm test` 命令。
 2. 自动化 Teaching allocation 重导后的稳定 ID、手工分配保留、受保护缩减和 Inactive 教师继承语义。
 3. 把学生班级、教室、规则与不可用时段等其余“写入后重算 warning”路径逐步改成同一事务，并减少问题清单轮询造成的全库写入。
+
+## 2026-08-11｜加入 production API、SQLite 与 Excel 自动化集成回归
+
+### 已完成
+
+- 新增统一 `npm test`／`npm run test:integration`：每次先生成最新 production standalone build，再运行 API、SQLite、Excel、revision 和资料关系回归，避免误测旧构建或只验证开发模式。
+- 测试脚本每次使用 `os.tmpdir()` 下的全新 SQLite 文件和操作系统分配的随机本机端口；启动前清除继承的 Railway、正式数据库和端口环境变量，绝不会打开 `web/data/timetabling.db`。
+- 直接启动 standalone Node 进程，不经过额外 npm／shell 子进程；启动失败、端口竞争、请求超时、断言失败、Ctrl-C 和 CI `SIGTERM` 都共用幂等清理，保证子服务与临时目录不会留在后台。
+- 自动创建一次性管理员并验证 401、首次 setup、安全 Cookie、注销和旧 Cookie 失效；测试不会输出密码、完整 Cookie 或请求头。
+- 抽出 production API 与测试共用的 Teaching Members 工作表解析器：目标表名称、5,000 行上限、额外超限检测行和 `!fullref` 截断保护只有一份实现。测试直接读取同一次解析建立的 Worksheet 名称，不再用复制的 SheetJS 选项或脆弱源码正则产生假阳性。
+- Excel 回归覆盖固定 SheetJS 0.20.3、目标表前置 Decoy、恰好 5,000／5,001 行、稀疏尾行、损坏 multipart、20 MB 上限和原型字段烟测；被拒绝的 5,001 行文件使用完整业务表快照证明零写入。
+- Excel 回归同时覆盖缺少 `Teaching Members`、缺少必要表头和扩展名正确但 ZIP 内容截断；三类请求都得到安全 400，响应不泄露 SheetJS／ZIP／XML 技术文字，完整业务表快照保持不变。
+- Teaching allocation 重导自动覆盖：课程／班次稳定 ID、相同工作簿不提高无变化 revision、人工教师与学生班级保留、受保护尾班缩减 409、Inactive 原教师 grandfather、新增 Inactive 班次 409，以及课程排入总表后整份重导 409；三类拒绝都验证事务零变化。
+- CRUD／关系回归覆盖教师、班级、教室、课程、班次分配、课程位置、共享 revision、旧 revision 409、无效／停用教室、Inactive 教师／教室 warning、首次排课重复 409、并发请求唯一赢家和退回待排区。
+- 使用 SQLite trigger 故障注入验证 DELETE 与 warning 重算原子回滚；同时验证受保护尾班的 ID／教师／revision，以及失败删除后的星期、开始时间、教室和 revision 全部不变。
+- 服务停止后直接执行 SQLite `RESTRICT`、`SET NULL`、`CASCADE`、`integrity_check` 和 `foreign_key_check`，确认教师、班级、教室、课程、班次和已排课程没有悬空关联。
+- 测试脚本各小区块均加入面向基础开发人员的中文注释；正常输出按业务保证分组，失败时只输出有上限的服务器日志尾部，便于定位且避免终端被大量资料淹没。
+- 保留老师工作树中尚未提交的 UX 测试命令、脚本和文档；本次只会局部暂存 `test`／`test:integration` 两条 package 命令和自己的集成测试文件。
+
+### 本次验证
+
+- `node --check scripts/verify-api-crud.mjs`、`git diff --check`、`npm run lint`、独立 TypeScript 检查与完整 `npm test` 全部通过；production build 的 24 个页面／API 成功生成。
+- 完整测试依次通过：身份保护与管理员、Excel 安全边界、Teaching allocation 五类重导关系、教师／班级／教室／课程／班次／排课 revision、注销、SQLite 外键与完整性。
+- 5,001 行工作簿拒绝前后的教师、班级、教室、课程、allocation、section、section-group 和 lesson 全表快照完全相同；Decoy 工作表没有建立 Worksheet 对象，数据库也没有 Decoy 课程。
+- 相同 Teaching allocation 重导后，课程 ID、两个班次 ID、第一班 revision 和人工维护第二班 revision 全部保持；人工教师和学生班级没有被 Excel 覆盖。缩减、Inactive 新增和已排课程重导的 409 前后完整业务快照相同；已排课程冲突工作簿还刻意修改目录并加入一门 companion 课程／教师，证明 409 前没有部分提交其他课程。
+- 两条并发 HTTP 首次排课请求严格得到一个 201 和一个带 `LESSON_ALREADY_SCHEDULED` 的 409；总表只有赢家一行，响应不含 SQLite／UNIQUE／constraint 文字。
+- warning trigger 故障时退回待排区得到安全 500，课程的星期、时间、教室和 revision 全部保持；移除 trigger 后用同一 revision 正常删除。
+- 手工发送 Ctrl-C 后进程使用标准退出码 130 结束，`os.tmpdir()` 下没有残留 `timetabling-api-crud-*`；完整正常测试退出码为 0，正式数据库修改时间仍为 `2026-08-11 01:06:13`。
+
+### 下一步
+
+1. 把同一课次首次排课的并发回归扩展到两个独立登录会话和两个共享 SQLite 的 standalone 进程；当前自动化已覆盖同进程并发请求，跨进程路径仍只有之前的一次性验收记录。
+2. 为学生班级、教室、规则与不可用时段的写入／warning 重算补齐 trigger 故障回滚，并统一未知数据库错误的 500 响应。
+3. 减少 `/api/issues` 每五秒触发的全库 warning 写入，补齐 runtime 数据库索引和满负载性能基准。
