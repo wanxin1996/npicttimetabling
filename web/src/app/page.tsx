@@ -323,12 +323,14 @@ export default function Home() {
   const [unscheduledGroupId, setUnscheduledGroupId] = useState("");
   const [unscheduledProgram, setUnscheduledProgram] = useState("");
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
-  // 总表默认只显示最重要的排课网格；老师需要课程或编辑资料时，再分别打开左右两侧的工具面板。
-  const [showUnscheduledDrawer, setShowUnscheduledDrawer] = useState(false);
+  // 老师进入年级总表后的主要动作是从待排清单开始放课，因此左侧待排区默认打开；仍可用顶部开关关闭并恢复全宽总表。
+  const [showUnscheduledDrawer, setShowUnscheduledDrawer] = useState(true);
   const [showTimetableInspector, setShowTimetableInspector] = useState(false);
   // 开关和关闭按钮的引用用于管理键盘焦点：打开面板后进入面板，关闭后回到原来的工具栏按钮。
   const unscheduledToggleButtonRef = useRef<HTMLButtonElement>(null);
   const unscheduledCloseButtonRef = useRef<HTMLButtonElement>(null);
+  // 记录上一次待排区状态，用来区分“页面载入时本来就打开”和“老师刚刚按开关打开”这两种情况。
+  const previousUnscheduledDrawerState = useRef(showUnscheduledDrawer);
   const inspectorToggleButtonRef = useRef<HTMLButtonElement>(null);
   const inspectorCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
@@ -376,8 +378,10 @@ export default function Home() {
   }, [recentlySavedLesson]);
 
   useEffect(() => {
-    // 待排抽屉完成渲染后，把键盘焦点移到明确的关闭按钮；Schedule 等原按钮即使被卸载，焦点也不会落回页面主体。
-    if (!showUnscheduledDrawer) return;
+    // 先保存本轮状态，只有从关闭变成打开时才把键盘焦点移到关闭按钮；页面首次载入虽然默认打开，但不会突然抢走登录后原有焦点。
+    const wasOpen = previousUnscheduledDrawerState.current;
+    previousUnscheduledDrawerState.current = showUnscheduledDrawer;
+    if (!showUnscheduledDrawer || wasOpen) return;
     const frame = window.requestAnimationFrame(() => unscheduledCloseButtonRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [showUnscheduledDrawer]);
