@@ -92,6 +92,7 @@ export type ScheduledLessonRecord = {
   durationHours: number;
   roomId: string | null;
   roomCode: string | null;
+  studentGroups: string[];
   occurrence: number;
   sessionsPerWeek: number;
   revision: number;
@@ -967,19 +968,23 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
       lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
       lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week,
       courses.week_start, courses.week_end,
-      rooms.code AS room_code
+      rooms.code AS room_code,
+      (SELECT GROUP_CONCAT(groups.code, ', ')
+        FROM section_student_groups links
+        JOIN student_groups groups ON groups.id = links.student_group_id
+        WHERE links.section_id = sections.id) AS student_groups
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
-  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null }>;
+  `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
   return rows.map((row) => {
     // Attach the highest issue level so the timetable card can use the same colour
     // standard as the consolidated issue list without reimplementing rule text.
     const warnings = JSON.parse(row.warnings_json) as string[];
-    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
@@ -998,7 +1003,11 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
       lessons.start_hour, lessons.duration_hours, lessons.room_id,
       lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week,
       courses.week_start, courses.week_end,
-      rooms.code AS room_code
+      rooms.code AS room_code,
+      (SELECT GROUP_CONCAT(groups.code, ', ')
+        FROM section_student_groups links
+        JOIN student_groups groups ON groups.id = links.student_group_id
+        WHERE links.section_id = sections.id) AS student_groups
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
@@ -1006,12 +1015,12 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE ${ownerFilter}
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null }>;
+  `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
   return rows.map((row) => {
     // Personal teacher, student and room views use the identical server-derived
     // issue level as the year master table.
     const warnings = JSON.parse(row.warnings_json) as string[];
-    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
+    return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
@@ -1361,7 +1370,10 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  // Return the linked class codes with the saved card so the UI does not need a
+  // second request before showing every resource assigned to the new lesson.
+  const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(section.id) as Array<{ code: string }>).map((group) => group.code);
+  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
@@ -1381,7 +1393,10 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   })();
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? warnings;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  // Keep mutation responses identical to normal timetable reads. This lets the card
+  // retain its student classes immediately after an edit without waiting for polling.
+  const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(lesson.section_id) as Array<{ code: string }>).map((group) => group.code);
+  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
