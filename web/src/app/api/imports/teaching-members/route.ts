@@ -25,34 +25,60 @@ function staffType(value: unknown): "FT" | "PT" | null {
 }
 
 export async function POST(request: Request) {
-  // 浏览器从 Courses 页面以 multipart 表单数据发送工作簿。
-  const formData = await request.formData();
+  // 浏览器从 Courses 页面以 multipart 表单数据发送工作簿。损坏的 multipart
+  // 请求会让 formData() 抛出异常，所以在读取文件前先转换成可理解的 400 提示。
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return NextResponse.json({ error: "The upload request could not be read. Please choose the file again." }, { status: 400 });
+  }
+
+  // multipart 中只接受名为 file 的真实文件，并在调用 Excel 解析器前验证扩展名。
   const file = formData.get("file");
   if (!file || typeof file === "string" || !file.name.toLowerCase().endsWith(".xlsx")) {
     return NextResponse.json({ error: "Please choose an .xlsx Teaching Members file." }, { status: 400 });
   }
-  // 已知工作簿约 16 MB；在分配完整内存缓冲区或让 SheetJS 解压之前，
-  // 先拒绝异常大的文件，防止意外或恶意消耗服务器内存。
+  // 已知工作簿约 16 MB；在复制文件到 Excel 解析缓冲区或让 SheetJS 解压之前，
+  // 先拒绝异常大的文件，减少意外或恶意输入继续消耗服务器内存的机会。
   if (file.size > maximumWorkbookBytes) {
     return NextResponse.json({ error: "The Teaching Members file must be 20 MB or smaller." }, { status: 413 });
   }
 
+  // 解析阶段只建立经过验证的内部资料，不在这里写数据库。这样能分别处理“文件有问题”
+  // 和“数据库暂时保存失败”，不会把服务器故障错误地说成老师选错了 Excel 文件。
+  const rows: TeachingMembersImportRow[] = [];
+  let ignoredZeroRows = 0;
   try {
-    // 只读取约定的工作表，文件中的其他工作表完全忽略，避免误导入不相关资料。
-    const workbook = XLSX.read(Buffer.from(await file.arrayBuffer()), { type: "buffer" });
+    // 只把约定工作表解析成单元格对象，避免继续处理其他工作表记录。SheetJS 仍需打开
+    // XLSX 压缩容器和共用资料，因此这个选项本身不能完全防止 ZIP 解压膨胀。
+    // sheetRows 包含表头，因此读取 5,002 行：1 行表头、最多 5,000 行业务资料，
+    // 再多读 1 行作为“确实超限”的证据，随后才能稳定区分 5,000 与 5,001 行。
+    const workbook = XLSX.read(Buffer.from(await file.arrayBuffer()), {
+      type: "buffer",
+      sheets: ["Teaching Members"],
+      sheetRows: maximumWorkbookRows + 2,
+    });
+
+    // 即使文件本身是合法 Excel，没有约定名称的工作表也不能继续导入。
     const worksheet = workbook.Sheets["Teaching Members"];
     if (!worksheet) return NextResponse.json({ error: "Sheet 'Teaching Members' was not found." }, { status: 400 });
+
+    // 把已受解析上限保护的工作表转换成对象；空单元格保留为 null，便于统一验证。
     const sheetRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(worksheet, { defval: null });
-    // 院系教学分配通常只有数百行。这个较宽松上限不会影响正常学期，
-    // 但能拦截意外膨胀或恶意构造的工作表。
-    if (sheetRows.length > maximumWorkbookRows) return NextResponse.json({ error: "The Teaching Members sheet must contain 5,000 rows or fewer." }, { status: 400 });
+    // 院系教学分配通常只有数百行。这个较宽松上限不会影响正常学期，且解析器
+    // 已经只多读取一行，因此这里不会先把任意数量的工作表记录全部放进内存。
+    // SheetJS 会在 sheetRows 截断了原始范围时写入 !fullref；同时检查它，避免前段
+    // 含空行时转换结果未超过 5,000 行，却把后面的真实资料静默遗漏后继续导入。
+    const workbookWasTruncated = Boolean(worksheet["!fullref"]);
+    if (workbookWasTruncated || sheetRows.length > maximumWorkbookRows) {
+      return NextResponse.json({ error: "The Teaching Members sheet must contain 5,000 rows or fewer." }, { status: 400 });
+    }
     // 读取数据行前先验证表头，防止旧模板被错误解释并导入不正确资料。
     const headers = new Set(Object.keys(sheetRows[0] ?? {}));
     const missing = requiredColumns.filter((column) => !headers.has(column));
     if (missing.length) return NextResponse.json({ error: `Missing required columns: ${missing.join(", ")}.` }, { status: 400 });
 
-    const rows: TeachingMembersImportRow[] = [];
-    let ignoredZeroRows = 0;
     const errors: string[] = [];
     // 把有效工作表行转换为数据库导入器所需的简洁内部格式。
     sheetRows.forEach((source, index) => {
@@ -74,7 +100,14 @@ export async function POST(request: Request) {
     // 只显示少量可操作的验证错误示例，避免一次输出过多信息让老师难以处理。
     if (errors.length) return NextResponse.json({ error: errors.slice(0, 3).join(" ") }, { status: 400 });
     if (!rows.some((row) => row.groupCount > 0)) return NextResponse.json({ error: "No positive teaching allocations were found in this file." }, { status: 400 });
+  } catch (error) {
+    // 解析器无法识别的文件只在服务器记录技术细节；浏览器收到安全且可操作的说明。
+    console.error("Teaching Members workbook could not be parsed", error);
+    return NextResponse.json({ error: "The file could not be read. Please use the Teaching Members export format." }, { status: 400 });
+  }
 
+  try {
+    // 所有工作表验证通过后，才交给数据库事务一次性更新教师、课程、分配与班次。
     return NextResponse.json(importTeachingMembers(rows, ignoredZeroRows));
   } catch (error) {
     // 已知的资料保护冲突本身就是用户提示，因此保留原文并返回 409；
@@ -82,9 +115,9 @@ export async function POST(request: Request) {
     if (error instanceof TeachingAllocationImportConflictError) {
       return NextResponse.json({ error: error.message }, { status: 409 });
     }
-    // 未预期的解析或数据库错误只记录在服务器；浏览器收到安全的通用说明，
-    // 不会暴露文件内容或 SQLite 内部细节。
-    console.error("Teaching Members import failed", error);
-    return NextResponse.json({ error: "The file could not be read. Please use the Teaching Members export format." }, { status: 400 });
+    // 未预期的数据库错误返回 500，提醒老师稍后重试；底层 SQL、触发器和文件内容
+    // 只写入服务器日志，不会在浏览器响应中泄露。
+    console.error("Teaching Members data could not be saved", error);
+    return NextResponse.json({ error: "Teaching allocations could not be saved. Please try again." }, { status: 500 });
   }
 }
