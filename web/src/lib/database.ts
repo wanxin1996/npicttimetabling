@@ -1693,23 +1693,71 @@ function listSectionStudentGroupAssignments(db: DatabaseInstance, sectionId: str
   `).all(sectionId) as Array<{ id: string; code: string }>;
 }
 
+export class ScheduledLessonPlacementConflictError extends Error {
+  // 首次排课没有可供浏览器提交的 revision，因此用“班次 + 每周课次”的唯一键判断
+  // 是否已被另一位老师先放入总表。专用错误类型让 API 可以准确返回 409。
+  constructor() {
+    super("This weekly session has already been placed by another scheduler.");
+    this.name = "ScheduledLessonPlacementConflictError";
+  }
+}
+
+export class ScheduledLessonPlacementInputError extends Error {
+  // 已知的班次、时间和教室输入问题可以安全显示；其他 SQLite 异常必须留在服务端日志中。
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduledLessonPlacementInputError";
+  }
+}
+
+function isScheduledOccurrenceUniqueError(error: unknown) {
+  // 预先查询能提供友好提示，但多个应用进程仍可能在查询后同时写入。
+  // 这里依赖 SQLite 的稳定错误代码而不是可能随版本或语言变化的英文错误文字。
+  // 当前事务只有 scheduled_lessons INSERT 会触发唯一键，所以这个代码可以准确代表同一课次已存在。
+  return error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_UNIQUE";
+}
+
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
   // 即使存在警告，也按用户要求创建整点课程并保存警告内容；
-  // 随后返回完整卡片数据，让浏览器立即展示排课结果和提醒。
+  // 新课程、关联警告和返回资料放在同一个事务中，任一步失败都不会留下半完成排课。
   const db = database();
-  const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
-  if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
-  if (!Number.isInteger(input.occurrence) || input.occurrence < 1 || input.occurrence > section.sessions_per_week) throw new Error("Choose a valid weekly session before placement.");
-  if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new Error("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
-  const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
-  const id = crypto.randomUUID();
-  db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
-  const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
-  const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  // 保存后连同关联班级编号一起返回，使界面无需再次请求，
-  // 就能立即显示新课程分配的教师、班级和教室等完整资源。
-  const studentGroupAssignments = listSectionStudentGroupAssignments(db, section.id);
-  return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  const placementTransaction = db.transaction(() => {
+    const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
+    if (!section || !section.duration_hours) throw new ScheduledLessonPlacementInputError("Section must have a course duration before placement.");
+    if (!Number.isInteger(input.occurrence) || input.occurrence < 1 || input.occurrence > section.sessions_per_week) throw new ScheduledLessonPlacementInputError("Choose a valid weekly session before placement.");
+    if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new ScheduledLessonPlacementInputError("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
+
+    // 如果另一个账号已经保存同一课次，就在运行警告引擎前尽早停止；
+    // 数据库唯一键仍是最终保护，负责覆盖两个服务器进程真正同时写入的极短竞态窗口。
+    const existingLesson = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? AND occurrence = ?").get(input.sectionId, input.occurrence);
+    if (existingLesson) throw new ScheduledLessonPlacementConflictError();
+
+    // 只允许选择仍启用的教室。候选清单生成后教室也可能被其他账号停用，
+    // 所以正式保存时必须重新检查，而不能相信浏览器中的旧下拉选项。
+    const room = input.roomId
+      ? db.prepare("SELECT code FROM rooms WHERE id = ? AND is_active = 1").get(input.roomId) as { code: string } | undefined
+      : undefined;
+    if (input.roomId && !room) throw new ScheduledLessonPlacementInputError("Choose an active room.");
+
+    const conflicts = calculatePlacementWarnings(db, { sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours });
+    const id = crypto.randomUUID();
+    try {
+      db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
+    } catch (error) {
+      if (isScheduledOccurrenceUniqueError(error)) throw new ScheduledLessonPlacementConflictError();
+      throw error;
+    }
+
+    const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
+    // 保存后连同关联班级编号一起返回，使界面无需再次请求，
+    // 就能立即显示新课程分配的教师、班级和教室等完整资源。
+    const studentGroupAssignments = listSectionStudentGroupAssignments(db, section.id);
+    return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
+  });
+
+  // IMMEDIATE 在事务开始时取得写入预留锁，使两个服务器进程不会都先读取到“尚未排课”再互相争抢写锁。
+  // 即使部署环境未能串行化，INSERT 的唯一键捕获仍会把后提交者转换为相同的业务冲突。
+  return placementTransaction.immediate();
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; studentGroupIds: string[]; revision: number }): ScheduledLessonRecord {

@@ -148,7 +148,7 @@ function noticeTone(message: string) {
   if (["could not", "unable", "failed", "error", "interrupted", "expired"].some((word) => normalized.includes(word))) return "border-red-200 bg-red-50 text-red-900";
   // “no warnings”虽然包含 warnings 单词，实际含义是成功；因此必须先识别完整成功短语，再处理一般警告文字，避免成功结果被误标成黄色。
   if (["no warnings", "successfully", "downloaded as", "full system restored"].some((phrase) => normalized.includes(phrase))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
-  if (["warning", "mismatch", "no completely clear"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
+  if (["warning", "mismatch", "no completely clear", "another scheduler", "already been placed"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
   if (["saved", "success", "placed", "updated", "created", "ready", "signed in"].some((word) => normalized.includes(word))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
   return "border-slate-200 bg-white text-slate-800";
 }
@@ -382,6 +382,10 @@ export default function Home() {
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [scheduleIssues, setScheduleIssues] = useState<ScheduleIssue[]>([]);
   const [placingSection, setPlacingSection] = useState<UnscheduledSection | null>(null);
+  // 首次排课的三个入口共用同一把即时锁：ref 在第一次操作同步生效，state 则负责显示 Placing 和停用按钮。
+  // 这样快速双击候选位置或重复提交 Inspector 时，只会真正建立一条课次记录。
+  const placingSessionKeyRef = useRef<string | null>(null);
+  const [placingSessionKey, setPlacingSessionKey] = useState<string | null>(null);
   const [candidateSection, setCandidateSection] = useState<UnscheduledSection | null>(null);
   const [candidateSlots, setCandidateSlots] = useState<CandidateSlot[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
@@ -513,20 +517,43 @@ export default function Home() {
     setCandidateSlots([]);
   }
 
-  async function openTimetable(year: number) {
+  async function openTimetable(year: number, signal?: AbortSignal): Promise<boolean> {
     // 系里分别维护三个年级总表，因此这里只加载一个年级的已排课程、待排课程和问题，减少页面数据量并保持年级边界清楚。
-    const [lessonResponse, unscheduledResponse, issuesResponse] = await Promise.all([fetch(`/api/schedule/lessons?year=${year}`), fetch(`/api/schedule/unscheduled?year=${year}`), fetch("/api/issues")]);
-    if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok) return setNotice("The year timetable could not be loaded.");
-    setTimetableYear(year);
-    setLessons(await lessonResponse.json());
-    setUnscheduledSections(await unscheduledResponse.json());
-    setScheduleIssues(await issuesResponse.json());
-    setView("Year timetables");
-    setShowForm(false);
-    setEditingLesson(null);
-    setPlacingSection(null);
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    // 返回 boolean 让多人冲突处理能够准确说明“最新资料已重载”或“需要手动刷新”，不能给老师错误的成功保证。
+    // 可选 signal 只由首次排课链传入，使 POST 成功后的三个刷新请求也受同一个 30 秒总时限保护。
+    try {
+      const [lessonResponse, unscheduledResponse, issuesResponse] = await Promise.all([
+        fetch(`/api/schedule/lessons?year=${year}`, { signal }),
+        fetch(`/api/schedule/unscheduled?year=${year}`, { signal }),
+        fetch("/api/issues", { signal }),
+      ]);
+      if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok) {
+        setNotice("The year timetable could not be loaded.");
+        return false;
+      }
+      // 三个响应必须全部成功解析后才一起写入 React state；若网络在解析中断，
+      // 页面会完整保留上一版，而不会出现“新课程 + 旧待排区 + 旧问题”的混合画面。
+      const [nextLessons, nextUnscheduledSections, nextScheduleIssues] = await Promise.all([
+        lessonResponse.json() as Promise<ScheduledLesson[]>,
+        unscheduledResponse.json() as Promise<UnscheduledSection[]>,
+        issuesResponse.json() as Promise<ScheduleIssue[]>,
+      ]);
+      setTimetableYear(year);
+      setLessons(nextLessons);
+      setUnscheduledSections(nextUnscheduledSections);
+      setScheduleIssues(nextScheduleIssues);
+      setView("Year timetables");
+      setShowForm(false);
+      setEditingLesson(null);
+      setPlacingSection(null);
+      setCandidateSection(null);
+      setCandidateSlots([]);
+      return true;
+    } catch {
+      // 断网或服务器重启时 fetch 会直接抛错；保持当前画面并允许老师稍后重试。
+      setNotice("The year timetable could not be loaded. Check the connection and try again.");
+      return false;
+    }
   }
 
   async function openScheduleIssue(issue: ScheduleIssue) {
@@ -603,6 +630,67 @@ export default function Home() {
     setPersonalLessons(await response.json());
   }
 
+  async function requestLessonPlacement(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }) {
+    // 拖放、Inspector 表单和 Clear slots 都通过这里建立新课次，保证它们使用相同的防重复、409 刷新和断网处理。
+    const sessionKey = `${input.sectionId}:${input.occurrence}`;
+    if (placingSessionKeyRef.current) {
+      setNotice("Another session placement is still in progress. Wait for it to finish before placing the next session.");
+      return null;
+    }
+
+    placingSessionKeyRef.current = sessionKey;
+    setPlacingSessionKey(sessionKey);
+    // 连接长时间没有响应时主动释放全局锁；30 秒足够本地 SQLite 完成正常保存和随后刷新，
+    // 同时避免断网后整个排课界面一直保持禁用，只能靠重新载入页面恢复。
+    const requestController = new AbortController();
+    let placementTimedOut = false;
+    const requestTimeout = window.setTimeout(() => {
+      placementTimedOut = true;
+      requestController.abort();
+    }, 30_000);
+    try {
+      const response = await fetch("/api/schedule/lessons", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+        signal: requestController.signal,
+      });
+      const body = await response.json() as ScheduledLesson & { code?: string; error?: string };
+
+      if (response.status === 409 && body.code === "LESSON_ALREADY_SCHEDULED") {
+        // 另一账号已先完成同一课次时，必须重新读取总表和待排清单；
+        // 否则旧卡片仍留在待排区，老师很容易继续重复操作或误判保存位置。
+        const timetableReloaded = await openTimetable(timetableYear, requestController.signal);
+        window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
+        const conflictMessage = body.error ?? "This weekly session has already been placed by another scheduler.";
+        setNotice(timetableReloaded
+          ? `${conflictMessage} The latest timetable has been reloaded; review its saved position before continuing.`
+          : `${conflictMessage} The latest timetable could not be reloaded. Refresh the page before continuing.`);
+        return null;
+      }
+      if (!response.ok) {
+        setNotice(body.error ?? "The section could not be placed.");
+        return null;
+      }
+      // 成功后的完整刷新仍属于同一次保存：锁必须保持到旧待排卡消失，
+      // 否则慢速网络下老师可能再次拖动仍显示在页面上的同一课次。
+      const timetableReloaded = await openTimetable(timetableYear, requestController.signal);
+      window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
+      return { lesson: body, timetableReloaded };
+    } catch {
+      // 网络异常时服务器是否收到请求并不确定，不能鼓励老师立刻重复点击；
+      // 明确要求先刷新，借由唯一键确认该课次究竟是否已经保存。
+      setNotice(placementTimedOut
+        ? "The placement request timed out. Refresh the timetable before trying this session again."
+        : "The placement result could not be confirmed. Refresh the timetable before trying this session again.");
+      return null;
+    } finally {
+      window.clearTimeout(requestTimeout);
+      placingSessionKeyRef.current = null;
+      setPlacingSessionKey(null);
+    }
+  }
+
   async function placeSection(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
     // 拖动资料只负责标识班次或已排课程；服务端会重新读取课时、教师和班级，浏览器端即使被修改也不能绕过排课规则。
     event.preventDefault();
@@ -634,10 +722,10 @@ export default function Home() {
     if (!draggedSession) return;
     const [sectionId, occurrenceText] = draggedSession.split(":");
     const occurrence = Number(occurrenceText ?? 1);
-    const response = await fetch("/api/schedule/lessons", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionId, occurrence, dayOfWeek, startHour, roomId: null }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
-    await openTimetable(timetableYear);
+    const placement = await requestLessonPlacement({ sectionId, occurrence, dayOfWeek, startHour, roomId: null });
+    if (!placement) return;
+    const body = placement.lesson;
+    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`);
     revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully. Assign its room next.`);
   }
@@ -662,12 +750,10 @@ export default function Home() {
     // 候选项已经包含校验过的教室，老师可一次点击完成排课；正式保存时接口仍会再次运行警告引擎，防止候选生成后资料发生变化。
     if (!candidateSection) return;
     const [sectionId] = candidateSection.id.split(":");
-    const response = await fetch("/api/schedule/lessons", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionId, occurrence: candidateSection.occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "The candidate placement could not be saved.");
-    setCandidateSection(null);
-    setCandidateSlots([]);
-    await openTimetable(timetableYear);
+    const placement = await requestLessonPlacement({ sectionId, occurrence: candidateSection.occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId });
+    if (!placement) return;
+    const body = placement.lesson;
+    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`);
     revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} changed while placing and now has warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed in ${slot.roomCode} with no warnings.`);
   }
@@ -678,21 +764,16 @@ export default function Home() {
     if (!placingSection) return;
     const data = new FormData(event.currentTarget);
     const [sectionId] = placingSection.id.split(":");
-    const response = await fetch("/api/schedule/lessons", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sectionId,
-        occurrence: placingSection.occurrence,
-        dayOfWeek: Number(data.get("dayOfWeek")),
-        startHour: Number(data.get("startHour")),
-        roomId: String(data.get("roomId") ?? "") || null,
-      }),
+    const placement = await requestLessonPlacement({
+      sectionId,
+      occurrence: placingSection.occurrence,
+      dayOfWeek: Number(data.get("dayOfWeek")),
+      startHour: Number(data.get("startHour")),
+      roomId: String(data.get("roomId") ?? "") || null,
     });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "The section could not be placed.");
-    setPlacingSection(null);
-    await openTimetable(timetableYear);
+    if (!placement) return;
+    const body = placement.lesson;
+    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`);
     revealSavedLesson(body.id);
     setNotice(body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully.`);
   }
@@ -1359,7 +1440,7 @@ export default function Home() {
                 </div>
                 <div className="grid min-h-0 flex-1 content-start gap-2 overflow-y-auto pr-1">
                   {filteredUnscheduledSections.map((section) => (
-                    <div key={section.id} draggable onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, section.label); }} className={`cursor-grab rounded-lg border p-2 text-[11px] active:cursor-grabbing ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
+                    <div key={section.id} draggable={placingSessionKey === null} onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, section.label); }} className={`rounded-lg border p-2 text-[11px] ${placingSessionKey ? "cursor-wait opacity-60" : "cursor-grab active:cursor-grabbing"} ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
                       <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
                       <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
@@ -1367,6 +1448,7 @@ export default function Home() {
                       <div className="mt-1.5 grid grid-cols-2 gap-1">
                         <button
                           draggable={false}
+                          disabled={placingSessionKey !== null}
                           onClick={(event) => {
                             event.stopPropagation();
                             setShowUnscheduledDrawer(false);
@@ -1375,20 +1457,21 @@ export default function Home() {
                             setEditingLesson(null);
                             setCandidateSection(null);
                           }}
-                          className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white"
+                          className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white disabled:cursor-wait disabled:opacity-50"
                           type="button"
                         >
                           Schedule
                         </button>
                         <button
                           draggable={false}
+                          disabled={placingSessionKey !== null}
                           onClick={(event) => {
                             event.stopPropagation();
                             setShowUnscheduledDrawer(false);
                             setShowTimetableInspector(true);
                             void findCandidateSlots(section);
                           }}
-                          className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400"
+                          className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400 disabled:cursor-wait disabled:opacity-50"
                           type="button"
                         >
                           Clear slots
@@ -1490,8 +1573,77 @@ export default function Home() {
                   {/* 学生班级选择器使用 form 属性连接到下方编辑表单，因此可以保持独立、易读的代码区块，同时仍由同一个 Save changes 一次提交。 */}
                   {editingLesson && <div className="mb-3"><StudentGroupSelector key={`${editingLesson.id}:${editingLesson.revision}`} groups={groups} selectedIds={editingLesson.studentGroupIds} /></div>}
                   {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
-                  : placingSection ? <form onSubmit={placeSectionWithoutDrag} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Schedule {placingSection.label}</p><p className="text-xs text-slate-500">Keyboard and click alternative to dragging</p></div><button onClick={() => setPlacingSection(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div><div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900"><p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p><p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p></div><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + placingSection.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Assign later</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><button className="rounded-lg bg-[#153d75] px-3 py-2.5 text-sm font-bold text-white" type="submit">Place session</button><button onClick={() => void findCandidateSlots(placingSection)} className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-bold text-emerald-800" type="button">Show only clear options</button></form>
-                  : candidateSection ? <div><div className="flex items-start justify-between gap-2"><div><p className="font-black text-emerald-950">Clear slots</p><p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p> : <div className="mt-3 grid gap-2">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500" type="button"><span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span><span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span></button>)}</div>}</div>
+                  : placingSection ? (
+                    <form onSubmit={placeSectionWithoutDrag} className="grid gap-3">
+                      {/* 标题区始终保留当前班次编号；保存进行中不允许关闭，避免老师误以为请求已经取消。 */}
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="font-black text-slate-950">Schedule {placingSection.label}</p>
+                          <p className="text-xs text-slate-500">Keyboard and click alternative to dragging</p>
+                        </div>
+                        <button onClick={() => setPlacingSection(null)} disabled={placingSessionKey !== null} className="text-xs font-bold text-slate-500 disabled:cursor-wait disabled:opacity-50" type="button">Close</button>
+                      </div>
+
+                      {/* 共享教师、学生班级和课时来自班次资料；首次放置这里只决定时间与教室。 */}
+                      <div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900">
+                        <p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p>
+                        <p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p>
+                      </div>
+
+                      {/* 请求发出后锁定三个选择器，确保按钮显示的资料与服务器实际收到的资料完全一致。 */}
+                      <label className="text-xs font-semibold text-slate-700">
+                        Day
+                        <select name="dayOfWeek" disabled={placingSessionKey !== null} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
+                          {["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold text-slate-700">
+                        Start hour
+                        <select name="startHour" disabled={placingSessionKey !== null} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
+                          {timetableHours.filter((hour) => hour + placingSection.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold text-slate-700">
+                        Room
+                        <select name="roomId" disabled={placingSessionKey !== null} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
+                          <option value="">Assign later</option>
+                          {rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
+                        </select>
+                      </label>
+
+                      {/* 主按钮提供明确的进行中状态；候选搜索同时停用，防止同一 Inspector 发起第二条异步流程。 */}
+                      <button disabled={placingSessionKey !== null} className="rounded-lg bg-[#153d75] px-3 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{placingSessionKey ? "Placing..." : "Place session"}</button>
+                      <button onClick={() => void findCandidateSlots(placingSection)} disabled={placingSessionKey !== null} className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-bold text-emerald-800 disabled:cursor-wait disabled:opacity-50" type="button">Show only clear options</button>
+                    </form>
+                  ) : candidateSection ? (
+                    <div>
+                      {/* 候选结果属于当前班次；保存期间保持面板可见但锁定关闭和其他候选，避免请求上下文被切换。 */}
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="font-black text-emerald-950">Clear slots</p>
+                          <p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p>
+                        </div>
+                        <button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} disabled={placingSessionKey !== null} className="text-xs font-bold text-slate-500 disabled:cursor-wait disabled:opacity-50" type="button">Close</button>
+                      </div>
+                      {placingSessionKey && <p className="mt-3 rounded-lg bg-blue-50 p-2 text-xs font-bold text-blue-800" role="status">Placing the selected option...</p>}
+
+                      {/* 搜索中、没有结果和可选结果分别显示，不让空白面板掩盖当前系统状态。 */}
+                      {candidatesLoading ? (
+                        <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p>
+                      ) : candidateSlots.length === 0 ? (
+                        <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p>
+                      ) : (
+                        <div className="mt-3 grid gap-2">
+                          {candidateSlots.map((slot) => (
+                            <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} disabled={placingSessionKey !== null} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500 disabled:cursor-wait disabled:opacity-50" type="button">
+                              <span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span>
+                              <span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )
                   : <div><p className="text-xs leading-5 text-slate-500">Select a lesson to edit it, or choose Schedule on an unscheduled session.</p><div className="my-3 border-t border-slate-100" /><div className="mb-2 flex items-center justify-between"><p className="text-sm font-black text-slate-950">Year {timetableYear} issues</p><button onClick={() => void openRules()} className="text-xs font-bold text-blue-700" type="button">All rules</button></div>{visibleYearIssues.length === 0 ? <p className="rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">No issues in this year.</p> : <div className="grid gap-2">{visibleYearIssues.map((issue) => <button key={issue.id} onClick={() => void openScheduleIssue(issue)} className="rounded-xl border border-slate-200 p-2.5 text-left text-xs hover:border-blue-300 hover:bg-blue-50" type="button"><span className="flex items-center justify-between gap-2"><span className="font-black text-slate-900">{issue.sectionLabel}</span><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill></span><span className="mt-1 block font-semibold text-slate-700">{issue.message}</span><span className="mt-1 block text-slate-500">{timetableDays[issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00</span></button>)}</div>}</div>}
                 </div>
                 </aside>}
