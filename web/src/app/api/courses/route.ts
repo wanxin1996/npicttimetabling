@@ -4,13 +4,12 @@ import { createManualCourse, listCourses } from "@/lib/database";
 export const runtime = "nodejs";
 
 export function GET() {
-  // The Courses view uses this read-only endpoint after loading or importing data.
+  // Courses 页面在初次加载或导入数据后，通过这个只读接口取得课程清单。
   return NextResponse.json(listCourses());
 }
 
 export async function POST(request: Request) {
-  // Manual creation is the correction path when the allocation workbook omits a
-  // course; it creates unassigned sections without fabricating allocation totals.
+  // 教学分配工作簿遗漏课程时可手动补录；系统会建立未分配班次，但不会虚构教师分配数量。
   const body = await request.json();
   const code = String(body.code ?? "").trim().toUpperCase();
   const catalog = String(body.catalog ?? "").trim() || null;

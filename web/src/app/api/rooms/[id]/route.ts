@@ -3,17 +3,16 @@ import { setRoomStatus, updateRoom } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  // Read the room id from the URL and decide whether this is a status toggle or a
-  // complete room-details edit from the data-management form.
+  // 从 URL 读取教室 ID，并判断请求是简单状态切换，还是资料管理表单提交的完整编辑。
   const { id } = await context.params;
   const body = await request.json();
   if (typeof body.isActive === "boolean" && body.code === undefined) {
-    // Status toggles remain non-destructive, preserving any lessons using the room.
+    // 状态切换不删除资料，因此已经使用该教室的课程记录仍然完整保留。
     if (!setRoomStatus(id, body.isActive)) return Response.json({ error: "Room not found." }, { status: 404 });
     return Response.json({ ok: true });
   }
 
-  // Room addresses use Block-Level-Room so the first segment can drive travel warnings.
+  // 教室地址采用 Block-Level-Room 格式，第一段楼栋编号用于连续课程跨楼提醒。
   const code = String(body.code ?? "").trim().toUpperCase();
   const capacity = Number(body.capacity);
   const addressParts = code.split("-");
@@ -26,8 +25,8 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     if (!updated) return Response.json({ error: "Room not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch {
-    // The unique room-code constraint gives staff a clear correction instead of a
-    // generic database error if another room already uses the new address.
+    // 若新地址已被其他教室使用，把数据库唯一约束转换成清楚的修正提示，
+    // 而不是返回笼统数据库错误。
     return Response.json({ error: "A room with this code already exists." }, { status: 409 });
   }
 }

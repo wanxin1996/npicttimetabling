@@ -5,8 +5,7 @@ const projectRoot = process.cwd();
 const standaloneRoot = path.join(projectRoot, ".next", "standalone");
 
 async function exists(sourcePath) {
-  // `stat` is used instead of assuming a public folder exists, because Next.js
-  // projects are allowed to omit it entirely.
+  // 使用 stat 检查目录，而不是假设 public 一定存在，因为 Next.js 项目可以完全不提供它。
   try {
     await stat(sourcePath);
     return true;
@@ -17,14 +16,14 @@ async function exists(sourcePath) {
 }
 
 async function copyDirectory(sourcePath, destinationPath) {
-  // Next.js traces server dependencies into the standalone folder but deliberately
-  // leaves browser assets outside. Copy both directories so one artifact is runnable.
+  // Next.js 会把服务器依赖追踪到 standalone 目录，却刻意把浏览器静态资源留在外部；
+  // 因此这里复制所需目录，使单一构建产物能够直接运行。
   if (!(await exists(sourcePath))) return;
   await mkdir(path.dirname(destinationPath), { recursive: true });
   await cp(sourcePath, destinationPath, { recursive: true, force: true });
 }
 
-// Compiled browser chunks must remain under `.next/static`, while files from the
-// project's public directory are served directly from the standalone root.
+// 编译后的浏览器代码块必须保留在 .next/static 路径下；
+// 项目 public 目录中的文件则从 standalone 根目录直接提供。
 await copyDirectory(path.join(projectRoot, ".next", "static"), path.join(standaloneRoot, ".next", "static"));
 await copyDirectory(path.join(projectRoot, "public"), path.join(standaloneRoot, "public"));

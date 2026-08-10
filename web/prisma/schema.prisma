@@ -1,17 +1,17 @@
 generator client {
-  // Generate the typed client outside the source tree so the app can import it cleanly.
+  // 在源代码目录之外生成带类型的客户端，使应用导入路径清晰且不会混入手写代码。
   provider = "prisma-client"
   output   = "../generated/prisma"
 }
 
 datasource db {
-  // The running local application uses SQLite. Field and table mappings below mirror
-  // its real snake_case schema so this file can become a trustworthy migration source.
+  // 当前本地应用使用 SQLite。下面的字段和表映射准确对应真实 snake_case 结构，
+  // 让本文件未来能够作为可信的数据库迁移来源。
   provider = "sqlite"
 }
 
 model AppUser {
-  // The first account is administrator; later scheduler accounts share timetable access.
+  // 第一个账号是管理员；后续排课账号共享时间表访问权限，但不能管理账号。
   id           String   @id @default(uuid())
   username     String   @unique
   passwordHash String   @map("password_hash")
@@ -25,7 +25,7 @@ model AppUser {
 }
 
 model AuthSession {
-  // Only a digest of the random cookie token is stored; sessions expire after 12 hours.
+  // 数据库只保存随机 Cookie 令牌的摘要；每个登录会话在 12 小时后过期。
   tokenHash String   @id @map("token_hash")
   expiresAt DateTime @map("expires_at")
   createdAt DateTime @default(now()) @map("created_at")
@@ -37,7 +37,7 @@ model AuthSession {
 }
 
 model Teacher {
-  // A teacher can be linked to imported allocations, generated course sections and blocked periods.
+  // 一位教师可以关联导入的教学分配、生成的课程班次以及个人不可用时段。
   id        String   @id @default(uuid())
   name      String   @unique
   staffType String   @default("FT") @map("staff_type")
@@ -54,7 +54,7 @@ model Teacher {
 }
 
 model StudentGroup {
-  // A student group is one class whose timetable must never overlap with itself.
+  // 一个学生班级代表共同上课的同一组学生，其时间表发生重叠时必须提示冲突。
   id        String   @id @default(uuid())
   code      String   @unique
   year      Int
@@ -69,7 +69,7 @@ model StudentGroup {
 }
 
 model Room {
-  // Room facilities support requirement matching and the block supports travel warnings.
+  // 教室设施用于匹配课程要求，Block 楼栋信息则用于连续课程跨楼提醒。
   id                String   @id @default(uuid())
   code              String   @unique
   block             String?
@@ -88,7 +88,7 @@ model Room {
 }
 
 model Course {
-  // A course defines shared teaching requirements; individual sections are created underneath it.
+  // 课程保存所有班次共用的教学要求，具体的 LEAD_01 等班次在其下生成。
   id                         String   @id @default(uuid())
   code                       String   @unique
   catalog                    String?
@@ -100,9 +100,9 @@ model Course {
   requiresMultiProjector     Boolean  @default(false) @map("requires_multi_projector")
   requiresSmartClassroom     Boolean  @default(false) @map("requires_smart_classroom")
   separateSectionsAcrossDays Boolean  @default(false) @map("separate_sections_across_days")
-  // Legacy quick-pattern value retained for compatibility with older local backups.
+  // 保留旧版快捷周次字段，用于兼容较早版本生成的本地备份。
   weekPattern                String   @default("ALL") @map("week_pattern")
-  // Null/null means all weeks; otherwise both positive bounds define the interval.
+  // 开始周和结束周都为空表示全学期；否则两个正整数共同定义实际上课周次范围。
   weekStart                  Int?     @map("week_start")
   weekEnd                    Int?     @map("week_end")
   createdAt                  DateTime @default(now()) @map("created_at")
@@ -115,7 +115,7 @@ model Course {
 }
 
 model TeachingAllocation {
-  // This records how many sections of one course a specific teacher is expected to teach.
+  // 此表记录教学分配中某位教师预计承担某门课程的班次数量。
   id                 String @id @default(uuid())
   assignedGroupCount Int    @map("assigned_group_count")
 
@@ -129,7 +129,7 @@ model TeachingAllocation {
 }
 
 model CourseSection {
-  // A section is the draggable unit, for example LEAD_01, with one assigned teacher.
+  // 课程班次是可拖放的基本单位，例如 LEAD_01，并且只分配一位任课教师。
   id       String @id @default(uuid())
   sequence Int
 
@@ -147,7 +147,7 @@ model CourseSection {
 }
 
 model SectionStudentGroup {
-  // This join table supports both normal and cross-year classes in the same section.
+  // 此关联表让同一课程班次既能连接普通单年级班级，也能连接多个跨年级班级。
   sectionId      String @map("section_id")
   studentGroupId String @map("student_group_id")
 
@@ -160,7 +160,7 @@ model SectionStudentGroup {
 }
 
 model ScheduledLesson {
-  // One section can meet multiple times each week and can use a different room per meeting.
+  // 同一班次每周可以上多次课，而且每次课允许使用不同教室。
   id            String @id @default(uuid())
   occurrence    Int    @default(1)
   dayOfWeek     Int    @map("day_of_week")
@@ -181,7 +181,7 @@ model ScheduledLesson {
 }
 
 model TeacherUnavailableWindow {
-  // A hard unavailable window is checked whenever a lesson is placed for this teacher.
+  // 给教师安排任何课程时，系统都会检查其严格不可用时段并产生警告。
   id        String @id @default(uuid())
   dayOfWeek Int    @map("day_of_week")
   startHour Int    @map("start_hour")
@@ -195,7 +195,7 @@ model TeacherUnavailableWindow {
 }
 
 model YearBlockedWindow {
-  // A year-level blocked window captures rules such as a Wednesday without classes.
+  // 年级禁排时段用于表达“整个星期三不上课”等适用于该年级所有学生的限制。
   id        String @id @default(uuid())
   year      Int
   dayOfWeek Int    @map("day_of_week")
@@ -207,7 +207,7 @@ model YearBlockedWindow {
 }
 
 model RuleSetting {
-  // Feature flags let future rule changes be enabled or disabled without deleting data.
+  // 规则功能开关让未来新增或调整的政策可以启用、停用，而无需删除任何排课数据。
   key       String  @id @map("rule_key")
   isEnabled Boolean @default(true) @map("is_enabled")
 
@@ -215,7 +215,7 @@ model RuleSetting {
 }
 
 model ScheduleBackup {
-  // A serialized snapshot is kept before a new scheduling cycle replaces the old one.
+  // 开始新排课周期并替换旧数据前，系统会保存一份序列化紧急快照。
   id           String   @id @default(uuid())
   snapshotJson String   @map("snapshot_json")
   createdAt    DateTime @default(now()) @map("created_at")

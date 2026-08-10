@@ -1,17 +1,15 @@
 import { listRuleSettings, updateRuleSetting } from "@/lib/database";
 
-// Policy switches are editable by schedulers; core conflict checks are deliberately
-// not exposed here and therefore remain permanently active.
+// 排课老师可以修改政策规则开关；核心资源冲突刻意不在此接口暴露，因此始终启用。
 export const runtime = "nodejs";
 
 export async function GET() {
-  // Every signed-in scheduler receives the same enabled/disabled rule catalogue.
+  // 所有已登录排课老师查看并使用同一份规则启用/停用清单。
   return Response.json(listRuleSettings());
 }
 
 export async function PATCH(request: Request) {
-  // Save one known rule toggle; changing its state immediately refreshes all saved
-  // lesson warnings in the database layer.
+  // 每次只保存一个已登记规则开关；状态改变后，数据库层立即刷新所有已排课程警告。
   const body = await request.json();
   if (typeof body.key !== "string" || typeof body.enabled !== "boolean") return Response.json({ error: "Rule key and enabled state are invalid." }, { status: 400 });
   if (!updateRuleSetting(body.key, body.enabled)) return Response.json({ error: "Rule setting not found." }, { status: 404 });

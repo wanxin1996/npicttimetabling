@@ -1,17 +1,16 @@
 import { listCourseSections, resizeCourseSections } from "@/lib/database";
 
-// This route reads generated sections for one selected course in the Node runtime.
+// 此路由在 Node 环境中读取某一门选定课程生成的全部班次。
 export const runtime = "nodejs";
 
 export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
-  // Keeping the course id in the URL avoids returning hundreds of sections at once.
+  // 把课程 ID 放入 URL，只返回当前课程班次，避免一次发送数百条无关资料。
   const { id } = await context.params;
   return Response.json(listCourseSections(id));
 }
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  // Staff can correct an incorrect Excel total without renaming or recreating the
-  // lower-numbered sections that already contain useful assignments.
+  // 老师可修正 Excel 中错误的班次总数，同时保留低编号班次的名称及已有教师、班级分配。
   const { id } = await context.params;
   const body = await request.json();
   const sectionCount = Number(body.sectionCount);

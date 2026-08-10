@@ -3,7 +3,7 @@ import { updateStudentGroup } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  // Read and normalise every editable field using the same rules as group creation.
+  // 使用与新增班级相同的规则读取并标准化每个可编辑字段，保持资料格式一致。
   const { id } = await context.params;
   const body = await request.json();
   const code = String(body.code ?? "").trim().toUpperCase();
@@ -14,7 +14,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   }
 
   try {
-    // Updating in place keeps all existing section-to-student-group assignments.
+    // 原记录就地更新并保留稳定 ID，因此所有现有课程班次关联继续有效。
     if (!updateStudentGroup(id, { code, year, program })) return Response.json({ error: "Student group not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch {

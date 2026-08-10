@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
-// These types describe the simplified data sent from the database to the browser.
-// They intentionally use friendly names instead of SQLite column names.
+// 下面这些类型描述数据库发送给浏览器的简化数据结构。
+// 字段名刻意使用业务人员容易理解的名称，避免前端代码直接依赖 SQLite 的底层列名。
 export type TeacherRecord = {
   id: string;
   name: string;
@@ -156,8 +156,8 @@ export type CycleStatusRecord = {
   backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number };
 };
 
-// The emergency snapshot covers only cycle data. Master records and account data are
-// intentionally excluded because starting a new cycle must retain them.
+// 紧急快照只保存当前排课周期的数据，例如课程、班次和已排课记录。
+// 教师、教室等基础资料以及账号数据不会写入快照，因为开始新周期时必须继续保留它们。
 type CourseSnapshotRow = { id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start?: number | null; week_end?: number | null; created_at: string; updated_at: string };
 type AllocationSnapshotRow = { id: string; course_id: string; teacher_id: string; assigned_group_count: number };
 type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null };
@@ -168,28 +168,28 @@ type CycleSnapshot = { courses: CourseSnapshotRow[]; allocations: AllocationSnap
 type DatabaseInstance = InstanceType<typeof Database>;
 
 function weekRangeSuffix(weekStart: number | null, weekEnd: number | null) {
-  // Compact labels distinguish any limited teaching interval while all-week courses
-  // stay uncluttered on the timetable.
+  // 只有在课程并非全学期上课时才显示简短周次标签，方便区分不同教学阶段；
+  // 全学期课程不额外显示标签，以免时间表卡片过于拥挤。
   return weekStart !== null && weekEnd !== null ? ` · W${weekStart}–${weekEnd}` : "";
 }
 
 function legacyWeekPattern(weekStart: number | null, weekEnd: number | null): "ALL" | "W1_4" | "W5_8" {
-  // Retain the old field for backward-compatible emergency snapshots; all conflict
-  // logic now reads the arbitrary numeric start and end columns instead.
+  // 保留旧字段是为了兼容旧版本生成的紧急快照；当前所有冲突判断都改为读取
+  // 数字形式的开始周和结束周，因此也能处理任意周次范围，而不只固定的半学期。
   if (weekStart === 1 && weekEnd === 4) return "W1_4";
   if (weekStart === 5 && weekEnd === 8) return "W5_8";
   return "ALL";
 }
 
-// Next.js reloads modules in development. Keeping one connection globally prevents
-// a new SQLite connection from being opened each time a route is refreshed.
+// Next.js 在开发模式中会反复重新加载模块。把数据库连接保存在全局对象里，
+// 可以避免每次刷新路由都重新打开一个 SQLite 连接，减少锁冲突和资源浪费。
 const globalForDatabase = globalThis as unknown as {
   timetableDatabase: DatabaseInstance | undefined;
 };
 
 function databaseFilePath() {
-  // Keep path selection in one place so the live database and automatic restore
-  // safety copies always use the same local disk or Railway persistent volume.
+  // 数据库路径统一从这里取得，确保正式数据库和恢复前自动生成的安全副本
+  // 始终位于同一块本地磁盘或 Railway 持久化磁盘中。
   const configuredPath = process.env.TIMETABLING_DATABASE_PATH?.trim();
   const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH?.trim();
   const selectedPath = configuredPath || (railwayVolumePath ? path.join(railwayVolumePath, "timetabling.db") : path.join(process.cwd(), "data", "timetabling.db"));
@@ -197,74 +197,73 @@ function databaseFilePath() {
 }
 
 function database() {
-  // Even an existing connection must run the table setup: this safely adds tables
-  // after the application has been upgraded with a new feature.
+  // 即使数据库连接已经存在，也要重复执行可安全重入的建表和升级逻辑。
+  // 这样应用新增功能后，无需手工迁移就能补上新表或新字段。
   if (globalForDatabase.timetableDatabase) {
     initializeTables(globalForDatabase.timetableDatabase);
     return globalForDatabase.timetableDatabase;
   }
 
-  // An explicit path is useful for isolated regression runs. On Railway, fall back
-  // to its automatically injected volume mount so a correctly attached volume is
-  // persistent without duplicating the mount path in another dashboard variable.
+  // 显式路径便于本地回归测试使用独立数据库；部署到 Railway 时，如果没有显式配置，
+  // 就使用平台自动注入的持久化磁盘挂载点，避免在控制台重复维护同一个路径。
   const databasePath = databaseFilePath();
   const dataDirectory = path.dirname(databasePath);
   mkdirSync(dataDirectory, { recursive: true });
   const db = new Database(databasePath);
   db.pragma("foreign_keys = ON");
   initializeTables(db);
-  // Demo records help local development, but a deployed empty database must start
-  // clean so real staff never see invented teachers, classes or rooms.
+  // 示例数据只用于本地开发时快速查看界面。部署环境中的空数据库必须保持干净，
+  // 防止真实用户误把虚构的教师、学生班级或教室当成正式资料。
   if (process.env.NODE_ENV !== "production") seed(db);
   globalForDatabase.timetableDatabase = db;
   return db;
 }
 
 export function databaseHealth() {
-  // A constant query verifies that the configured file can be opened and queried
-  // without exposing timetable counts, account details or the server file path.
+  // 用固定查询确认数据库文件能够打开并执行 SQL，同时不向健康检查接口泄露
+  // 排课数量、账号资料或服务器上的真实文件路径。
   const row = database().prepare("SELECT 1 AS healthy").get() as { healthy: number };
   return row.healthy === 1;
 }
 
 function assertDatabaseIntegrity(db: DatabaseInstance, stage: string) {
-  // SQLite returns one or more problem descriptions when the file structure is
-  // damaged. A healthy database returns exactly one row containing "ok".
+  // SQLite 检测到文件结构损坏时会返回一条或多条问题说明；
+  // 健康的数据库只会返回一行内容为“ok”的结果。
   const integrityRows = db.pragma("integrity_check") as Array<Record<string, unknown>>;
   const integrityMessages = integrityRows.flatMap((row) => Object.values(row).map(String));
   if (integrityMessages.length !== 1 || integrityMessages[0].toLowerCase() !== "ok") {
     throw new Error(`${stage} failed SQLite integrity check.`);
   }
 
-  // Foreign-key problems can exist even when the file itself is structurally
-  // healthy, so this separate check protects relationships such as lessons to rooms.
+  // 数据库文件结构正常时仍可能存在外键关系错误，因此还要单独检查关联完整性，
+  // 例如确保每条排课记录引用的教室确实存在。
   const foreignKeyProblems = db.pragma("foreign_key_check") as unknown[];
   if (foreignKeyProblems.length > 0) throw new Error(`${stage} failed foreign-key check.`);
 }
 
 export async function createVerifiedSystemBackup() {
-  // A unique operating-system temporary folder keeps simultaneous downloads apart
-  // and ensures the generated file never appears beside the live database.
+  // 每次下载都创建独立的系统临时目录，避免多人同时导出时文件互相覆盖，
+  // 也确保临时副本不会混放在正式数据库旁边。
   const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-backup-"));
   const backupPath = path.join(temporaryDirectory, "timetabling.sqlite");
   let backupDatabase: DatabaseInstance | undefined;
 
   try {
-    // Check the source first, then use SQLite's online backup API instead of copying
-    // a possibly active database and its write-ahead log as ordinary files.
+    // 先检查源数据库，再使用 SQLite 的在线备份接口生成一致副本。
+    // 不能直接复制正在使用的数据库文件及其预写日志，否则可能得到不完整的数据。
     const sourceDatabase = database();
     assertDatabaseIntegrity(sourceDatabase, "Source database");
     await sourceDatabase.backup(backupPath);
 
-    // Existing browser sessions are operational secrets rather than department
-    // records. Remove them from the copy and vacuum it so deleted pages are rebuilt.
+    // 浏览器登录会话属于敏感的运行凭证，不属于需要备份的院系业务数据。
+    // 从副本删除会话后执行 VACUUM，重建文件页面，避免已删除凭证残留在空闲页中。
     backupDatabase = new Database(backupPath);
     backupDatabase.pragma("foreign_keys = ON");
     backupDatabase.prepare("DELETE FROM auth_sessions").run();
     backupDatabase.exec("VACUUM");
 
-    // Validate the exact sanitized file that will be downloaded, then close it before
-    // reading the bytes so every SQLite write is flushed into the response payload.
+    // 对最终提供下载的脱敏文件本身做完整性检查；读取文件字节前先关闭数据库，
+    // 让 SQLite 的所有写入都刷新到磁盘，确保响应内容完整。
     assertDatabaseIntegrity(backupDatabase, "Generated backup");
     backupDatabase.close();
     backupDatabase = undefined;
@@ -272,16 +271,16 @@ export async function createVerifiedSystemBackup() {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     return { contents, filename: `timetabling-backup-${timestamp}.sqlite` };
   } finally {
-    // The response already owns an in-memory copy, so the sensitive temporary file
-    // can always be removed immediately, including when validation throws an error.
+    // 响应对象已经持有内存中的文件内容，因此无论成功还是校验报错，
+    // 都可以立即删除包含业务数据的临时文件，减少敏感副本在磁盘上的停留时间。
     backupDatabase?.close();
     rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 }
 
 export class SystemBackupValidationError extends Error {
-  // A dedicated error type lets the API distinguish an unsafe uploaded file from an
-  // unexpected server failure without exposing SQLite implementation details.
+  // 使用专门的错误类型，让 API 能区分“不安全的上传文件”和“服务器意外故障”，
+  // 同时不必把 SQLite 的内部实现细节暴露给浏览器。
   constructor(message: string) {
     super(message);
     this.name = "SystemBackupValidationError";
@@ -292,14 +291,14 @@ type TableColumn = { cid: number; name: string; type: string; notnull: number; d
 type TableShape = { name: string; columns: TableColumn[] };
 
 function quoteIdentifier(value: string) {
-  // Table names come from SQLite metadata, but quoting them still prevents unusual
-  // names from changing the restore statements into a different SQL command.
+  // 表名虽然来自 SQLite 自己的元数据，仍然要进行安全引用。
+  // 这样即使出现特殊字符，也不会改变恢复语句原本要执行的 SQL 命令。
   return `"${value.replaceAll('"', '""')}"`;
 }
 
 function tableShapes(db: DatabaseInstance) {
-  // Restore accepts only a database with exactly the same user tables and column
-  // order as the running application. Internal sqlite_* bookkeeping is never copied.
+  // 恢复功能只接受与当前应用具有完全相同业务表、列名和列顺序的数据库。
+  // SQLite 自己维护的 sqlite_* 内部表不会参与比较，也不会被复制。
   const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
   return tables.map<TableShape>(({ name }) => ({
     name,
@@ -308,8 +307,8 @@ function tableShapes(db: DatabaseInstance) {
 }
 
 function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseInstance) {
-  // Structural and relationship checks happen before any current record is touched.
-  // Exact shapes also prove that the upload is a backup from this application version.
+  // 在修改任何现有记录之前，先检查上传文件的结构和外键关系。
+  // 表结构完全一致也能证明该文件来自兼容的应用版本，而不是任意 SQLite 文件。
   assertDatabaseIntegrity(source, "Uploaded backup");
   const sourceShapes = tableShapes(source);
   const liveShapes = tableShapes(live);
@@ -317,8 +316,8 @@ function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseIn
     throw new SystemBackupValidationError("The selected file does not match this version of the timetabling system.");
   }
 
-  // All sessions will be removed, so at least one active administrator with a valid
-  // password-hash shape must remain able to sign in after the restore completes.
+  // 恢复后所有旧会话都会被删除，因此上传文件中必须至少保留一个启用状态的管理员，
+  // 并且密码哈希格式有效，保证恢复完成后仍有人能够重新登录。
   const administrators = source.prepare("SELECT password_hash FROM app_users WHERE is_admin = 1 AND is_active = 1").all() as Array<{ password_hash: string }>;
   const validPasswordHash = /^[0-9a-f]{32}:[0-9a-f]{128}$/i;
   if (!administrators.some((administrator) => validPasswordHash.test(administrator.password_hash))) {
@@ -329,8 +328,8 @@ function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseIn
 }
 
 function saveRestoreSafetyCopy(contents: Buffer, sourceFilename: string) {
-  // Store the pre-restore snapshot beside the live database so Railway keeps it on
-  // the mounted volume even if the application container restarts after a restore.
+  // 恢复前的安全快照保存在正式数据库旁边，使 Railway 能把它保留在持久化磁盘中；
+  // 即使恢复后应用容器重启，这份回滚副本也不会随临时文件系统消失。
   const livePath = databaseFilePath();
   const databaseName = path.basename(livePath, path.extname(livePath));
   const safetyDirectory = path.join(path.dirname(livePath), `${databaseName}-restore-safety`);
@@ -341,8 +340,8 @@ function saveRestoreSafetyCopy(contents: Buffer, sourceFilename: string) {
 }
 
 export async function restoreVerifiedSystemBackup(contents: Buffer) {
-  // The uploaded bytes live in a unique temporary file only long enough for SQLite
-  // to validate and read them. Permissions limit other local users from opening it.
+  // 上传内容只在独立临时文件中停留到 SQLite 完成校验和读取为止。
+  // 文件权限限制其他本机用户访问，降低业务数据在服务器上泄露的风险。
   const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-restore-"));
   const uploadedPath = path.join(temporaryDirectory, "uploaded.sqlite");
   writeFileSync(uploadedPath, contents, { mode: 0o600 });
@@ -353,8 +352,8 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
   try {
     let tableNames: string[];
     try {
-      // Read-only mode prevents validation from repairing or changing the file the
-      // administrator selected; invalid SQLite bytes become a controlled 400 error.
+      // 只读方式打开上传文件，防止校验过程自动修复或改写管理员选择的原文件；
+      // 如果内容不是有效 SQLite 数据，则转换成可预期的 400 请求错误。
       uploadedDatabase = new Database(uploadedPath, { readonly: true, fileMustExist: true });
       uploadedDatabase.pragma("query_only = ON");
       tableNames = assertRestorableSystemBackup(uploadedDatabase, liveDatabase);
@@ -366,13 +365,13 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
       uploadedDatabase = undefined;
     }
 
-    // Before destructive work, make and persist a separately verified snapshot of
-    // the current state. It deliberately excludes active session credentials.
+    // 在覆盖现有数据这种高风险操作之前，先生成并验证一份当前状态的持久化快照。
+    // 快照刻意排除正在使用的登录会话凭证。
     const safetyBackup = await createVerifiedSystemBackup();
     const safetyBackupFilename = saveRestoreSafetyCopy(safetyBackup.contents, safetyBackup.filename);
 
-    // Attach the already validated upload and replace every application table in one
-    // synchronous transaction. Any copy or constraint error rolls the whole change back.
+    // 把已通过校验的上传数据库附加到当前连接，并在一个同步事务中替换全部业务表。
+    // 任何复制错误或约束错误都会让整个事务回滚，避免只恢复了一部分数据。
     liveDatabase.prepare("ATTACH DATABASE ? AS restore_source").run(uploadedPath);
     restoreAttached = true;
     liveDatabase.pragma("foreign_keys = OFF");
@@ -381,8 +380,8 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
         for (const tableName of tableNames) liveDatabase.prepare(`DELETE FROM main.${quoteIdentifier(tableName)}`).run();
         for (const tableName of tableNames) liveDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} SELECT * FROM restore_source.${quoteIdentifier(tableName)}`).run();
 
-        // Sessions from either database must never survive a full restore. Checking
-        // relationships inside the transaction makes a failure roll back all copies.
+        // 当前数据库和上传数据库中的登录会话都不能在完整恢复后继续有效。
+        // 外键检查也放在事务内执行，一旦失败，前面复制的所有表都会一起回滚。
         liveDatabase.prepare("DELETE FROM main.auth_sessions").run();
         const relationshipProblems = liveDatabase.pragma("foreign_key_check") as unknown[];
         if (relationshipProblems.length > 0) throw new Error("Restored data failed foreign-key check.");
@@ -392,8 +391,8 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
       liveDatabase.pragma("foreign_keys = ON");
     }
 
-    // Apply any idempotent defaults and validate the committed live file before the
-    // API tells the browser that restoration succeeded.
+    // 恢复提交后补齐可重复执行的默认规则，并再次校验正式数据库。
+    // 只有所有检查通过，API 才会通知浏览器恢复成功。
     initializeTables(liveDatabase);
     assertDatabaseIntegrity(liveDatabase, "Restored database");
     const counts = liveDatabase.prepare(`SELECT
@@ -404,8 +403,8 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
       (SELECT COUNT(*) FROM app_users) AS accounts`).get() as { teachers: number; courses: number; sections: number; lessons: number; accounts: number };
     return { safetyBackupFilename, ...counts };
   } finally {
-    // Detach the upload before deleting its temporary folder. Cleanup runs for valid,
-    // rejected and failed restores without touching the retained safety snapshot.
+    // 删除临时目录前先从 SQLite 连接卸载上传数据库。无论恢复成功、被拒绝还是执行失败，
+    // 都会清理上传临时文件，但不会删除恢复前保留的安全快照。
     if (restoreAttached) liveDatabase.exec("DETACH DATABASE restore_source");
     uploadedDatabase?.close();
     rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -413,8 +412,8 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
 }
 
 function initializeTables(db: DatabaseInstance) {
-  // CREATE ... IF NOT EXISTS makes this setup repeatable and safe on every start.
-  // The tables below are the part of the timetable model currently used by the UI.
+  // CREATE ... IF NOT EXISTS 让初始化逻辑可以在每次启动时安全重复执行。
+  // 下面这些表构成当前界面实际使用的排课数据模型。
   db.exec(`
     CREATE TABLE IF NOT EXISTS teachers (
       id TEXT PRIMARY KEY,
@@ -532,13 +531,13 @@ function initializeTables(db: DatabaseInstance) {
     );
   `);
 
-  // Policy rules are data-driven switches. Insert new defaults without overwriting a
-  // scheduler's existing choice when a later release adds another optional rule.
+  // 政策规则采用数据库开关控制。后续版本新增可选规则时只补入缺失的默认值，
+  // 不覆盖排课老师已经做出的启用或停用选择。
   const addRule = db.prepare("INSERT OR IGNORE INTO rule_settings (rule_key, is_enabled) VALUES (?, 1)");
   for (const ruleKey of ["prefer_9am", "lunch_break", "max_continuous", "student_daily_limit", "teacher_daily_limit", "same_block", "separate_weekly_sessions"]) addRule.run(ruleKey);
 
-  // SQLite cannot add a new column through CREATE TABLE after the table already
-  // exists. Check old local databases and upgrade this small prototype schema safely.
+  // 表已经存在后，重复执行 CREATE TABLE 不会自动补上新列。
+  // 因此这里检查旧版本地数据库，并用安全的小型迁移方式升级原型表结构。
   const courseColumns = db.prepare("PRAGMA table_info(courses)").all() as Array<{ name: string }>;
   if (!courseColumns.some((column) => column.name === "primary_year")) {
     db.exec("ALTER TABLE courses ADD COLUMN primary_year INTEGER CHECK (primary_year IN (1, 2, 3))");
@@ -555,8 +554,8 @@ function initializeTables(db: DatabaseInstance) {
   if (!courseColumns.some((column) => column.name === "week_end")) {
     db.exec("ALTER TABLE courses ADD COLUMN week_end INTEGER CHECK (week_end IS NULL OR week_end >= 1)");
   }
-  // Backfill the two legacy half-cycle options once. Custom ranges use ALL in the
-  // retained legacy field and therefore are never overwritten here.
+  // 只为旧版“前半学期/后半学期”选项补填一次数字周次范围。
+  // 自定义范围在保留的旧字段中使用 ALL，因此不会被这里的兼容逻辑误覆盖。
   db.exec("UPDATE courses SET week_start = 1, week_end = 4 WHERE week_pattern = 'W1_4' AND week_start IS NULL AND week_end IS NULL");
   db.exec("UPDATE courses SET week_start = 5, week_end = 8 WHERE week_pattern = 'W5_8' AND week_start IS NULL AND week_end IS NULL");
   const lessonColumns = db.prepare("PRAGMA table_info(scheduled_lessons)").all() as Array<{ name: string }>;
@@ -569,12 +568,12 @@ function initializeTables(db: DatabaseInstance) {
 }
 
 function seed(db: DatabaseInstance) {
-  // Sample records help a new installation show a usable screen before real data
-  // is imported. Once any teacher exists, never overwrite the user's database.
+  // 示例记录让全新的本地开发环境在导入真实数据前也能展示可用界面。
+  // 一旦数据库中已有任何教师，就认定用户已开始使用，绝不覆盖其资料。
   const count = db.prepare("SELECT COUNT(*) AS count FROM teachers").get() as { count: number };
   if (count.count > 0) return;
 
-  // Prepare the repeated insert statements once, then add all sample data atomically.
+  // 重复使用的插入语句只预编译一次，并在同一个事务中原子性写入全部示例数据。
   const createTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
   const createGroup = db.prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)");
   const createRoom = db.prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)");
@@ -595,20 +594,20 @@ function seed(db: DatabaseInstance) {
 }
 
 function activeStatus(isActive: number) {
-  // SQLite stores booleans as 0/1; the API exposes human-readable status text.
+  // SQLite 用 0 和 1 保存布尔值；API 再把它转换为容易阅读的状态文字。
   return isActive ? "Active" : "Inactive";
 }
 
 function hashPassword(password: string) {
-  // Scrypt is deliberately slow for attackers. A unique random salt means equal
-  // passwords never produce equal stored values; plaintext is never persisted.
+  // Scrypt 会刻意增加密码猜测成本。每个密码使用独立随机盐值，因此相同密码也不会
+  // 产生相同的存储结果；系统任何时候都不会把明文密码写入数据库。
   const salt = randomBytes(16).toString("hex");
   return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
 }
 
 function passwordMatches(password: string, stored: string) {
-  // Recreate the saved scrypt value with its original salt, then use a timing-safe
-  // comparison so password checks do not reveal which characters matched.
+  // 使用原始盐值重新计算 Scrypt 结果，再通过恒定时间比较验证密码，
+  // 防止攻击者根据响应耗时推测哪些字符已经匹配。
   const [salt, expectedHex] = stored.split(":");
   if (!salt || !expectedHex) return false;
   const actual = scryptSync(password, salt, 64);
@@ -617,14 +616,14 @@ function passwordMatches(password: string, stored: string) {
 }
 
 function sessionHash(token: string) {
-  // Only a one-way digest of the bearer token is stored, limiting damage if the
-  // local database is copied while an account is logged in.
+  // 数据库只保存登录令牌的单向摘要。即使账号登录期间数据库被复制，
+  // 攻击者也不能直接拿存储值冒充浏览器会话。
   return createHash("sha256").update(token).digest("hex");
 }
 
 function createSession(db: DatabaseInstance, userId: string) {
-  // Give the browser a random token but store only its hash in SQLite, limiting the
-  // usefulness of a copied session table to anyone without the original cookie.
+  // 浏览器收到随机原始令牌，SQLite 中只保存它的哈希。
+  // 没有原始 Cookie 的人即使复制了会话表，也难以利用其中的数据登录。
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   db.prepare("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)").run(sessionHash(token), userId, expiresAt);
@@ -632,16 +631,16 @@ function createSession(db: DatabaseInstance, userId: string) {
 }
 
 export function authenticationStatus(token?: string): { setupRequired: boolean; user: AppUserRecord | null } {
-  // The login screen needs to know whether first-time setup is required and whether
-  // a supplied session token still identifies an active user.
+  // 登录页需要判断系统是否仍处于首次初始化状态，并确认浏览器提供的会话令牌
+  // 是否仍然对应一个启用中的有效用户。
   const db = database();
   const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
   return { setupRequired: count.count === 0, user: token ? validateSession(token) : null };
 }
 
 export function validateSession(token: string): AppUserRecord | null {
-  // Session validation joins the active account and checks expiry in one query so
-  // disabled users and expired cookies lose access immediately.
+  // 会话校验在一次查询中同时关联启用账号并检查过期时间，
+  // 让被停用的用户或已过期的 Cookie 立即失去访问权限。
   const db = database();
   db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(new Date().toISOString());
   const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
@@ -649,11 +648,11 @@ export function validateSession(token: string): AppUserRecord | null {
 }
 
 export function createInitialAdmin(username: string, password: string) {
-  // First-run setup is allowed only while the account table is empty; creating the
-  // administrator and its first session in one transaction avoids a half-setup state.
+  // 只有账号表为空时才允许首次初始化；管理员账号和第一个会话在同一事务中创建，
+  // 避免出现“账号已建但登录会话未建”的半完成状态。
   const db = database();
-  // The first-user check and insert share one transaction so two simultaneous setup
-  // requests cannot both become separate bootstrap administrators.
+  // 检查首位用户和插入账号使用同一个事务，防止两个同时到达的初始化请求
+  // 各自创建一个初始管理员。
   return db.transaction(() => {
     const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
     if (count.count > 0) throw new Error("Initial administrator has already been created.");
@@ -664,8 +663,8 @@ export function createInitialAdmin(username: string, password: string) {
 }
 
 export function loginUser(username: string, password: string) {
-  // Login accepts only active accounts with a matching password and returns a fresh
-  // server-side session for the secure browser cookie.
+  // 登录只接受启用状态且密码匹配的账号；验证成功后生成新的服务器端会话，
+  // 再由浏览器通过安全 Cookie 保存原始会话令牌。
   const db = database();
   const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
   if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
@@ -673,31 +672,31 @@ export function loginUser(username: string, password: string) {
 }
 
 export function logoutSession(token: string) {
-  // Logging out deletes only the hashed form of this browser's session token.
+  // 退出登录只删除当前浏览器会话令牌对应的哈希，不影响该用户在其他浏览器的会话。
   return database().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(sessionHash(token)).changes > 0;
 }
 
 export function listAppUsers(): AppUserRecord[] {
-  // Administrators see account identity and status, never password hashes or sessions.
+  // 管理员只能查看账号标识和启用状态，接口绝不返回密码哈希或登录会话资料。
   const rows = database().prepare("SELECT id, username, is_admin, is_active FROM app_users ORDER BY username").all() as Array<{ id: string; username: string; is_admin: number; is_active: number }>;
   return rows.map((row) => ({ id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) }));
 }
 
 export function createAppUser(username: string, password: string): AppUserRecord {
-  // New team members are scheduler accounts by default; only the initial account is
-  // an administrator who can later create, disable or reset other accounts.
+  // 后续新增成员默认都是普通排课账号；只有首次初始化账号是管理员，
+  // 由它负责创建、停用或重置其他账号。
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 0)").run(id, username, hashPassword(password));
   return { id, username, isAdmin: false, isActive: true };
 }
 
 export function changeOwnPassword(userId: string, currentPassword: string, newPassword: string) {
-  // A signed-in user must prove the current password before replacing its hash, and
-  // every session is revoked so the new password becomes the sole credential.
+  // 已登录用户修改密码前必须再次证明当前密码正确。更新哈希后撤销该账号的全部会话，
+  // 确保旧密码或遗留浏览器不能继续访问。
   const db = database();
   const user = db.prepare("SELECT password_hash FROM app_users WHERE id = ? AND is_active = 1").get(userId) as { password_hash: string } | undefined;
   if (!user || !passwordMatches(currentPassword, user.password_hash)) return false;
-  // Password changes revoke every existing login, including other forgotten browsers.
+  // 密码修改会撤销该账号所有现有登录，包括用户可能已经忘记的其他浏览器。
   db.transaction(() => {
     db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ?").run(hashPassword(newPassword), userId);
     db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
@@ -706,10 +705,9 @@ export function changeOwnPassword(userId: string, currentPassword: string, newPa
 }
 
 export function setAppUserStatus(userId: string, isActive: boolean) {
-  // Account deactivation is reversible and removes existing sessions without
-  // deleting the username or historical ownership context.
+  // 停用账号是可恢复操作：删除现有会话，但保留用户名及历史操作归属信息。
   const db = database();
-  // Deactivation revokes active sessions immediately; reactivation does not create one.
+  // 停用后立即撤销活跃会话；重新启用只恢复登录资格，不会自动创建新会话。
   return db.transaction(() => {
     const changed = db.prepare("UPDATE app_users SET is_active = ? WHERE id = ? AND is_admin = 0").run(isActive ? 1 : 0, userId).changes > 0;
     if (changed && !isActive) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
@@ -718,8 +716,8 @@ export function setAppUserStatus(userId: string, isActive: boolean) {
 }
 
 export function resetAppUserPassword(userId: string, newPassword: string) {
-  // Administrator reset replaces the stored hash and signs out every browser using
-  // that account, forcing the owner to authenticate with the new password.
+  // 管理员重置密码时会替换已存哈希，并让该账号在所有浏览器中退出登录，
+  // 账号持有人必须使用新密码重新验证身份。
   const db = database();
   return db.transaction(() => {
     const changed = db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ? AND is_admin = 0").run(hashPassword(newPassword), userId).changes > 0;
@@ -729,8 +727,8 @@ export function resetAppUserPassword(userId: string, newPassword: string) {
 }
 
 export function listTeachers(): TeacherRecord[] {
-  // Count imported teaching allocations beside each teacher so the data screen
-  // immediately shows how many sections that teacher has been assigned.
+  // 在教师资料旁统计从教学分配表导入的班次数量，让资料页无需额外计算，
+  // 就能直接显示每位教师预计承担多少个班次。
   const rows = database().prepare(`
     SELECT teachers.id, teachers.name, teachers.staff_type, teachers.is_active,
       COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
@@ -743,15 +741,15 @@ export function listTeachers(): TeacherRecord[] {
 }
 
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
-  // UUIDs allow a record to be created locally without relying on a database counter.
+  // 使用 UUID 生成稳定主键，使本地新增资料不必依赖数据库自增序号。
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
   return { id, name, staffType, status: "Active", sections: 0 };
 }
 
 export function updateTeacher(id: string, input: { name: string; staffType: "FT" | "PT" }) {
-  // Editing the existing row preserves every allocation, unavailable window and
-  // scheduled lesson that already refers to this teacher's stable id.
+  // 编辑时保留原有教师 ID，因此已经关联的教学分配、不可用时段和排课记录
+  // 都会继续指向同一位教师，不会因修改姓名而丢失。
   const result = database().prepare(`
     UPDATE teachers SET name = ?, staff_type = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
@@ -760,41 +758,40 @@ export function updateTeacher(id: string, input: { name: string; staffType: "FT"
 }
 
 export function setTeacherStatus(id: string, isActive: boolean) {
-  // Deactivating preserves old timetable history while hiding a teacher from future work.
+  // 停用教师只会把其从后续可选名单中隐藏，同时完整保留旧时间表中的历史记录。
   const result = database().prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   return result.changes > 0;
 }
 
 export function listStudentGroups(): StudentGroupRecord[] {
-  // Order groups predictably for staff: year first, then programme, then class code.
+  // 学生班级按年级、专业、班级编号依次排序，保证老师每次查看时顺序一致、容易查找。
   const rows = database().prepare("SELECT id, code, year, program FROM student_groups ORDER BY year ASC, program ASC, code ASC").all() as StudentGroupRecord[];
   return rows;
 }
 
 export function createStudentGroup(code: string, year: number, program: string): StudentGroupRecord {
-  // Student groups are stable conflict-check identities; year and programme remain
-  // editable attributes while the generated database id protects existing links.
+  // 学生班级 ID 是冲突检查所依赖的稳定身份；年级和专业仍可修改，
+  // 由数据库生成的 ID 则保护已有课程关联不受名称调整影响。
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
   return { id, code, year, program };
 }
 
 export function updateStudentGroup(id: string, input: { code: string; year: number; program: string }) {
-  // Keep the original group id so all section assignments survive a spelling,
-  // programme or year correction made by the scheduling team.
+  // 修改拼写、专业或年级时保留原班级 ID，因此已经分配给该班的所有课程班次都会继续存在。
   const db = database();
   const result = db.prepare(`
     UPDATE student_groups SET code = ?, year = ?, program = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).run(input.code, input.year, input.program, id);
-  // Group labels appear inside conflict warnings, so refresh saved warnings as
-  // soon as a linked group's details change.
+  // 冲突警告会直接显示班级名称，因此班级资料修改后立即重新计算已保存的警告，
+  // 避免时间表继续显示过期名称。
   if (result.changes > 0) refreshAllScheduleWarnings(db);
   return result.changes > 0;
 }
 
 export function listRooms(): RoomRecord[] {
-  // Convert separate database flags into a short list that the table can display.
+  // 把数据库中分开的教室功能布尔字段转换为简短列表，方便资料表格直接展示。
   const rows = database().prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom, is_active FROM rooms ORDER BY code ASC").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number }>;
   return rows.map((row) => ({
     id: row.id,
@@ -806,22 +803,22 @@ export function listRooms(): RoomRecord[] {
 }
 
 export function createRoom(input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }): RoomRecord {
-  // Save room capacity and all facility flags together; Smart Classroom also implies
-  // Multi Projector so later requirement checks see a consistent feature set.
+  // 教室容量和全部设施标记一次性保存。根据院系规则，Smart Classroom 必然同时属于
+  // Multi Projector，确保后续教室要求检查始终看到一致资料。
   const id = crypto.randomUUID();
-  // Room codes follow Block-Level-Room, so the first segment supports travel warnings later.
+  // 教室编号格式是 Block-Level-Room，因此取第一段作为楼栋编号，供连续课程跨楼提醒使用。
   const block = input.code.split("-")[0] || null;
-  // A Smart Classroom is always also a Multi Projector room in this department.
+  // 本院系规定 Smart Classroom 一定具备 Multi Projector，所以保存时自动补上该标记。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
   database().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
   return { id, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
 }
 
 export function updateRoom(id: string, input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }) {
-  // Recalculate Block whenever the room address changes because back-to-back travel
-  // warnings must use the latest building rather than a stale imported value.
+  // 教室地址变化时重新解析 Block，保证背靠背课程的跨楼提醒使用最新楼栋，
+  // 而不是继续读取旧地址留下的值。
   const block = input.code.split("-")[0] || null;
-  // Preserve the department rule that every Smart Classroom is also multi-projector.
+  // 编辑资料时同样强制执行“Smart Classroom 也是 Multi Projector”的院系规则。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
   const db = database();
   const result = db.prepare(`
@@ -834,8 +831,8 @@ export function updateRoom(id: string, input: { code: string; capacity: number; 
 }
 
 export function setRoomStatus(id: string, isActive: boolean) {
-  // Rooms are deactivated rather than deleted so existing timetable cards keep a
-  // valid historical room reference while new candidate searches exclude them.
+  // 教室只停用、不直接删除，使旧时间表卡片仍能引用有效的历史教室；
+  // 新的排课候选搜索则会自动排除已停用教室。
   const db = database();
   const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   if (result.changes > 0) refreshAllScheduleWarnings(db);
@@ -843,14 +840,14 @@ export function setRoomStatus(id: string, isActive: boolean) {
 }
 
 export function listUnavailableWindows(): UnavailableWindowRecord[] {
-  // Combine teacher and year restrictions into one UI list while retaining their kind.
+  // 教师和年级不可用时段合并成一个界面列表，但保留类型字段，方便编辑时识别来源。
   const teachers = database().prepare(`SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label, windows.day_of_week, windows.start_hour, windows.end_hour FROM teacher_unavailable_windows windows JOIN teachers ON teachers.id = windows.teacher_id ORDER BY teachers.name, windows.day_of_week, windows.start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
   const years = database().prepare(`SELECT id, CAST(year AS TEXT) AS owner_id, 'Year ' || year AS owner_label, day_of_week, start_hour, end_hour FROM year_blocked_windows ORDER BY year, day_of_week, start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
   return [...teachers.map((row) => ({ id: row.id, kind: "Teacher" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour })), ...years.map((row) => ({ id: row.id, kind: "Year" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour }))];
 }
 
 export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; ownerId: string; dayOfWeek: number; startHour: number; endHour: number }) {
-  // Restrictions use half-open time ranges [start, end), matching lesson overlap logic.
+  // 不可用时段采用左闭右开区间 [开始, 结束)，与课程重叠判断规则保持一致。
   const id = crypto.randomUUID();
   const db = database();
   if (input.kind === "Teacher") db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
@@ -860,7 +857,7 @@ export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; owner
 }
 
 export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
-  // The kind selects the exact table, preventing a coincidental id match elsewhere.
+  // 先根据类型选择准确的数据表，避免不同表中恰好出现相同 ID 时误删其他记录。
   const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
   const db = database();
   const removed = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
@@ -879,16 +876,16 @@ const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
 ];
 
 export function listRuleSettings(): RuleSettingRecord[] {
-  // Join the stable explanatory copy to the small persisted switch table in code,
-  // keeping the database focused on values staff may change.
+  // 在程序中把固定的规则说明与数据库中的开关值合并；数据库只保存老师可修改的状态，
+  // 文字说明由代码统一维护，避免重复和版本不一致。
   const rows = database().prepare("SELECT rule_key, is_enabled FROM rule_settings").all() as Array<{ rule_key: string; is_enabled: number }>;
   const enabledByKey = new Map(rows.map((row) => [row.rule_key, Boolean(row.is_enabled)]));
   return ruleSettingDetails.map((rule) => ({ ...rule, enabled: enabledByKey.get(rule.key) ?? true }));
 }
 
 export function updateRuleSetting(key: string, enabled: boolean) {
-  // Only registered policy keys can be changed; core collision checks deliberately
-  // have no switch and therefore cannot be disabled by accident.
+  // 只有已登记的政策规则键可以修改。教师、班级和教室重叠等核心冲突没有开关，
+  // 因而不会被用户意外停用。
   if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
   const db = database();
   const changed = db.prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
@@ -897,8 +894,8 @@ export function updateRuleSetting(key: string, enabled: boolean) {
 }
 
 function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
-  // Explicit table lists make the backup boundary reviewable: only data cleared by
-  // a new cycle enters the snapshot, never accounts or retained master data.
+  // 明确列出周期表，让备份范围可以被代码审查：只有“开始新周期”会清空的数据进入快照，
+  // 账号以及需要跨周期保留的基础资料永远不在其中。
   return {
     courses: db.prepare("SELECT id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at FROM courses ORDER BY id").all() as CourseSnapshotRow[],
     allocations: db.prepare("SELECT id, course_id, teacher_id, assigned_group_count FROM teaching_allocations ORDER BY id").all() as AllocationSnapshotRow[],
@@ -909,38 +906,36 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
 }
 
 function backupSummary(id: string, createdAt: string, snapshot: CycleSnapshot) {
-  // The cycle screen shows only counts and time, not the large JSON snapshot itself.
+  // 周期管理页面只显示记录数量和快照时间，不把体积较大的 JSON 快照内容发送给浏览器。
   return { id, createdAt, courses: snapshot.courses.length, sections: snapshot.sections.length, lessons: snapshot.lessons.length };
 }
 
 export function cycleStatus(): CycleStatusRecord {
-  // Report current working totals and the newest emergency backup available for the
-  // one supported undo operation after starting a new cycle.
+  // 返回当前排课数据总数，以及开始新周期后可用于一次撤销操作的最新紧急快照。
   const db = database();
-  // Only the newest emergency backup is exposed; this is not a browsable version
-  // history and therefore stays aligned with the agreed first-release scope.
+  // 只提供最新紧急快照，不把它做成可浏览的完整版本历史，保持首个版本的功能范围简单明确。
   const current = db.prepare("SELECT (SELECT COUNT(*) FROM courses) AS courses, (SELECT COUNT(*) FROM course_sections) AS sections, (SELECT COUNT(*) FROM scheduled_lessons) AS lessons").get() as { courses: number; sections: number; lessons: number };
   const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
   if (!backup) return { ...current, backup: null };
   try {
     return { ...current, backup: backupSummary(backup.id, backup.created_at, JSON.parse(backup.snapshot_json) as CycleSnapshot) };
   } catch {
-    // A damaged snapshot must never prevent staff from opening the cycle screen.
+    // 即使快照内容损坏，也不能阻止老师打开周期管理页面；此时仅把快照视为不可恢复。
     return { ...current, backup: null };
   }
 }
 
 export function startNewCycle(): CycleStatusRecord {
-  // Snapshot the current course work, then clear lessons, generated sections and
-  // courses in one transaction while retaining people, rooms, rules and accounts.
+  // 先快照当前排课工作，再在一个事务中清空课程、生成班次和排课记录；
+  // 教师、学生班级、教室、规则及账号继续保留供新周期使用。
   const db = database();
   const snapshot = readCycleSnapshot(db);
   if (snapshot.courses.length === 0) throw new Error("There is no current course cycle to clear.");
   const backupId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
 
-  // Save the complete snapshot and clear the current cycle atomically. A failure in
-  // either step rolls back both, so staff never receive an incomplete empty system.
+  // 保存完整快照与清空当前周期在同一事务中原子执行。任一步失败都会一起回滚，
+  // 避免老师得到“资料已清空但备份不完整”的系统。
   const replaceCycle = db.transaction(() => {
     db.prepare("DELETE FROM schedule_backups").run();
     db.prepare("INSERT INTO schedule_backups (id, snapshot_json, created_at) VALUES (?, ?, ?)").run(backupId, JSON.stringify(snapshot), createdAt);
@@ -951,8 +946,8 @@ export function startNewCycle(): CycleStatusRecord {
 }
 
 export function restoreLastCycleBackup(): CycleStatusRecord {
-  // Replace current cycle work from the newest emergency JSON snapshot in a single
-  // transaction, then recalculate warnings against retained rules and restrictions.
+  // 在单一事务中用最新紧急 JSON 快照替换当前周期数据，随后根据目前保留的规则
+  // 和不可用时段重新计算全部警告。
   const db = database();
   const backup = db.prepare("SELECT snapshot_json FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { snapshot_json: string } | undefined;
   if (!backup) throw new Error("No emergency cycle backup is available.");
@@ -964,14 +959,14 @@ export function restoreLastCycleBackup(): CycleStatusRecord {
   }
   if (![snapshot.courses, snapshot.allocations, snapshot.sections, snapshot.sectionGroups, snapshot.lessons].every(Array.isArray)) throw new Error("The emergency backup is not valid.");
 
-  // Restore in parent-to-child order so every foreign key is valid. Clearing and
-  // rebuilding run in one transaction; missing retained master data would roll back.
+  // 按父表到子表的顺序恢复，确保每一步外键都有效。清空和重建在同一事务中执行；
+  // 如果依赖的基础资料已经不存在，整个恢复会回滚。
   const restore = db.transaction(() => {
     db.prepare("DELETE FROM courses").run();
     const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const row of snapshot.courses) {
-      // Old backups contain only week_pattern; derive their numeric boundaries when
-      // restoring after this schema upgrade.
+      // 旧备份只包含 week_pattern；在升级后的结构中恢复时，
+      // 根据旧值推导数字形式的开始周和结束周以保持兼容。
       const weekStart = row.week_start ?? (row.week_pattern === "W1_4" ? 1 : row.week_pattern === "W5_8" ? 5 : null);
       const weekEnd = row.week_end ?? (row.week_pattern === "W1_4" ? 4 : row.week_pattern === "W5_8" ? 8 : null);
       insertCourse.run(row.id, row.code, row.catalog, row.duration_hours, row.sessions_per_week, row.primary_year, row.minimum_room_capacity, row.requires_lab, row.requires_multi_projector, row.requires_smart_classroom, row.separate_sections_across_days, row.week_pattern, weekStart, weekEnd, row.created_at, row.updated_at);
@@ -986,15 +981,15 @@ export function restoreLastCycleBackup(): CycleStatusRecord {
     for (const row of snapshot.lessons) insertLesson.run(row.id, row.section_id, row.occurrence, row.day_of_week, row.start_hour, row.duration_hours, row.room_id, row.warnings_json, row.revision);
   });
   restore();
-  // Master data or policy settings may have changed since the emergency snapshot;
-  // restore placements exactly, then evaluate them against the current retained rules.
+  // 紧急快照生成后，基础资料或政策规则可能已经变化。因此先准确恢复原排课位置，
+  // 再用当前保留的最新规则重新评估警告。
   refreshAllScheduleWarnings(db);
   return cycleStatus();
 }
 
 export function listCourses(): CourseRecord[] {
-  // Use separate subqueries so the section count and allocation total do not multiply
-  // each other when a course has several teachers and several generated sections.
+  // 班次数量和教师分配总数分别使用独立子查询，避免一门课同时有多位教师和多个班次时，
+  // 连接结果互相相乘而造成统计数字虚高。
   const rows = database().prepare(`
     SELECT courses.id, courses.code, courses.catalog, courses.duration_hours, courses.sessions_per_week,
       courses.primary_year, courses.minimum_room_capacity, courses.requires_lab,
@@ -1027,11 +1022,11 @@ export function listCourses(): CourseRecord[] {
 }
 
 export function createManualCourse(input: { code: string; catalog: string | null; sectionCount: number }): CourseRecord {
-  // Manual creation covers modules omitted from Excel; generated sections begin
-  // unassigned so staff can choose teachers and student groups explicitly.
+  // 手动新增用于补充 Excel 遗漏的课程；新生成的班次暂不分配教师和学生班级，
+  // 由排课老师明确选择，避免系统自行猜测。
   const db = database();
-  // A manual course covers a missing Excel row without inventing a teaching
-  // allocation. Its sections start unassigned so staff can choose teachers explicitly.
+  // 手动课程只补齐 Excel 缺失行，不会凭空创建教学分配数量；
+  // 所有班次初始未分配，教师和学生班级由老师自行设置。
   const create = db.transaction(() => {
     const id = crypto.randomUUID();
     db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)").run(id, input.code, input.catalog);
@@ -1042,19 +1037,19 @@ export function createManualCourse(input: { code: string; catalog: string | null
     return id;
   });
   const id = create();
-  // Reuse the normal projection so manually and spreadsheet-created courses always
-  // have exactly the same API shape and downstream behaviour.
+  // 复用标准查询结果，让手动课程和表格导入课程始终返回完全相同的 API 结构，
+  // 后续界面与业务逻辑无需区分资料来源。
   const course = listCourses().find((item) => item.id === id);
   if (!course) throw new Error("The course was created but could not be read.");
   return course;
 }
 
 export function resizeCourseSections(courseId: string, sectionCount: number) {
-  // Increasing adds the next numbered sections; decreasing removes only the highest
-  // unscheduled sections so saved timetable work is never silently discarded.
+  // 增加数量时接着现有编号生成班次；减少数量时只从编号最大的未排班次开始删除，
+  // 绝不会静默丢弃已经排入时间表的工作。
   const db = database();
-  // Resize only at the highest sequence numbers, preserving stable labels and all
-  // assignments on LEAD_01 ... LEAD_N that remain within the requested count.
+  // 只调整最高序号一端的班次，保证保留下来的 LEAD_01 至 LEAD_N 标签、
+  // 教师分配和学生班级关联都保持稳定。
   const resize = db.transaction(() => {
     const course = db.prepare("SELECT id FROM courses WHERE id = ?").get(courseId) as { id: string } | undefined;
     if (!course) return false;
@@ -1072,8 +1067,8 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
       const hasScheduledLesson = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? LIMIT 1");
       const hasStudentGroup = db.prepare("SELECT 1 FROM section_student_groups WHERE section_id = ? LIMIT 1");
       for (const section of removable) {
-        // A user must first return scheduled lessons to the tray and clear student
-        // groups, preventing a count correction from silently discarding real work.
+        // 若要删除的班次已经排课或关联学生班级，用户必须先把课程退回待排区并清除关联，
+        // 防止修正数量时无提示地删除真实工作。
         if (hasScheduledLesson.get(section.id)) throw new Error(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
         if (hasStudentGroup.get(section.id)) throw new Error(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
       }
@@ -1086,18 +1081,18 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
 }
 
 export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "weekPattern" | "allocatedSections" | "configuredSections" | "allocationVarianceCount"> & { durationHours: number }) {
-  // Course requirements apply to every generated section, so they are saved once
-  // on the course rather than duplicated 18 times for a course such as LEAD.
+  // 课程要求适用于该课生成的每个班次，因此只保存在课程层级；
+  // 像 LEAD 有 18 个班次时无需重复存储 18 份相同设置。
   const db = database();
-  // Keep the business rule at the persistence boundary as well as the API, because
-  // maintenance scripts may call this shared function directly in future releases.
+  // 业务规则不仅放在 API 层，也在数据库写入边界再次执行，
+  // 因为未来维护脚本可能绕过 API，直接调用这个共享函数。
   if (!Number.isInteger(input.durationHours) || input.durationHours < 2 || input.durationHours > 4) {
     throw new Error("Course duration must be 2 to 4 whole hours.");
   }
   if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isInteger(input.weekStart) || !Number.isInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd < input.weekStart))) {
     throw new Error("Teaching weeks must be blank for all weeks or a valid positive start and end range.");
   }
-  // Do not silently hide a second weekly meeting that staff have already scheduled.
+  // 如果第二次每周课次已经排入时间表，不允许静默把它隐藏或删除。
   const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
   if (scheduledExtra) throw new Error("Return the extra weekly sessions to the tray before reducing sessions per week.");
   const outsideGrid = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.start_hour + ? > 18 LIMIT 1`).get(id, input.durationHours);
@@ -1110,8 +1105,8 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
         week_start = ?, week_end = ?,
         updated_at = CURRENT_TIMESTAMP WHERE id = ?
     `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, legacyWeekPattern(input.weekStart, input.weekEnd), input.weekStart, input.weekEnd, id);
-    // Scheduled lessons copy duration for fast grid rendering; keep that denormalised
-    // value synchronized whenever the shared course requirement changes.
+    // 已排课记录冗余保存时长，以便时间表快速渲染；课程统一时长变化时，
+    // 必须同步更新这个冗余值，避免卡片高度与真实设置不一致。
     if (result.changes > 0) db.prepare("UPDATE scheduled_lessons SET duration_hours = ?, revision = revision + 1 WHERE section_id IN (SELECT id FROM course_sections WHERE course_id = ?)").run(input.durationHours, id);
     return result.changes > 0;
   });
@@ -1121,8 +1116,8 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
 }
 
 export function listCourseSections(courseId: string): CourseSectionRecord[] {
-  // Aggregate student groups into one row per section so the browser can show its
-  // complete conflict scope beside the teacher assignment.
+  // 把一个班次关联的多个学生班级聚合到同一结果行，
+  // 让浏览器能在教师分配旁完整展示该班次涉及的冲突范围。
   const rows = database().prepare(`
     SELECT course_sections.id, courses.code, course_sections.sequence, teachers.id AS teacher_id,
       teachers.name AS teacher_name, student_groups.id AS group_id, student_groups.code AS group_code
@@ -1147,16 +1142,16 @@ export function listCourseSections(courseId: string): CourseSectionRecord[] {
 }
 
 export function listCourseAllocationVariances(courseId: string): AllocationVarianceRecord[] {
-  // Compare imported teacher group counts with the current section assignments so
-  // manual substitutions remain allowed but visible to the scheduler.
+  // 比较导入的教师班次数量与当前实际班次分配。系统允许老师手动替换任课教师，
+  // 但会把与原分配不一致的情况清楚显示给排课人员。
   const db = database();
-  // Manual courses have no Teaching Members baseline, so their freely assigned
-  // teachers must not be reported as a mismatch against a non-existent allocation.
+  // 手动课程没有 Teaching Members 的原始分配基线，因此自由选择的教师
+  // 不应被误报为与一个根本不存在的分配不一致。
   const hasAllocation = db.prepare("SELECT 1 FROM teaching_allocations WHERE course_id = ? LIMIT 1").get(courseId);
   if (!hasAllocation) return [];
 
-  // Include both expected teachers and any substitute teacher currently assigned.
-  // Correlated counts keep the calculation readable and are inexpensive at this scale.
+  // 结果同时包含预期教师和当前实际使用的代课教师。
+  // 相关子查询使计算逻辑容易阅读，而且在院系规模的数据量下性能足够。
   const rows = db.prepare(`
     SELECT teachers.id, teachers.name,
       COALESCE((SELECT assigned_group_count FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id), 0) AS expected_sections,
@@ -1172,11 +1167,11 @@ export function listCourseAllocationVariances(courseId: string): AllocationVaria
 }
 
 export function updateCourseSection(id: string, teacherId: string | null, studentGroupIds: string[]) {
-  // Save one teacher and all linked student groups together, then invalidate any
-  // open lesson editors and refresh warnings affected by the assignment change.
+  // 在同一操作中保存一位教师及全部关联学生班级，随后让旧编辑版本失效，
+  // 并刷新所有可能受此次分配变更影响的警告。
   const db = database();
-  // Replacing the join records in one transaction makes an edited cross-level class
-  // immediately consistent for future conflict checks.
+  // 在一个事务中整体替换学生班级关联，使跨年级课程修改完成后，
+  // 后续冲突检查立即读取到一致、完整的班级集合。
   const transaction = db.transaction(() => {
     const section = db.prepare("SELECT id, course_id FROM course_sections WHERE id = ?").get(id) as { id: string; course_id: string } | undefined;
     if (!section) return null;
@@ -1188,8 +1183,8 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
     db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(id);
     const addGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const groupId of [...new Set(studentGroupIds)]) addGroup.run(id, groupId);
-    // A timetable editor opened before this assignment change must not later
-    // overwrite it with a stale save, so invalidate every scheduled occurrence.
+    // 分配变更前已经打开的时间表编辑器不能再用旧资料覆盖新设置，
+    // 因此提高该班次每个已排课次的修订版本，使旧保存请求被识别为过期。
     db.prepare("UPDATE scheduled_lessons SET revision = revision + 1 WHERE section_id = ?").run(id);
     return section.course_id;
   });
@@ -1199,8 +1194,8 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
 }
 
 export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
-  // The master timetable is filtered by the course's primary year, while each lesson
-  // still retains its cross-year student groups for conflict checks.
+  // 年级总表按课程的主要年级筛选；每条排课记录仍保留全部跨年级学生班级关联，
+  // 因此其他年级发生重叠时仍能正确提示冲突。
   const rows = database().prepare(`
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.id AS teacher_id, teachers.name AS teacher_name,
       lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
@@ -1219,19 +1214,19 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
     WHERE courses.primary_year = ? ORDER BY lessons.day_of_week, lessons.start_hour
   `).all(year) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
   return rows.map((row) => {
-    // Attach the highest issue level so the timetable card can use the same colour
-    // standard as the consolidated issue list without reimplementing rule text.
+    // 把该课程最高严重等级附加到结果中，使时间表卡片和综合问题清单使用同一套颜色标准，
+    // 前端不必再次解析规则文字来判断颜色。
     const warnings = JSON.parse(row.warnings_json) as string[];
     return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
 export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
-  // Personal views query the same lesson records across all three primary years;
-  // no duplicate timetable copy is created for a teacher, group or room.
+  // 教师、学生班级和教室视图都查询三个年级共用的同一批排课记录，
+  // 系统不会为个人视图复制另一份时间表数据。
   const db = database();
-  // Teacher and room schedules span all three master years. Student-group schedules
-  // use the link table so a cross-level course appears for every participating class.
+  // 教师和教室日程横跨三个年级总表；学生班级日程通过关联表查询，
+  // 因而跨年级课程会出现在每个参与班级的视图中。
   const ownerFilter = kind === "Teacher"
     ? "sections.teacher_id = ?"
     : kind === "Room"
@@ -1257,16 +1252,16 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     ORDER BY lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
   `).all(ownerId) as Array<{ id: string; section_id: string; code: string; sequence: number; teacher_id: string | null; teacher_name: string | null; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; occurrence: number; revision: number; sessions_per_week: number; week_start: number | null; week_end: number | null; room_code: string | null; student_groups: string | null }>;
   return rows.map((row) => {
-    // Personal teacher, student and room views use the identical server-derived
-    // issue level as the year master table.
+    // 教师、学生和教室个人视图使用服务器计算出的同一个问题等级，
+    // 与年级总表的卡片颜色和警告含义完全一致。
     const warnings = JSON.parse(row.warnings_json) as string[];
     return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
-  // Only sections with a completed duration can be dragged to the grid. Sections
-  // missing setup remain visible in Courses, where staff can finish configuring them.
+  // 只有已经设置课程时长的班次才能拖入时间表；资料未完成的班次仍显示在 Courses 页面，
+  // 提醒老师先补齐时长和主要年级等必要设置。
   const rows = database().prepare(`
     SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
       courses.sessions_per_week, courses.week_start, courses.week_end, occurrences.occurrence,
@@ -1285,7 +1280,7 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null; occurrence: number; teacher_name: string | null; staff_type: "FT" | "PT" | null; group_code: string | null }>;
   const sections = new Map<string, UnscheduledSectionRecord>();
   for (const row of rows) {
-    // One section can contribute two draggable cards when it meets twice per week.
+    // 每周上两次的同一班次会生成两张独立待排卡片，分别代表第一和第二次课。
     const occurrenceKey = `${row.id}:${row.occurrence}`;
     const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
     if (row.group_code) section.studentGroups.push(row.group_code);
@@ -1297,8 +1292,8 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
 type DailyInterval = { startHour: number; durationHours: number; block: string | null };
 
 function longestContinuousHours(intervals: DailyInterval[]) {
-  // Adjacent lessons count as one continuous block; overlapping lessons are merged
-  // so a warning reflects elapsed time rather than double-counting a conflict.
+  // 首尾相接的课程视为同一个连续教学时段；发生重叠的区间先合并，
+  // 让连续上课警告按真实经过时间计算，而不是重复累计冲突部分。
   const ordered = [...intervals].sort((left, right) => left.startHour - right.startHour);
   let longest = 0;
   let blockStart = ordered[0]?.startHour ?? 0;
@@ -1315,32 +1310,32 @@ function longestContinuousHours(intervals: DailyInterval[]) {
 }
 
 function hasLunchHour(intervals: DailyInterval[]) {
-  // With whole-hour lessons, the 12:00–14:00 lunch window has a free hour when
-  // either 12:00–13:00 or 13:00–14:00 is not covered by any lesson.
+  // 课程都以整点为边界，因此在 12:00–14:00 午餐窗口中，
+  // 只要 12:00–13:00 或 13:00–14:00 任一小时没有课程，就满足一小时休息要求。
   const occupied = (hour: number) => intervals.some((interval) => interval.startHour <= hour && interval.startHour + interval.durationHours >= hour + 1);
   return !occupied(12) || !occupied(13);
 }
 
 function hasBackToBackBlockChange(intervals: DailyInterval[], proposed: DailyInterval) {
-  // Travel is only checked for immediately adjacent lessons and when both rooms have blocks.
+  // 跨楼提醒只检查时间上紧邻的两节课，并且要求两个教室都能解析出 Block 楼栋信息。
   if (!proposed.block) return false;
   const proposedEnd = proposed.startHour + proposed.durationHours;
   return intervals.some((interval) => interval.block && interval.block !== proposed.block && (interval.startHour + interval.durationHours === proposed.startHour || interval.startHour === proposedEnd));
 }
 
 function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: string; lessonId?: string; teacherId: string | null; roomId: string | null; dayOfWeek: number; startHour: number; durationHours: number }) {
-  // Every placement path uses this single warning engine, ensuring drag, edit and
-  // future candidate suggestions all apply the same conflict definitions.
+  // 所有排课入口都使用同一个警告引擎，确保拖放、编辑以及候选时段建议
+  // 对同一种冲突采用完全一致的定义。
   const warnings: string[] = [];
   const lessonId = input.lessonId ?? "";
   const endHour = input.startHour + input.durationHours;
-  // Optional policy rules can change between semesters. Core resource and timetable
-  // collisions below remain unconditional and are intentionally absent from this set.
+  // 可选政策规则可能每学期调整；下面的教师、班级、教室和时间重叠属于核心冲突，
+  // 始终无条件检查，刻意不放进可关闭规则集合。
   const enabledRules = new Set((db.prepare("SELECT rule_key FROM rule_settings WHERE is_enabled = 1").all() as Array<{ rule_key: string }>).map((row) => row.rule_key));
   const courseRule = db.prepare(`SELECT courses.id, courses.code, courses.sessions_per_week, courses.separate_sections_across_days, courses.week_start, courses.week_end FROM courses JOIN course_sections ON course_sections.course_id = courses.id WHERE course_sections.id = ?`).get(input.sectionId) as { id: string; code: string; sessions_per_week: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null };
   if (courseRule.sessions_per_week > 1 && enabledRules.has("separate_weekly_sessions")) {
-    // Separate weekly meetings of one class should not be placed on the same day,
-    // otherwise a nominally twice-weekly course becomes one long teaching day.
+    // 同一班次每周分开的两次课不应排在同一天，
+    // 否则名义上的“每周两次”会变成同一天的一段长课。
     const sameSectionDay = db.prepare("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?").get(lessonId, input.sectionId, input.dayOfWeek);
     if (sameSectionDay) warnings.push(`${courseRule.code} weekly sessions should be scheduled on different days`);
   }
@@ -1348,8 +1343,8 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     const sameDay = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE lessons.id <> ? AND sections.course_id = ? AND lessons.day_of_week = ?`).get(lessonId, courseRule.id, input.dayOfWeek);
     if (sameDay) warnings.push(`${courseRule.code} sections should not be scheduled on the same day`);
   }
-  // Null bounds mean all weeks. Two limited ranges overlap inclusively when each
-  // starts on or before the other's end; touching at the same week is a conflict.
+  // 周次边界为空表示覆盖全学期。两个有限周次范围按包含端点方式判断重叠：
+  // 若它们在同一周相接，该周仍同时上课，因此属于冲突。
   const overlaps = db.prepare(`
     SELECT lessons.id, sections.teacher_id, lessons.room_id
     FROM scheduled_lessons lessons
@@ -1361,7 +1356,7 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
         OR (occupied_courses.week_start <= ? AND ? <= occupied_courses.week_end))
   `).all(lessonId, input.dayOfWeek, endHour, input.startHour, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; teacher_id: string | null; room_id: string | null }>;
 
-  // Missing assignments are allowed during drafting, but remain visible as warnings.
+  // 草拟阶段允许暂时缺少教师、学生班级或教室分配，但系统会持续显示警告提醒补齐。
   if (!input.teacherId) warnings.push("Teacher not assigned");
   else {
     if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
@@ -1371,7 +1366,7 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   if (!input.roomId) warnings.push("Room not assigned");
   else if (overlaps.some((row) => row.room_id === input.roomId)) warnings.push("Room conflict");
 
-  // Match shared student-group ids across overlapping sections, including cross-level classes.
+  // 通过稳定的学生班级 ID 比较重叠课程，因此也能识别跨年级课程共享班级造成的冲突。
   const groupConflicts = db.prepare(`
     SELECT DISTINCT groups.code FROM scheduled_lessons lessons
     JOIN course_sections occupied_sections ON occupied_sections.id = lessons.section_id
@@ -1394,8 +1389,8 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     if (blocked) warnings.push(`Year ${affected.year} is unavailable at this time`);
   }
 
-  // A selected room must satisfy every course requirement; Smart Classroom already
-  // implies Multi Projector when room master data is saved.
+  // 所选教室必须同时满足该课程的所有设施和容量要求；保存教室资料时已经保证
+  // Smart Classroom 自动包含 Multi Projector 属性。
   if (input.roomId) {
     const suitability = db.prepare(`SELECT rooms.code, rooms.capacity, rooms.has_multi_projector, rooms.is_lab, rooms.is_smart_classroom, rooms.is_active, courses.minimum_room_capacity, courses.requires_multi_projector, courses.requires_lab, courses.requires_smart_classroom FROM rooms JOIN course_sections sections ON sections.id = ? JOIN courses ON courses.id = sections.course_id WHERE rooms.id = ?`).get(input.sectionId, input.roomId) as { code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number; minimum_room_capacity: number | null; requires_multi_projector: number; requires_lab: number; requires_smart_classroom: number } | undefined;
     if (!suitability || !suitability.is_active) warnings.push("Room is unavailable");
@@ -1407,7 +1402,7 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     }
   }
 
-  // The department prefers 09:00 starts; 08:00 remains available when needed.
+  // 院系偏好最早 09:00 开课；08:00 仍然允许使用，但会作为软规则产生提醒。
   if (input.startHour === 8 && enabledRules.has("prefer_9am")) warnings.push("08:00 start is discouraged");
 
   const proposedRoom = input.roomId ? db.prepare("SELECT block FROM rooms WHERE id = ?").get(input.roomId) as { block: string | null } | undefined : undefined;
@@ -1431,8 +1426,8 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
     if (enabledRules.has("same_block") && hasBackToBackBlockChange(existing, proposed)) warnings.push("Teacher has back-to-back lessons in different blocks");
   }
 
-  // Evaluate each associated student group separately because cross-level sections
-  // can affect several year timetables through one placement.
+  // 每个关联学生班级都要分别评估，因为一节跨年级课程的单次排课
+  // 可能同时影响多个年级总表的每日时长和连续上课限制。
   const proposedGroups = db.prepare("SELECT student_groups.id, student_groups.code FROM section_student_groups JOIN student_groups ON student_groups.id = section_student_groups.student_group_id WHERE section_id = ?").all(input.sectionId) as Array<{ id: string; code: string }>;
   for (const group of proposedGroups) {
     const groupDay = db.prepare(`
@@ -1457,9 +1452,9 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
 }
 
 function refreshAllScheduleWarnings(db: DatabaseInstance) {
-  // Any changed lesson, assignment, room or rule can affect neighbouring cards.
-  // Recalculate the small department timetable once after such a mutation so every
-  // year and personal view reads one consistent warning snapshot.
+  // 课程位置、班次分配、教室或规则的任何变化都可能影响相邻卡片。
+  // 修改后统一重新计算这个院系规模不大的时间表，使所有年级和个人视图
+  // 读取同一份一致的警告快照。
   const lessons = db.prepare(`
     SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
       lessons.duration_hours, lessons.room_id, sections.teacher_id
@@ -1481,8 +1476,8 @@ function refreshAllScheduleWarnings(db: DatabaseInstance) {
 }
 
 function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | "severity"> {
-  // The summary labels help staff scan a long list without changing the underlying
-  // rule behaviour: every issue remains a warning and never blocks saving.
+  // 摘要标签帮助老师快速浏览较长的问题列表，但不会改变底层规则行为：
+  // 所有问题都只是警告，永远不会阻止用户保存排课。
   if (message.includes("not assigned")) return { category: "Assignment", severity: "Advisory" };
   if (message.includes("unavailable")) return { category: "Availability", severity: "High" };
   if (message.includes("conflict")) return { category: "Conflict", severity: "High" };
@@ -1496,8 +1491,8 @@ function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | 
 }
 
 function highestIssueSeverity(messages: string[]): "High" | "Warning" | "Advisory" | null {
-  // Reduce several rule messages to the colour of the most urgent one: red beats
-  // yellow, yellow beats blue, and an empty message list has no issue colour.
+  // 一节课有多条规则消息时，只取最紧急等级决定卡片颜色：红色高于黄色，
+  // 黄色高于蓝色；没有消息时则不显示问题颜色。
   const severities = messages.map((message) => describeIssue(message).severity);
   if (severities.includes("High")) return "High";
   if (severities.includes("Warning")) return "Warning";
@@ -1506,12 +1501,11 @@ function highestIssueSeverity(messages: string[]): "High" | "Warning" | "Advisor
 }
 
 export function listScheduleIssues(): ScheduleIssueRecord[] {
-  // Recalculate every lesson first, then expand its saved warning messages into the
-  // sortable issue records used by both the global list and year inspector.
+  // 先重新计算每条排课记录，再把保存的多条警告展开为可排序的问题记录，
+  // 供全局问题清单和年级检查面板共同使用。
   const db = database();
-  // Recalculate every saved lesson when the issue screen opens. This keeps the list
-  // current after restrictions or neighbouring lessons change, even when the lesson
-  // itself has not been opened in the editor again.
+  // 打开问题页面时重新计算所有已排课程。即使某节课没有再次打开编辑器，
+  // 当不可用时段或相邻课程变化后，问题清单仍能立即反映最新状态。
   const warningsByLesson = refreshAllScheduleWarnings(db);
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
@@ -1535,7 +1529,7 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
   const issues: ScheduleIssueRecord[] = [];
   for (const row of rows) {
     const warnings = warningsByLesson.get(row.id) ?? [];
-    // Flatten one lesson with several warnings into independently filterable issue rows.
+    // 把一节课的多条警告展开成独立问题行，使每条规则都能单独筛选和查看。
     warnings.forEach((message, index) => {
       const description = describeIssue(message);
       issues.push({
@@ -1558,11 +1552,11 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
 }
 
 export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
-  // Candidate search is deliberately advisory: evaluate every valid room and hour,
-  // returning only combinations that produce zero enabled-rule messages.
+  // 候选搜索只提供建议，不自动排课：系统评估所有有效教室和整点时段，
+  // 只返回在当前已启用规则下完全没有警告的组合。
   const db = database();
-  // Candidate search uses the section's saved teacher, student groups, duration and
-  // course requirements. Incomplete sections therefore return no misleading options.
+  // 候选搜索读取班次已保存的教师、学生班级、时长及教室要求。
+  // 资料不完整时不返回可能误导用户的候选结果。
   const section = db.prepare(`
     SELECT sections.id, sections.sequence, sections.teacher_id, courses.code,
       courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end
@@ -1576,14 +1570,14 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
   const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? AND occurrence = ?").get(sectionId, occurrence);
   if (alreadyScheduled) throw new Error("Candidate slots are only available for an unscheduled weekly session.");
 
-  // Try every active room at every valid whole-hour placement. The existing warning
-  // engine is the single source of truth, and only placements with zero messages pass.
+  // 遍历每个启用教室和所有合法整点位置；现有警告引擎是唯一判断标准，
+  // 只有零条警告的排法才会通过候选筛选。
   const rooms = db.prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom FROM rooms WHERE is_active = 1 ORDER BY code").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number }>;
   const slots: CandidateSlotRecord[] = [];
   const preferredStartRule = db.prepare("SELECT is_enabled FROM rule_settings WHERE rule_key = 'prefer_9am'").get() as { is_enabled: number } | undefined;
   for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
-    // 08:00 becomes a valid candidate only when staff explicitly disable the
-    // preferred 09:00-start policy; the warning engine remains the final filter.
+    // 只有老师明确关闭“偏好 09:00 后开课”规则时，08:00 才会成为无警告候选；
+    // 最终是否通过仍由统一警告引擎判断。
     for (let startHour = preferredStartRule?.is_enabled === 0 ? 8 : 9; startHour + section.duration_hours <= 18; startHour += 1) {
       for (const room of rooms) {
         const warnings = calculatePlacementWarnings(db, { sectionId, teacherId: section.teacher_id, roomId: room.id, dayOfWeek, startHour, durationHours: section.duration_hours });
@@ -1604,8 +1598,8 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
 }
 
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
-  // Create the requested whole-hour lesson even when warnings exist, store those
-  // warnings, and return the complete card data for immediate browser feedback.
+  // 即使存在警告，也按用户要求创建整点课程并保存警告内容；
+  // 随后返回完整卡片数据，让浏览器立即展示排课结果和提醒。
   const db = database();
   const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
   if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
@@ -1616,18 +1610,18 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? conflicts;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  // Return the linked class codes with the saved card so the UI does not need a
-  // second request before showing every resource assigned to the new lesson.
+  // 保存后连同关联班级编号一起返回，使界面无需再次请求，
+  // 就能立即显示新课程分配的教师、班级和教室等完整资源。
   const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(section.id) as Array<{ code: string }>).map((group) => group.code);
   return { id, sectionId: section.id, sectionLabel: `${section.code}_${String(section.sequence).padStart(2, "0")}${section.sessions_per_week > 1 ? ` · Session ${input.occurrence}` : ""}${weekRangeSuffix(section.week_start, section.week_end)}`, courseCode: section.code, teacherId: section.teacher_id, teacherName: section.teacher_name, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: input.occurrence, sessionsPerWeek: section.sessions_per_week, revision: 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
-  // Revision checking prevents silent overwrites; teacher and placement changes are
-  // saved together so recalculated conflicts always match the displayed card.
+  // 修订版本检查防止多人编辑时静默覆盖；教师和课程位置一起保存，
+  // 确保重新计算的冲突始终与界面显示的卡片资料一致。
   const db = database();
-  // The editor updates the section teacher and lesson placement together so the card
-  // never briefly shows a teacher that differs from the conflict-check input.
+  // 编辑器在同一事务中更新班次教师和课程位置，避免卡片短暂显示一位教师，
+  // 而冲突检查实际使用另一位教师的中间状态。
   const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
   if (!lesson) throw new Error("Scheduled lesson not found.");
   if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
@@ -1641,15 +1635,15 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   })();
   const refreshedWarnings = refreshAllScheduleWarnings(db).get(id) ?? warnings;
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  // Keep mutation responses identical to normal timetable reads. This lets the card
-  // retain its student classes immediately after an edit without waiting for polling.
+  // 修改操作的返回结构与普通时间表查询保持一致，使卡片编辑后立刻保留学生班级信息，
+  // 不必等待下一次轮询刷新。
   const studentGroups = (db.prepare("SELECT groups.code FROM section_student_groups links JOIN student_groups groups ON groups.id = links.student_group_id WHERE links.section_id = ? ORDER BY groups.code").all(lesson.section_id) as Array<{ code: string }>).map((group) => group.code);
   return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroups, occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: refreshedWarnings, warningSeverity: highestIssueSeverity(refreshedWarnings) };
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
-  // Removing one lesson returns only that weekly session to the tray; the section's
-  // other occurrence remains scheduled when a course meets twice per week.
+  // 删除一条排课只会把对应的每周课次退回待排区；若该班次每周上两次，
+  // 另一课次仍保留在原时间表位置。
   const db = database();
   const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
   if (removed) refreshAllScheduleWarnings(db);
@@ -1657,32 +1651,31 @@ export function removeScheduledLesson(id: string, revision: number) {
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
-  // Convert the validated worksheet rows into one teacher list, course list and
-  // allocation map before applying the full import transaction.
+  // 先把已验证的工作表行整理为教师清单、课程清单和教学分配映射，
+  // 再一次性执行完整导入事务。
   const db = database();
-  // Maps remove duplicates from the spreadsheet while preserving one record per
-  // teacher, course, and course-teacher allocation pair.
+  // 使用 Map 去除表格中的重复项，同时保证每位教师、每门课程以及每个课程—教师组合
+  // 最终都只有一条明确记录。
   const teachers = new Map<string, { name: string; staffType: "FT" | "PT" }>();
   const courses = new Map<string, { code: string; catalog: string | null }>();
   const allocations = new Map<string, TeachingMembersImportRow>();
 
   for (const row of rows) {
-    // Every valid workbook row contributes to the teacher master list, including a
-    // teacher whose current allocation values are all zero.
+    // 每一行有效工作表资料都会加入教师基础清单，即使该教师当前所有课程分配都为零。
     teachers.set(row.lecturer, { name: row.lecturer, staffType: row.staffType });
-    // A confirmed zero means this teacher does not teach the module: do not create
-    // the course-teacher allocation, the course, or an unscheduled section from it.
+    // 明确的零表示该教师不教授这门课，因此该单元格不会创建教师分配、课程，
+    // 也不会生成任何待排班次。
     if (row.groupCount === 0) continue;
     courses.set(row.mod, { code: row.mod, catalog: row.catalog });
-    // The null separator cannot occur in normal course codes or names, so it makes
-    // a safe composite key for repeated rows of the same allocation.
+    // 空字符分隔符不会出现在正常课程编号或姓名中，因此可安全组成复合键，
+    // 用于识别同一个教学分配在多行中重复出现的情况。
     const key = `${row.mod}\u0000${row.lecturer}`;
     const existing = allocations.get(key);
     allocations.set(key, existing ? { ...existing, groupCount: existing.groupCount + row.groupCount } : row);
   }
 
   const transaction = db.transaction(() => {
-    // Keep the import all-or-nothing: staff never see a half-imported allocation.
+    // 整个导入保持“全部成功或全部失败”的原子性，老师不会看到只导入了一半的教学分配。
     const findTeacher = db.prepare("SELECT id FROM teachers WHERE name = ?");
     const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
     const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
@@ -1693,7 +1686,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
     const teacherIds = new Map<string, string>();
 
     for (const teacher of teachers.values()) {
-      // Reuse matching manual teachers, otherwise create a new one from the file.
+      // 如果已有同名手动教师则复用其稳定 ID；否则才根据文件建立新教师。
       const existing = findTeacher.get(teacher.name) as { id: string } | undefined;
       const id = existing?.id ?? crypto.randomUUID();
       if (existing) updateTeacher.run(teacher.staffType, id);
@@ -1701,8 +1694,8 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       teacherIds.set(teacher.name, id);
     }
     for (const course of courses.values()) {
-      // Course setup fields are deliberately not replaced here; only the Excel catalog
-      // is refreshed, so future duration and room settings survive a re-import.
+      // 这里刻意不覆盖课程时长、年级和教室要求等手动设置，只刷新 Excel 课程目录资料，
+      // 因而以后重新导入教学分配时不会丢失已经完成的排课配置。
       const existing = findCourse.get(course.code) as { id: string } | undefined;
       const id = existing?.id ?? crypto.randomUUID();
       if (existing) updateCourse.run(course.catalog, id);
@@ -1710,13 +1703,12 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       courseIds.set(course.code, id);
     }
 
-    // Rebuild only courses present in this workbook. This preserves a course that
-    // staff added manually because it was omitted from Excel.
+    // 只重建本工作簿中出现的课程分配；老师因 Excel 遗漏而手动新增的其他课程会继续保留。
     const importedCourseIds = [...courseIds.values()];
     const findScheduledCourse = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? LIMIT 1`);
     for (const courseId of importedCourseIds) {
-      // Re-importing generated sections would cascade-delete their timetable work.
-      // Require staff to use manual corrections after scheduling has begun instead.
+      // 已开始排课后重新生成班次会级联删除时间表工作，因此此时拒绝自动重建，
+      // 要求老师改用手动更正，避免真实排课被意外清除。
       if (findScheduledCourse.get(courseId)) throw new Error("Teaching allocation cannot be re-imported after one of its courses has been scheduled. Use the manual course and section corrections, or start a new cycle first.");
     }
     const deleteCourseSections = db.prepare("DELETE FROM course_sections WHERE course_id = ?");
@@ -1733,7 +1725,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       const teacherId = teacherIds.get(allocation.lecturer);
       if (!courseId || !teacherId) continue;
       insertAllocation.run(crypto.randomUUID(), courseId, teacherId, allocation.groupCount);
-      // Number sections continuously for each module: LEAD_01, LEAD_02, and so on.
+      // 每门课程的班次从 01 开始连续编号，例如 LEAD_01、LEAD_02，依此类推。
       let sequence = sequenceByCourse.get(allocation.mod) ?? 0;
       for (let group = 0; group < allocation.groupCount; group += 1) {
         sequence += 1;
@@ -1744,7 +1736,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   });
   transaction();
 
-  // Return a compact audit summary for the upload confirmation message.
+  // 返回精简的审计摘要，供上传完成提示显示导入了多少教师、课程、分配和班次。
   return {
     courses: courses.size,
     teachers: teachers.size,

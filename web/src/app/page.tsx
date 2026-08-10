@@ -2,7 +2,7 @@
 
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-// Each view uses the same page shell but displays a different master-data table.
+// 所有功能页面共用同一个外层布局；View 只决定中间区域显示哪一种排课资料，避免为每张资料表重复维护导航和登录逻辑。
 type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
 type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boolean };
 
@@ -65,7 +65,7 @@ const timetableDays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const timetableHours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
 function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "blue" | "amber" | "green" | "red" }) {
-  // Reusable status badge: keeping colours here makes tables consistent and accessible.
+  // 这个共用状态标签集中管理颜色和文字样式，确保不同页面对成功、警告和错误使用一致且容易辨认的视觉表达。
   const tones = {
     slate: "bg-slate-100 text-slate-700",
     blue: "bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-200",
@@ -78,20 +78,17 @@ function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: 
 }
 
 function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
-  // Match the agreed timetable colours: red for serious issues, yellow for daily
-  // limit warnings, blue for recommendations or incomplete assignments.
+  // 按需求约定统一课程卡颜色：红色代表严重冲突，黄色代表每日时数等软性上限，蓝色代表建议事项或尚未完成的教师／教室分配。
   if (severity === "High") return { card: "bg-red-50 text-red-950 ring-red-300", message: "text-red-700" };
   if (severity === "Warning") return { card: "bg-amber-50 text-amber-950 ring-amber-300", message: "text-amber-700" };
   return { card: "bg-blue-50 text-blue-900 ring-blue-300", message: "text-blue-700" };
 }
 
 function noticeTone(message: string) {
-  // Convert human-readable operation messages into the matching success, warning,
-  // error or neutral colour used by the fixed status notice.
+  // 根据给老师看的操作结果文字选择固定提示框颜色；这样不需要每个保存函数都另外传递一套颜色状态。
   const normalized = message.toLowerCase();
   if (["could not", "unable", "failed", "error", "interrupted", "expired"].some((word) => normalized.includes(word))) return "border-red-200 bg-red-50 text-red-900";
-  // Successful candidate placement says "no warnings". Recognise that explicit
-  // success before the generic warning word so a clear save never looks cautionary.
+  // “no warnings”虽然包含 warnings 单词，实际含义是成功；因此必须先识别完整成功短语，再处理一般警告文字，避免成功结果被误标成黄色。
   if (["no warnings", "successfully", "downloaded as", "full system restored"].some((phrase) => normalized.includes(phrase))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
   if (["warning", "mismatch", "no completely clear"].some((word) => normalized.includes(word))) return "border-amber-200 bg-amber-50 text-amber-950";
   if (["saved", "success", "placed", "updated", "created", "ready", "signed in"].some((word) => normalized.includes(word))) return "border-emerald-200 bg-emerald-50 text-emerald-950";
@@ -99,8 +96,7 @@ function noticeTone(message: string) {
 }
 
 function setCompactDragPreview(event: DragEvent<HTMLElement>, label: string) {
-  // The browser normally drags a full-size copy of the course card, which hides the
-  // hour beneath the pointer. A small temporary label keeps the destination visible.
+  // 浏览器默认会把整张课程卡当作拖动影子，容易遮住鼠标下方的小时格；这里临时生成只含课程编号的小标签，让老师始终看得见目标时间。
   const preview = document.createElement("div");
   preview.textContent = label;
   preview.className = "fixed -left-[9999px] top-0 rounded-md bg-slate-900 px-2 py-1 text-xs font-bold text-white shadow-lg";
@@ -110,13 +106,11 @@ function setCompactDragPreview(event: DragEvent<HTMLElement>, label: string) {
 }
 
 function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[] {
-  // Turn saved day/time records into visual lanes so deliberate overlaps remain
-  // readable instead of drawing multiple course cards on top of one another.
+  // 把数据库保存的星期和时间转换为可视化横向通道；即使老师允许多门课重叠保存，课程卡也会并排显示，而不是互相覆盖。
   const positioned: PositionedLesson[] = [];
 
   for (let dayOfWeek = 1; dayOfWeek <= timetableDays.length; dayOfWeek += 1) {
-    // Sort one day chronologically. Longer lessons come first when starts match, so
-    // their visual lane remains stable while shorter conflicts sit beside them.
+    // 每次只处理一天并按开始时间排序；相同开始时间时先放长课，使长课通道保持稳定，较短的冲突课程再排列到旁边。
     const dayLessons = lessons
       .filter((lesson) => lesson.dayOfWeek === dayOfWeek)
       .sort((left, right) => left.startHour - right.startHour || right.durationHours - left.durationHours || left.id.localeCompare(right.id));
@@ -125,9 +119,7 @@ function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[
 
     const placeComponent = () => {
       if (component.length === 0) return;
-      // Give overlapping lessons the first available horizontal lane. Every lesson
-      // in the connected overlap group uses the final lane count, preventing cards
-      // saved with deliberate conflicts from covering one another.
+      // 每门重叠课程使用第一个已经空出的横向通道；同一组相连的重叠课程共用最终通道总数，保证所有已保存冲突都能完整并排显示。
       const laneEnds: number[] = [];
       const assignments = component.map((lesson) => {
         let lane = laneEnds.findIndex((endHour) => endHour <= lesson.startHour);
@@ -140,8 +132,7 @@ function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[
     };
 
     for (const lesson of dayLessons) {
-      // A lesson beginning exactly when the current component ends does not overlap
-      // it, so the next group can return to the full day-column width.
+      // 如果下一门课刚好在当前课程组结束时开始，两者没有时间重叠；结束当前组后，下一门课可以重新使用整列宽度。
       if (component.length > 0 && lesson.startHour >= componentEnd) {
         placeComponent();
         component = [];
@@ -162,20 +153,17 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
   focusLesson?: { id: string; requestNumber: number } | null;
 }) {
-  // This shared grid renders both editable year timetables and read-only personal
-  // timetables, while optional callbacks add drag-and-drop only where appropriate.
+  // 这张共用周表同时服务可编辑的年级总表和只读的个人课表；只有传入拖放回调时才开放拖动，避免个人课表意外修改资料。
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<TimetableDropTarget | null>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
-  // Conflict lanes stay narrow enough to scan together; a very busy day can still
-  // expand horizontally rather than drawing one lesson over another.
+  // 冲突通道尽量保持窄小，方便一次扫视多门课；极端繁忙的日期仍可横向扩展，绝不为了省空间而覆盖课程卡。
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
   const minimumGridWidth = 48 + laneCountsByDay.reduce((total, laneCount) => total + Math.max(104, laneCount * 54), 0) + (timetableDays.length * 4);
   const timetableColumns = `48px ${laneCountsByDay.map((laneCount) => `minmax(${Math.max(104, laneCount * 54)}px, ${laneCount}fr)`).join(" ")}`;
 
   useEffect(() => {
-    // Clear the green destination marker when a drag finishes anywhere, including
-    // outside this timetable, so a cancelled move never leaves a false target behind.
+    // 无论拖动在表内完成还是在表外取消，都清除绿色目标行，避免页面残留一个实际上不会接收课程的错误时间提示。
     if (!onCellDrop) return;
     const clearDropTarget = () => setDropTarget(null);
     window.addEventListener("dragend", clearDropTarget);
@@ -187,16 +175,14 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   }, [onCellDrop]);
 
   function allowCellDrop(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
-    // Every hour cell reports its exact destination and makes that row visible before
-    // the teacher releases the mouse.
+    // 鼠标经过每个小时格时立即记录确切星期和开始时间，并先显示绿色目标行，让老师在松开鼠标前确认落点。
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
     setDropTarget((current) => current?.dayOfWeek === dayOfWeek && current.startHour === startHour ? current : { dayOfWeek, startHour });
   }
 
   function hourInsideLesson(event: DragEvent<HTMLDivElement>, lesson: ScheduledLesson) {
-    // An existing multi-hour card covers several background cells. Divide its visible
-    // height into hour bands so dropping on its second or third row remains precise.
+    // 已有的多小时课程卡会遮住多个背景格；这里按课程时长把卡片高度平均分成小时段，拖到第二或第三段仍能准确得到对应开始时间。
     const bounds = event.currentTarget.getBoundingClientRect();
     const hourHeight = bounds.height / lesson.durationHours;
     const offset = Math.min(lesson.durationHours - 1, Math.max(0, Math.floor((event.clientY - bounds.top) / hourHeight)));
@@ -204,8 +190,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   }
 
   function finishCellDrop(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
-    // Clear visual guidance first, then hand the exact day and hour to the existing
-    // save workflow, which still performs every conflict and rule check.
+    // 松开鼠标后先清除视觉提示，再把准确星期和小时交给原有保存流程；保存接口仍会执行全部冲突与规则检查。
     event.preventDefault();
     event.stopPropagation();
     setDropTarget(null);
@@ -213,8 +198,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   }
 
   useEffect(() => {
-    // After a successful save, find the exact rendered wrapper without interpolating
-    // its database id into a CSS selector, then reveal it across all scroll containers.
+    // 保存成功后直接在已渲染元素中寻找相同数据库编号，不把编号拼进 CSS；找到后跨越内外滚动区把课程卡平滑移动到可见位置。
     if (!focusLesson) return;
     const scrollContainer = scrollContainerRef.current;
     const savedLesson = Array.from(scrollContainer?.querySelectorAll<HTMLElement>("[data-lesson-id]") ?? []).find((element) => element.dataset.lessonId === focusLesson.id);
@@ -222,8 +206,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   }, [focusLesson, positionedLessons]);
 
   const scrollTimetable = (direction: -1 | 1) => {
-    // Move most of one visible width at a time. The remaining overlap preserves
-    // context, so schedulers can tell which day column they just moved away from.
+    // 横向按钮每次移动约四分之三可见宽度，保留一小段原画面作为位置参照，避免老师滚动后不知道刚才离开了哪一天。
     const container = scrollContainerRef.current;
     if (!container) return;
     container.scrollBy({ left: direction * Math.max(320, container.clientWidth * 0.75), behavior: "smooth" });
@@ -231,8 +214,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 
   return (
     <div>
-      {/* Keep horizontal navigation visible above the long timetable. This avoids
-          making users scroll to 18:00 just to discover the browser scrollbar. */}
+      {/* 横向导航固定放在长总表上方；老师不需要先滚动到 18:00，才能发现底部还有浏览器横向滚动条。 */}
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
         <span>{onCellDrop ? "Drag until the green row shows the exact start hour. Use arrows only when a very busy day still overflows." : "Use the arrows or a trackpad to view every day and overlapping lesson."}</span>
         <div className="flex gap-1">
@@ -241,8 +223,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
         </div>
       </div>
       <div ref={scrollContainerRef} data-timetable-scroll className="overflow-x-auto pb-1">
-        {/* Compact 44px hour tracks fit the full 08:00–18:00 day on a normal laptop;
-            durationHours still determines the exact number of rows each card spans. */}
+        {/* 每小时使用紧凑的 44px 高度，让普通笔记本尽量一次看见 08:00–18:00；课程卡仍严格按照 durationHours 跨越对应小时数。 */}
         <div className="grid gap-x-1 text-[10px]" style={{ gridTemplateColumns: timetableColumns, gridTemplateRows: "30px repeat(10, minmax(44px, 1fr))", minHeight: 470, minWidth: minimumGridWidth }}>
         <div className="sticky left-0 z-20 bg-white pt-2 text-slate-400" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
         {timetableDays.map((day, index) => <div key={day} className="rounded-md bg-slate-50 p-1.5 text-center font-bold text-slate-500" style={{ gridColumn: index + 2, gridRow: 1 }}>{day}</div>)}
@@ -253,8 +234,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
           </div>
         ))}
 
-        {/* Background cells remain the drag targets. Lesson overlays use
-            pointer-events:none except on the cards, so empty hours stay droppable. */}
+        {/* 背景小时格始终是真正的拖放目标；课程覆盖层本身不接收鼠标，只有课程卡例外，因此所有空白小时仍可正常放入课程。 */}
         {timetableHours.flatMap((hour, hourIndex) => timetableDays.map((_, dayIndex) => (
           <div
             key={`cell-${dayIndex + 1}-${hour}`}
@@ -267,8 +247,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 
         {timetableDays.map((_, dayIndex) => (
           <div key={`overlay-${dayIndex + 1}`} className="pointer-events-none relative z-10" style={{ gridColumn: dayIndex + 2, gridRow: "2 / span 10" }}>
-            {/* This marker sits above existing cards without catching pointer events,
-                so the teacher always sees the exact hour that will receive the drop. */}
+            {/* 绿色目标行显示在已有课程卡上方但不截获鼠标事件，因此老师能看见确切落点，同时拖放仍由下方课程或小时格处理。 */}
             {dropTarget?.dayOfWeek === dayIndex + 1 && <div className="pointer-events-none absolute z-30 flex items-start rounded border-2 border-emerald-500 bg-emerald-200/70 px-1 py-0.5 font-black text-emerald-950 shadow-sm" style={{ top: `${((dropTarget.startHour - timetableHours[0]) / timetableHours.length) * 100}%`, height: `${100 / timetableHours.length}%`, left: 1, right: 1 }}><span className="rounded bg-white/90 px-1">Drop {String(dropTarget.startHour).padStart(2, "0")}:00</span></div>}
             {positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map(({ lesson, lane, laneCount }) => {
               const laneWidth = 100 / laneCount;
@@ -300,7 +279,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 }
 
 export default function Home() {
-  // View and form state control what the scheduler currently sees and edits.
+  // 这一组状态记录老师当前看到的页面、表单和业务资料；所有切换都在客户端完成，避免每次点击都重新载入整页。
   const [view, setView] = useState<View>("Year timetables");
   const [query, setQuery] = useState("");
   const [showForm, setShowForm] = useState(false);
@@ -348,21 +327,19 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // The green ring remains long enough to connect the toast to the timetable card,
-    // then clears automatically so it never looks like a permanent issue state.
+    // 保存后的绿色外框保留六秒，让老师能把右下角提示和总表课程对应起来；随后自动消失，避免被误认为永久冲突标记。
     if (!recentlySavedLesson) return;
     const timeout = window.setTimeout(() => setRecentlySavedLesson(null), 6000);
     return () => window.clearTimeout(timeout);
   }, [recentlySavedLesson]);
 
   function revealSavedLesson(id: string) {
-    // A new object is created for every save, even when the lesson id is unchanged.
-    // That restarts both scrolling and the six-second highlight after a quick edit.
+    // 每次保存都创建新的请求编号，即使课程编号没有改变也一样；这样快速连续编辑同一门课时，滚动定位和六秒高亮都会重新触发。
     savedLessonRequestNumber.current += 1;
     setRecentlySavedLesson({ id, requestNumber: savedLessonRequestNumber.current });
   }
 
-  // Filter in the browser so searching feels instant and does not repeatedly query SQLite.
+  // 教师、班级、教室和课程搜索都在浏览器内过滤已加载资料，输入时立即响应，也不会反复查询 SQLite。
   const filteredTeachers = useMemo(
     () => teachers.filter((teacher) => `${teacher.name} ${teacher.staffType}`.toLowerCase().includes(query.toLowerCase())),
     [query, teachers],
@@ -381,8 +358,7 @@ export default function Home() {
   );
   const unscheduledPrograms = useMemo(() => [...new Set(groups.map((group) => group.program))].sort(), [groups]);
   const filteredUnscheduledSections = useMemo(() => {
-    // Search enriches each tray card with its student programmes, while dropdowns
-    // provide exact filters for the most common allocation-workflow questions.
+    // 待排搜索同时检查课程、教师、学生班级和专业；下拉菜单提供精确筛选，覆盖分配工作中最常见的查找方式。
     const normalizedQuery = unscheduledQuery.trim().toLowerCase();
     const selectedGroupCode = groups.find((group) => group.id === unscheduledGroupId)?.code;
     return unscheduledSections.filter((section) => {
@@ -402,7 +378,7 @@ export default function Home() {
   }, [scheduleIssues, timetableYear]);
 
   function openView(nextView: View) {
-    // Moving between tables clears controls that belong only to the previous table.
+    // 切换资料页面时清除上一页专用的编辑对象、筛选和课程详情，防止旧状态被错误带到新的表格。
     setView(nextView);
     setQuery("");
     setShowForm(false);
@@ -420,7 +396,7 @@ export default function Home() {
   }
 
   async function openTimetable(year: number) {
-    // Load one year at a time because the department maintains three separate master tables.
+    // 系里分别维护三个年级总表，因此这里只加载一个年级的已排课程、待排课程和问题，减少页面数据量并保持年级边界清楚。
     const [lessonResponse, unscheduledResponse, issuesResponse] = await Promise.all([fetch(`/api/schedule/lessons?year=${year}`), fetch(`/api/schedule/unscheduled?year=${year}`), fetch("/api/issues")]);
     if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok) return setNotice("The year timetable could not be loaded.");
     setTimetableYear(year);
@@ -436,8 +412,7 @@ export default function Home() {
   }
 
   async function openScheduleIssue(issue: ScheduleIssue) {
-    // Load a fresh copy of both sides of the selected year's workspace before
-    // navigating, so the editor never opens an older revision from the issue list.
+    // 从问题清单打开课程前重新读取该年级的总表与待排区，确保编辑器使用最新 revision，不会覆盖另一位老师刚保存的修改。
     const [lessonResponse, unscheduledResponse] = await Promise.all([
       fetch(`/api/schedule/lessons?year=${issue.primaryYear}`),
       fetch(`/api/schedule/unscheduled?year=${issue.primaryYear}`),
@@ -446,12 +421,10 @@ export default function Home() {
 
     const nextLessons = await lessonResponse.json() as ScheduledLesson[];
     const linkedLesson = nextLessons.find((lesson) => lesson.id === issue.lessonId);
-    // A collaborator may have removed the lesson since the issues screen loaded.
-    // In that case, leave the user on the review screen and explain the stale row.
+    // 问题页显示后，其他账号可能已把课程退回待排区；如果找不到课程，就留在问题页并说明该记录已经过期。
     if (!linkedLesson) return setNotice("This lesson is no longer scheduled. Refresh the issue list to remove the old item.");
 
-    // Switch to the correct year, retain its tray, and open the normal lesson editor
-    // so the scheduler can immediately fix or return the exact lesson.
+    // 找到课程后切换到正确年级、保留该年级待排区并打开标准编辑器，让老师可以立即修正或把准确课程退回待排区。
     setTimetableYear(issue.primaryYear);
     setLessons(nextLessons);
     setUnscheduledSections(await unscheduledResponse.json() as UnscheduledSection[]);
@@ -464,14 +437,12 @@ export default function Home() {
     setShowForm(false);
     setNotice(`${issue.sectionLabel} opened from the issue list.`);
 
-    // The issue list can be far down the page; scroll the newly rendered editor
-    // into view after React has switched screens.
+    // 问题记录可能位于长页面底部；等待 React 完成页面切换后，再把新编辑器滚动到可见位置。
     requestAnimationFrame(() => document.getElementById("lesson-editor")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
 
   async function openRules() {
-    // Load restrictions and the recalculated timetable review together, so editing a
-    // rule immediately refreshes every affected issue on the same screen.
+    // 同时读取不可用时段、最新问题和可开关规则；规则改变后重新打开本页即可看到所有受影响课程的重新计算结果。
     const [rulesResponse, issuesResponse, settingsResponse] = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
     if (!rulesResponse.ok || !issuesResponse.ok || !settingsResponse.ok) return setNotice("Rules and timetable issues could not be loaded.");
     setUnavailableWindows(await rulesResponse.json());
@@ -482,8 +453,7 @@ export default function Home() {
   }
 
   async function openCycle() {
-    // Cycle tools are loaded on demand because they are used only twice per year and
-    // contain destructive actions that should never share an accidental shortcut.
+    // 新周期工具每年只使用两次，而且包含清空资料的高风险操作，因此只在进入专用页面时加载，不能与日常排课共用快捷入口。
     const response = await fetch("/api/cycle");
     if (!response.ok) return setNotice("Cycle status could not be loaded.");
     setCurrentCycle(await response.json());
@@ -492,8 +462,7 @@ export default function Home() {
   }
 
   async function loadPersonalTimetable(kind: "Teacher" | "StudentGroup" | "Room", requestedOwnerId?: string) {
-    // Choose a valid default when staff first open or switch the personal view, then
-    // keep the selected owner explicit for subsequent dropdown changes.
+    // 首次打开或切换个人课表类型时选择一个仍有效的默认对象；后续下拉变化始终明确保存教师、班级或教室编号。
     const availableOwners = kind === "Teacher"
       ? teachers.filter((teacher) => teacher.status === "Active")
       : kind === "Room"
@@ -515,8 +484,7 @@ export default function Home() {
   }
 
   async function placeSection(event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) {
-    // The dragged card identifies both its section and weekly occurrence; the server
-    // still retrieves duration and teacher data so browser changes cannot bypass rules.
+    // 拖动资料只负责标识班次或已排课程；服务端会重新读取课时、教师和班级，浏览器端即使被修改也不能绕过排课规则。
     event.preventDefault();
     const lessonId = event.dataTransfer.getData("application/x-scheduled-lesson");
     if (lessonId) {
@@ -543,8 +511,7 @@ export default function Home() {
   }
 
   async function findCandidateSlots(section: UnscheduledSection) {
-    // Suggestions are requested only when needed and replace the previous section's
-    // results, keeping the timetable sidebar compact for hundreds of sections.
+    // 只有老师点击 Clear slots 时才计算候选时段，并用新班次结果替换旧结果，避免数百个班次的建议同时挤满侧栏。
     setCandidateSection(section);
     setPlacingSection(null);
     setEditingLesson(null);
@@ -560,8 +527,7 @@ export default function Home() {
   }
 
   async function placeCandidate(slot: CandidateSlot) {
-    // A candidate includes its verified room, allowing staff to place it in one click;
-    // the POST endpoint still runs the warning engine again before saving.
+    // 候选项已经包含校验过的教室，老师可一次点击完成排课；正式保存时接口仍会再次运行警告引擎，防止候选生成后资料发生变化。
     if (!candidateSection) return;
     const [sectionId] = candidateSection.id.split(":");
     const response = await fetch("/api/schedule/lessons", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionId, occurrence: candidateSection.occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId }) });
@@ -575,8 +541,7 @@ export default function Home() {
   }
 
   async function placeSectionWithoutDrag(event: FormEvent<HTMLFormElement>) {
-    // Keyboard and mouse users can submit the inspector form instead of dragging;
-    // the save request and conflict feedback remain identical to drag placement.
+    // 不方便拖动的老师可以在 Inspector 使用键盘或鼠标选择星期、时间和教室；提交接口与拖放完全相同，因此冲突提示也一致。
     event.preventDefault();
     if (!placingSection) return;
     const data = new FormData(event.currentTarget);
@@ -601,7 +566,7 @@ export default function Home() {
   }
 
   async function saveLesson(event: FormEvent<HTMLFormElement>) {
-    // The edit panel changes placement, teacher and room in one save and then reloads warnings.
+    // 编辑面板一次保存星期、开始时间、教师和教室；成功后重新载入总表，使最新 warning 和 revision 立即显示。
     event.preventDefault();
     if (!editingLesson) return;
     const data = new FormData(event.currentTarget);
@@ -615,7 +580,7 @@ export default function Home() {
   }
 
   async function unscheduleLesson() {
-    // Unscheduling returns the section to the tray instead of deleting its course data.
+    // 取消排课只删除具体时间安排并把班次退回待排区，不删除课程设置、教师分配或学生班级关联。
     if (!editingLesson) return;
     const response = await fetch(`/api/schedule/lessons/${editingLesson.id}?revision=${editingLesson.revision}`, { method: "DELETE" });
     if (!response.ok) return setNotice("The lesson could not be returned to the tray.");
@@ -626,10 +591,9 @@ export default function Home() {
   }
 
   async function saveUnavailableWindow(event: FormEvent<HTMLFormElement>, kind: "Teacher" | "Year") {
-    // Teacher and year forms share one API while keeping their owner selectors easy to understand.
+    // 教师和年级不可用时段共用同一个接口，但表单保留各自清楚的对象选择，减少重复代码又不牺牲可理解性。
     event.preventDefault();
-    // Keep the real form element before awaiting the server. React clears
-    // event.currentTarget after the event callback yields, but this reference stays valid.
+    // 在等待服务器前保存真实表单元素；React 事件回调暂停后会把 event.currentTarget 清空，但这个独立引用仍可安全重置表单。
     const form = event.currentTarget;
     const data = new FormData(form);
     const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
@@ -641,7 +605,7 @@ export default function Home() {
   }
 
   async function removeUnavailableWindow(window: UnavailableWindow) {
-    // Deleting a window immediately changes future checks; existing lesson warnings refresh when edited.
+    // 删除不可用时段会立即影响之后的排课检查；已有课程的 warning 会在重新打开或编辑时根据最新规则刷新。
     const response = await fetch(`/api/unavailability?id=${window.id}&kind=${window.kind}`, { method: "DELETE" });
     if (!response.ok) return setNotice("Unavailable time could not be removed.");
     await openRules();
@@ -649,8 +613,7 @@ export default function Home() {
   }
 
   async function toggleRuleSetting(rule: RuleSetting) {
-    // Saving one switch then reopening the screen also recalculates every issue using
-    // the new policy, so the effect is visible immediately.
+    // 每次只保存一个规则开关，随后重新载入本页；服务端会用新政策重新计算全部问题，让开关影响立即可见。
     const response = await fetch("/api/rule-settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: rule.key, enabled: !rule.enabled }) });
     if (!response.ok) return setNotice("The rule setting could not be changed.");
     await openRules();
@@ -658,7 +621,7 @@ export default function Home() {
   }
 
   function toggleForm() {
-    // Closing a form also clears its selected record, so the next action starts cleanly.
+    // 关闭表单时同时清除当前编辑对象，下一次新增不会误带上一条教师、班级、教室或课程资料。
     setShowForm((current) => !current);
     if (showForm) {
       setEditingTeacher(null);
@@ -669,14 +632,14 @@ export default function Home() {
   }
 
   const fetchData = useCallback(async () => {
-    // Load independent reference lists together, which keeps the first screen fast.
+    // 教师、学生班级、教室和课程互不依赖，因此并行读取四张清单，缩短首次进入资料维护页的等待时间。
     const [teacherResponse, groupResponse, roomResponse, courseResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms"), fetch("/api/courses")]);
     if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok || !courseResponse.ok) throw new Error("Could not load data.");
     return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>, courseResponse.json() as Promise<Course[]>]);
   }, []);
 
   const loadData = useCallback(async () => {
-    // Reuse one refresh routine after every successful edit or import.
+    // 所有新增、编辑和 Excel 导入成功后共用这一套刷新流程，确保页面四张基础清单保持同步。
     const [nextTeachers, nextGroups, nextRooms, nextCourses] = await fetchData();
     setTeachers(nextTeachers);
     setGroups(nextGroups);
@@ -685,7 +648,7 @@ export default function Home() {
   }, [fetchData]);
 
   useEffect(() => {
-    // Authentication is checked before protected reference-data APIs are called.
+    // 页面启动时先检查登录状态，再请求受保护的业务资料；未登录浏览器不会先下载教师或课程数据。
     void fetch("/api/auth/status").then(async (response) => {
       const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
       if (status.setupRequired) return setAuthScreen("setup");
@@ -698,14 +661,12 @@ export default function Home() {
   }, [loadData]);
 
   useEffect(() => {
-    // While a scheduler is viewing live data, refresh the active screen every five
-    // seconds so edits made by another account become visible without manual reload.
+    // 老师查看实时资料时，每五秒刷新当前功能所需数据；其他账号的修改会自动出现，不需要手工刷新整页。
     if (authScreen !== "ready") return;
     let active = true;
 
     async function refreshVisibleWorkspace() {
-      // Poll only the currently visible scheduling projection. This keeps multiple
-      // logged-in browsers current without repeatedly downloading unrelated tables.
+      // 轮询只请求当前可见的年级表、个人表或规则页，既保持多浏览器同步，也避免反复下载无关资料表。
       let responses: Response[] = [];
       if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues")]);
       if (view === "Personal timetables" && personalOwnerId) responses = [await fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`)];
@@ -725,16 +686,14 @@ export default function Home() {
       setLastSyncedAt(new Date());
     }
 
-    // Five seconds feels immediate for a small scheduling team while avoiding a
-    // permanent WebSocket service during the local SQLite MVP stage.
+    // 五秒延迟对小型排课团队已接近实时，同时在本地 SQLite MVP 阶段不需要额外维护长期 WebSocket 服务。
     void refreshVisibleWorkspace();
     const interval = window.setInterval(() => void refreshVisibleWorkspace(), 5000);
     return () => { active = false; window.clearInterval(interval); };
   }, [authScreen, personalKind, personalOwnerId, timetableYear, view]);
 
   async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
-    // The same compact form handles first-admin creation and later sign-in; the server
-    // decides the security-sensitive operation from the selected endpoint.
+    // 首次管理员建立和日常登录共用同一套简洁字段；浏览器根据当前认证画面选择接口，真正的安全校验全部由服务端完成。
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const endpoint = authScreen === "setup" ? "/api/auth/setup" : "/api/auth/login";
@@ -748,7 +707,7 @@ export default function Home() {
   }
 
   async function logout() {
-    // Logout invalidates the server-side session as well as clearing the browser cookie.
+    // 登出不仅清除浏览器 Cookie，也在服务端删除会话记录，复制旧 Cookie 也不能继续访问资料。
     await fetch("/api/auth/logout", { method: "POST" });
     setCurrentUser(null);
     setAuthScreen("login");
@@ -756,8 +715,7 @@ export default function Home() {
   }
 
   async function openAccounts() {
-    // Account details are fetched only when an administrator opens this restricted
-    // view, keeping usernames out of normal scheduling screen requests.
+    // 只有管理员进入账号页时才读取账号清单，日常排课请求不会附带其他用户名，减少不必要的账号资料暴露。
     const response = await fetch("/api/auth/accounts");
     if (!response.ok) return setNotice("Only the administrator can manage accounts.");
     setAccounts(await response.json());
@@ -766,10 +724,9 @@ export default function Home() {
   }
 
   async function createAccount(event: FormEvent<HTMLFormElement>) {
-    // New schedulers receive normal access; only the initial administrator can create them.
+    // 新账号默认是普通排课账号，可以使用全部排课功能但不能建立新账号；只有初始管理员拥有账号创建权。
     event.preventDefault();
-    // Capture the form before the request so the success cleanup cannot read a
-    // cleared React event target after the asynchronous response returns.
+    // 请求前保存表单元素，避免异步响应回来后读取已被 React 清空的事件目标，导致账号其实已创建但页面误报错误。
     const form = event.currentTarget;
     const data = new FormData(form);
     const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
@@ -781,7 +738,7 @@ export default function Home() {
   }
 
   async function changePassword(event: FormEvent<HTMLFormElement>) {
-    // A successful password change signs out every browser, including this one.
+    // 密码修改成功后撤销该账号的所有浏览器会话，包括当前页面，确保旧密码建立的会话不能继续使用。
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const response = await fetch("/api/auth/password", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currentPassword: String(data.get("currentPassword") ?? ""), newPassword: String(data.get("newPassword") ?? "") }) });
@@ -793,8 +750,7 @@ export default function Home() {
   }
 
   async function changeAccountStatus(account: AppUser) {
-    // Deactivation preserves the account record but prevents future logins; the
-    // refreshed list immediately shows the administrator the new state.
+    // 停用账号会保留记录和审计关联，但阻止之后登录；保存后立即刷新清单，让管理员确认最新状态。
     const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive }) });
     if (!response.ok) return setNotice("Account status could not be changed.");
     await openAccounts();
@@ -802,10 +758,9 @@ export default function Home() {
   }
 
   async function resetAccountPassword(event: FormEvent<HTMLFormElement>) {
-    // Administrators can replace a forgotten password without learning the old one;
-    // the server also revokes that user's existing sessions after the reset.
+    // 管理员可直接替换普通账号遗忘的密码，不需要知道旧密码；重置成功后服务端同时撤销该账号现有会话。
     event.preventDefault();
-    // Retain the submitted form itself because the React event target is temporary.
+    // 先保存提交表单本身，因为 React 的事件目标只在同步回调期间可靠；服务器响应后使用稳定引用清空密码框。
     const form = event.currentTarget;
     const data = new FormData(form);
     const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });
@@ -816,8 +771,7 @@ export default function Home() {
   }
 
   async function downloadSystemBackup() {
-    // Fetching the file in the page lets authorization and integrity-check failures
-    // appear as a readable notice instead of navigating away to a JSON error screen.
+    // 由当前页面请求备份文件，权限或完整性失败时可显示易读提示，而不是跳转到只含 JSON 错误的新页面。
     setDownloadingBackup(true);
     setNotice("Creating and checking the full system backup...");
     try {
@@ -827,8 +781,7 @@ export default function Home() {
         return setNotice(body.error ?? "The full system backup could not be downloaded.");
       }
 
-      // The server supplies a safe dated filename. The temporary browser URL starts
-      // the normal download and is revoked immediately after the click is dispatched.
+      // 服务端提供安全的日期文件名；浏览器建立临时下载地址并触发下载，点击发出后立即撤销地址，避免长期占用内存。
       const disposition = response.headers.get("Content-Disposition") ?? "";
       const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "timetabling-backup.sqlite";
       const objectUrl = URL.createObjectURL(await response.blob());
@@ -841,18 +794,16 @@ export default function Home() {
       URL.revokeObjectURL(objectUrl);
       setNotice(`Full system backup downloaded as ${filename}.`);
     } catch {
-      // A disconnected local server or interrupted network request should leave the
-      // page usable and explain that no successful download can be assumed.
+      // 本地服务断开或网络请求中断时保持页面可继续操作，并明确说明不能把这次请求当作成功备份。
       setNotice("The full system backup could not be downloaded. Check the connection and try again.");
     } finally {
-      // Always re-enable the control, including when the network request itself fails.
+      // 无论成功、接口拒绝还是网络异常，最终都重新启用下载按钮，避免一次失败后按钮永久锁住。
       setDownloadingBackup(false);
     }
   }
 
   async function restoreSystemBackup(event: FormEvent<HTMLFormElement>) {
-    // The browser preserves the selected file in FormData. The server independently
-    // repeats every confirmation and performs all trust-sensitive validation.
+    // 浏览器用 FormData 原样上传所选文件和确认项；服务端会独立重复检查所有确认、文件结构和数据库完整性，不能信任前端结果。
     event.preventDefault();
     const form = event.currentTarget;
     const formData = new FormData(form);
@@ -863,16 +814,14 @@ export default function Home() {
       const body = await response.json();
       if (!response.ok) return setNotice(body.error ?? "The full system backup could not be restored.");
 
-      // A successful restore removes this session and activates the accounts stored
-      // in the selected backup, so return immediately to the sign-in screen.
+      // 完整恢复成功后当前会话已被删除，而且备份中的账号已取代在线账号；页面必须立即返回登录画面。
       form.reset();
       setCurrentUser(null);
       setAccounts([]);
       setAuthScreen("login");
       setNotice(`Full system restored. All sessions were signed out. Server safety copy: ${body.safetyBackupFilename}.`);
     } catch {
-      // Network interruption is not treated as success; the user can sign in again
-      // and inspect the data before deciding whether another restore is necessary.
+      // 网络中断不能推断恢复成功或失败；提示老师重新登录检查实际资料，再决定是否需要再次恢复。
       setNotice("The restore response was interrupted. Sign in again and verify the current system before retrying.");
     } finally {
       setRestoringBackup(false);
@@ -880,11 +829,9 @@ export default function Home() {
   }
 
   async function beginNewCycle(event: FormEvent<HTMLFormElement>) {
-    // Two explicit acknowledgements plus an exact phrase form the agreed repeated
-    // confirmation. The server independently checks the phrase before clearing data.
+    // 开始新周期要求两个勾选和完全一致的确认短语，构成约定的多重确认；服务端清空前还会独立验证一次。
     event.preventDefault();
-    // The request and reference-data reload are asynchronous, so retain the form
-    // element now for the final reset instead of returning to event.currentTarget.
+    // 清空请求和资料重载都是异步操作，因此先保存表单元素；最终重置时不能再依赖临时 event.currentTarget。
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.");
@@ -902,10 +849,9 @@ export default function Home() {
   }
 
   async function restoreCycle(event: FormEvent<HTMLFormElement>) {
-    // Restoring replaces any work created after the clear, so it requires its own
-    // acknowledgement and exact phrase rather than a one-click undo.
+    // 恢复应急副本会覆盖清空后新做的全部课程和排课，因此必须使用独立勾选与准确短语，不能设计成一键撤销。
     event.preventDefault();
-    // Store a stable form reference before waiting for the restore response.
+    // 等待恢复接口前保存稳定表单引用，确保成功后可以安全清空确认内容。
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.");
@@ -919,7 +865,7 @@ export default function Home() {
   }
 
   async function toggleTeacher(teacher: Teacher) {
-    // Status is toggled rather than deleting a teacher, protecting schedule history.
+    // 教师只切换启用状态而不删除记录，保护历史排课和分配关联；停用后不再出现在新的选择清单。
     const isActive = teacher.status !== "Active";
     const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
     if (!response.ok) return setNotice("Teacher status could not be updated.");
@@ -932,7 +878,7 @@ export default function Home() {
   }
 
   async function toggleRoom(room: Room) {
-    // The same non-destructive availability pattern applies to rooms.
+    // 教室采用相同的非破坏性停用方式，保留历史课程使用记录，同时阻止新的排课继续选择它。
     const isActive = room.status !== "Active";
     const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
     if (!response.ok) return setNotice("Room status could not be updated.");
@@ -945,10 +891,9 @@ export default function Home() {
   }
 
   async function addRecord(event: FormEvent<HTMLFormElement>) {
-    // One form handler supports the three manually maintained reference-data views.
+    // 教师、学生班级和教室三种手工资料共用一个提交入口；根据当前页面建立对应接口、方法和请求内容。
     event.preventDefault();
-    // The save request is asynchronous. Capture the form now so successful teacher,
-    // student-group and room saves can clear it without using a released React event.
+    // 保存请求是异步的，先保存真实表单；教师、学生班级或教室成功写入后，不能再使用已经释放的 React 事件目标。
     const form = event.currentTarget;
     const data = new FormData(form);
     let endpoint = "";
@@ -956,8 +901,7 @@ export default function Home() {
     let payload: Record<string, unknown> = {};
 
     if (view === "Teachers") {
-      // Reuse the same fields for creation and correction while keeping the
-      // existing teacher id when the user opened a row for editing.
+      // 教师新增和更正共用姓名与类别字段；编辑时沿用原数据库编号，使既有课程分配不会因为改名而断开。
       const name = String(data.get("name") ?? "").trim().toUpperCase();
       if (!name) return;
       endpoint = editingTeacher ? `/api/teachers/${editingTeacher.id}` : "/api/teachers";
@@ -966,7 +910,7 @@ export default function Home() {
     }
 
     if (view === "Student groups") {
-      // Group corrections update the stable record used by existing timetable links.
+      // 学生班级更正直接更新稳定记录，已关联的班次与冲突检查仍指向同一个班级编号。
       const code = String(data.get("code") ?? "").trim().toUpperCase();
       if (!code) return;
       endpoint = editingGroup ? `/api/student-groups/${editingGroup.id}` : "/api/student-groups";
@@ -975,7 +919,7 @@ export default function Home() {
     }
 
     if (view === "Rooms") {
-      // Room facilities are saved as flags for later room-requirement matching.
+      // 教室容量和设施保存为结构化标记，后续候选时段和警告引擎可以准确匹配课程的多重教室要求。
       const code = String(data.get("room") ?? "").trim().toUpperCase();
       if (!code) return;
       endpoint = editingRoom ? `/api/rooms/${editingRoom.id}` : "/api/rooms";
@@ -983,7 +927,7 @@ export default function Home() {
       payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
     }
 
-    // Send the normalised form data to the API; database validation remains the final check.
+    // 浏览器先统一大小写和数字格式再发送；数据库约束与服务端验证仍是最终防线，不能只依赖表单。
     const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) {
       const body = await response.json();
@@ -1005,16 +949,15 @@ export default function Home() {
   }
 
   async function importTeachingMembers(event: FormEvent<HTMLFormElement>) {
-    // This separate handler uploads the Excel file without converting it to JSON in the browser.
+    // Excel 使用独立上传流程，浏览器不自行转换 JSON；服务端以同一解析规则读取原始工作簿，减少格式差异。
     event.preventDefault();
-    // Keep the form element across the long workbook upload; event.currentTarget is
-    // no longer reliable after the first await even when the import itself succeeds.
+    // 工作簿上传时间较长，第一次 await 后 event.currentTarget 已不可靠；预先保存表单，导入成功后才能正常清空文件选择。
     const form = event.currentTarget;
     const formData = new FormData(form);
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.");
     setImporting(true);
-    // Let the server validate the worksheet and update all allocation records atomically.
+    // 工作表名称、表头、每行内容和全部分配由服务端校验，并在一个事务中更新，失败时不会留下半份导入资料。
     const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
     const body = await response.json();
     setImporting(false);
@@ -1029,10 +972,9 @@ export default function Home() {
   }
 
   async function addManualCourse(event: FormEvent<HTMLFormElement>) {
-    // This correction path handles a course omitted from Excel without inventing a
-    // teacher allocation; staff assign each generated section afterwards.
+    // 手工课程只用于补充 Excel 遗漏项；系统建立未分配教师的班次，不伪造 teaching allocation，老师之后逐班分配。
     event.preventDefault();
-    // Retain the form before awaiting the API so the success reset uses a stable node.
+    // 调用接口前保存表单节点，使成功后的重置不依赖已经失效的 React 事件对象。
     const form = event.currentTarget;
     const data = new FormData(form);
     const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: String(data.get("code") ?? ""), catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
@@ -1045,8 +987,7 @@ export default function Home() {
   }
 
   async function changeSectionCount(event: FormEvent<HTMLFormElement>) {
-    // Reducing the total removes only highest-numbered sections. Ask for explicit
-    // confirmation because even an unscheduled section is meaningful course data.
+    // 减少班次数量时只删除编号最高的班次；即使尚未排课也是有意义的课程资料，因此提交前要求明确确认。
     event.preventDefault();
     if (!selectedCourse) return;
     const data = new FormData(event.currentTarget);
@@ -1061,7 +1002,7 @@ export default function Home() {
   }
 
   async function saveCourseSetup(event: FormEvent<HTMLFormElement>) {
-    // The course list selects one course at a time, making the required settings less overwhelming.
+    // 课程清单每次只打开一门课的设置，避免老师同时面对 52 门课程的大量必填规则。
     event.preventDefault();
     if (!editingCourse) return;
     const data = new FormData(event.currentTarget);
@@ -1077,8 +1018,7 @@ export default function Home() {
         requiresMultiProjector: Boolean(data.get("requiresMultiProjector")),
         requiresSmartClassroom: Boolean(data.get("requiresSmartClassroom")),
         separateSectionsAcrossDays: Boolean(data.get("separateSectionsAcrossDays")),
-        // Blank bounds mean the course runs every week; otherwise the inclusive
-        // start/end pair supports any teaching interval.
+        // 起止周都留空表示每周上课；否则必须同时提供，并把开始周和结束周都包含在教学区间内。
         weekStart: data.get("weekStart") ? Number(data.get("weekStart")) : null,
         weekEnd: data.get("weekEnd") ? Number(data.get("weekEnd")) : null,
       }),
@@ -1092,8 +1032,7 @@ export default function Home() {
   }
 
   async function openSections(course: Course) {
-    // Fetch detailed sections and their imported-allocation comparison only when
-    // requested, keeping the initial 52-course table compact and quick.
+    // 只有点击 Sections 时才读取班次明细和教师分配差异，让最初的 52 门课程清单保持简洁且加载快速。
     const [sectionsResponse, allocationResponse] = await Promise.all([fetch(`/api/courses/${course.id}/sections`), fetch(`/api/courses/${course.id}/allocation`)]);
     if (!sectionsResponse.ok || !allocationResponse.ok) return setNotice("Course sections could not be loaded.");
     setSections(await sectionsResponse.json());
@@ -1104,7 +1043,7 @@ export default function Home() {
   }
 
   async function saveSection(event: FormEvent<HTMLFormElement>, section: CourseSection) {
-    // The checked group list becomes the section's future student-conflict scope.
+    // 勾选的学生班级会成为该班次之后所有学生冲突、每日时数和个人课表检查的范围。
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const response = await fetch(`/api/course-sections/${section.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teacherId: String(data.get("teacherId") ?? "") || null, studentGroupIds: data.getAll("studentGroupIds").map(String) }) });
@@ -1115,20 +1054,19 @@ export default function Home() {
     setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`);
   }
 
-  // The primary button stays contextual so staff do not need to learn separate screens.
+  // 页面主按钮根据当前资料类型自动显示新增教师、班级、教室或导入课程，减少需要记忆的不同操作入口。
   const actionLabel = view === "Student groups" ? "Add student group" : view === "Courses" ? "Import or add course" : `Add ${view.slice(0, -1).toLowerCase()}`;
 
   if (authScreen !== "ready") {
-    // Logged-out users see no scheduling data; first launch becomes administrator setup.
+    // 未登录浏览器看不到任何排课资料；数据库尚无账号时，同一画面改为建立首位管理员。
     return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
   }
 
-  // On desktop, the scheduling workbench owns the viewport so its three panes can
-  // scroll independently without hiding navigation or save feedback below the fold.
+  // 桌面端年级排课工作区占满可视高度，待排区、总表和 Inspector 各自滚动，导航与保存提示不会被推到页面下方。
   return (
     <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "xl:flex xl:h-screen xl:min-h-0 xl:flex-col xl:overflow-hidden" : ""}`}>
       {notice && <div role="status" aria-live="polite" aria-atomic="true" className={`fixed bottom-4 right-4 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span>{notice}</div>}
-      {/* Persistent identity header for the department workspace. */}
+      {/* 顶部身份栏始终显示系统名称、同步时间和当前账号，让老师确认自己正在操作哪一个工作区。 */}
       <header className="shrink-0 border-b border-slate-200 bg-white">
         <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "max-w-[1920px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
           <div className="flex items-center gap-3">
@@ -1152,7 +1090,7 @@ export default function Home() {
       </header>
 
       <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1920px] gap-3 px-3 py-3 lg:grid-cols-[140px_minmax(0,1fr)] xl:min-h-0 xl:w-full xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
-        {/* Navigation reflects the future scheduling modules; only data management is active today. */}
+        {/* 左侧导航集中全部排课模块，并用选中样式标明当前位置，避免在相似资料页面之间迷失。 */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
           <button onClick={() => void openTimetable(timetableYear)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Year timetables" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
@@ -1178,7 +1116,7 @@ export default function Home() {
         </aside>
 
         <section className={`min-w-0 ${view === "Year timetables" ? "xl:flex xl:min-h-0 xl:flex-col" : ""}`}>
-          {/* Page title and the single action that applies to the selected data view. */}
+          {/* 页面标题说明当前任务；右侧只保留与当前资料类型对应的主要操作，减少误点。 */}
           <div className={`${view === "Year timetables" ? "mb-3" : "mb-6"} flex flex-col justify-between gap-4 sm:flex-row sm:items-end`}>
             <div>
               <p className="text-sm font-semibold text-blue-700">{view === "Year timetables" ? "Year timetables" : view === "Personal timetables" ? "Personal timetables" : view === "Rules & issues" ? "Rules & issues" : view === "Cycle" ? "Cycle safety" : view === "Accounts" ? "Administration" : view === "Profile" ? "My account" : "Data management"}</p>
@@ -1191,15 +1129,14 @@ export default function Home() {
           </div>
 
           {!["Year timetables", "Personal timetables", "Rules & issues", "Cycle", "Accounts", "Profile"].includes(view) && <div className="mb-6 grid gap-4 sm:grid-cols-3">
-            {/* At-a-glance counts confirm that import and master data are ready for scheduling. */}
+            {/* 汇总数字让老师快速确认教师、学生班级和预生成班次是否准备完成，再开始正式排课。 */}
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Teachers</p><p className="mt-1 text-2xl font-black">{teachers.length}</p><p className="mt-1 text-xs text-amber-700">{teachers.filter((teacher) => teacher.staffType === "PT").length} PT priority teachers</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Student groups</p><p className="mt-1 text-2xl font-black">{groups.length}</p><p className="mt-1 text-xs text-slate-500">Across Years 1–3</p></div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-sm text-slate-500">Course sections</p><p className="mt-1 text-2xl font-black">{courses.reduce((total, course) => total + course.configuredSections, 0)}</p><p className="mt-1 text-xs text-slate-500">Pre-generated from allocation</p></div>
           </div>}
 
           {view === "Personal timetables" && (
-            /* All three read-only projections come from the same saved lessons, so
-               staff can review people and room occupancy without duplicate data. */
+            /* 教师、学生班级和教室三种个人课表都读取同一批已保存课程，不复制资料，避免不同视图出现不一致。 */
             <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
               <div className="mb-4 grid gap-3 sm:grid-cols-2">
                 <label className="text-xs font-semibold text-slate-700">
@@ -1226,8 +1163,7 @@ export default function Home() {
               <WeeklyTimetableGrid
                 lessons={personalLessons}
                 renderLesson={(lesson) => {
-                  // Personal projections use the same spanning geometry but remain
-                  // read-only, with the selected owner's most useful counterpart shown.
+                  // 个人课表沿用总表的跨小时布局但保持只读；卡片只显示与当前查看对象最有关联的教师或教室信息。
                   const issueClasses = lessonIssueClasses(lesson.warningSeverity);
                   return <div className={`h-full overflow-y-auto rounded-md p-2 shadow-sm ${issueClasses.card}`}><p className="font-black">{lesson.sectionLabel} · {lesson.durationHours}h</p><p className="mt-1 font-semibold">{String(lesson.startHour).padStart(2, "0")}:00–{String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00</p><p className="mt-1">{personalKind === "Teacher" ? lesson.roomCode ?? "Room pending" : personalKind === "Room" ? lesson.teacherName ?? "Teacher pending" : `${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`}</p>{lesson.warnings.length > 0 && <p className={`mt-1 ${issueClasses.message}`}>⚠ {lesson.warnings.length} issue{lesson.warnings.length === 1 ? "" : "s"}</p>}</div>;
                 }}
@@ -1242,8 +1178,7 @@ export default function Home() {
                   <p className="font-bold text-slate-950">Unscheduled sessions</p>
                   <p className="text-xs text-slate-500">{filteredUnscheduledSections.length} of {unscheduledSections.length} ready to place</p>
                 </div>
-                {/* Tray filters run locally over the current year response, so hundreds
-                    of sections can be narrowed instantly without extra API requests. */}
+                {/* 待排筛选直接处理当前年级已加载资料；即使有数百个班次也能即时缩小范围，不产生额外接口请求。 */}
                 <div className="mb-2 grid shrink-0 gap-2 rounded-xl bg-slate-50 p-2">
                   <input value={unscheduledQuery} onChange={(event) => setUnscheduledQuery(event.target.value)} placeholder="Course or teacher..." className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs" />
                   <div className="grid grid-cols-2 gap-2"><select value={unscheduledStaffType} onChange={(event) => setUnscheduledStaffType(event.target.value as "All" | "FT" | "PT")} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="All">FT + PT</option><option value="PT">PT priority</option><option value="FT">FT only</option></select><select value={unscheduledProgram} onChange={(event) => setUnscheduledProgram(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs"><option value="">All programmes</option>{unscheduledPrograms.map((program) => <option key={program} value={program}>{program}</option>)}</select></div>
@@ -1265,8 +1200,7 @@ export default function Home() {
                 </div>
               </aside>
 
-              {/* min-w-0 keeps a conflict-wide timetable inside this grid column, so
-                  the timetable's own controls scroll it instead of widening the page. */}
+              {/* min-w-0 强制高冲突总表留在中间栏；需要时只滚动总表本身，不把整个页面和导航一起撑宽。 */}
               <div className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <div><p className="text-xs font-semibold text-blue-700">Master timetable</p><h2 className="text-lg font-black">Year {timetableYear}</h2></div>
@@ -1277,8 +1211,7 @@ export default function Home() {
                     focusLesson={recentlySavedLesson}
                     onCellDrop={(event, dayOfWeek, startHour) => void placeSection(event, dayOfWeek, startHour)}
                     renderLesson={(lesson, isDense) => {
-                      // Three or more simultaneous lessons use narrow cards: keep the
-                      // identifiers visible here and move full details to the tooltip/editor.
+                      // 同时段达到三门课时切换窄卡，只保留扫视所需资料；完整内容放在鼠标提示和 Inspector。
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
                       return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left text-[10px] leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
                         <span className={`font-black ${isDense ? "block break-all" : "flex items-start justify-between gap-1"}`}><span className={isDense ? "" : "truncate"}>{lesson.sectionLabel}</span><span className={`${isDense ? "mt-0.5 block" : "shrink-0"} opacity-70`}>{lesson.durationHours}h</span></span>
@@ -1290,8 +1223,7 @@ export default function Home() {
                   /></div>
               </div>
 
-              {/* The inspector opens only when requested or when a course is selected,
-                  returning its width to the master timetable during overview work. */}
+              {/* Inspector 只在主动点击或选择课程时打开；总览阶段把右侧宽度还给总表，方便一次看见更多课程。 */}
               {showTimetableInspector && <aside className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-label="Timetable inspector">
                 <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div></div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -1305,8 +1237,7 @@ export default function Home() {
           )}
 
           {view === "Cycle" && currentCycle && (
-            /* Destructive cycle controls live on a dedicated screen, visually and
-               operationally separated from normal timetable editing. */
+            /* 会清空或恢复资料的新周期操作放在独立页面，并用不同视觉样式与日常排课彻底分开。 */
             <div className="mb-6 grid gap-4 lg:grid-cols-2">
               <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-2">
                 <p className="font-black text-slate-950">Current cycle contents</p>
@@ -1333,8 +1264,7 @@ export default function Home() {
           {view === "Profile" && <form onSubmit={changePassword} className="mb-6 max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="font-black">Change password</p><p className="mt-1 text-xs text-slate-500">At least 10 characters. All logged-in browsers will be signed out.</p><div className="mt-4 grid gap-3"><label className="text-sm font-semibold">Current password<input name="currentPassword" required autoComplete="current-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label><label className="text-sm font-semibold">New password<input name="newPassword" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label></div><button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Change password</button></form>}
 
           {view === "Accounts" && (
-            /* Full backup and restore stay with administrator-only account controls
-               because both operations contain passwords and all department records. */
+            /* 完整备份和恢复包含密码哈希、全部账号和部门排课资料，因此只放在管理员受限页面。 */
             <div className="mb-6 grid gap-4 lg:grid-cols-[400px_1fr]">
               <div className="grid content-start gap-4">
                 <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 shadow-sm">
@@ -1345,8 +1275,7 @@ export default function Home() {
                 </section>
 
                 <form onSubmit={restoreSystemBackup} className="rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
-                  {/* The server also saves a current-state copy, but the nearby download
-                      gives the administrator a separately controlled off-system copy. */}
+                  {/* 服务端恢复前会保存当前状态；旁边的下载再提供一份由管理员独立保管的系统外副本。 */}
                   <p className="font-black text-red-950">Restore full system backup</p>
                   <p className="mt-1 text-xs leading-5 text-red-800">The uploaded file replaces all current data and accounts. The server first retains an automatic safety copy of the current state.</p>
                   <div className="mt-4 grid gap-3 text-sm text-red-950">
@@ -1359,8 +1288,7 @@ export default function Home() {
                 </form>
 
                 <form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                  {/* Scheduler creation remains simple because only the initial
-                      administrator can reach this form. */}
+                  {/* 只有初始管理员能进入此表单，因此新排课账号只需用户名和初始密码。 */}
                   <p className="font-black">Create scheduler account</p>
                   <p className="mt-1 text-xs leading-5 text-slate-500">Schedulers receive full timetable access but cannot create accounts.</p>
                   <div className="mt-4 grid gap-3">
@@ -1371,8 +1299,7 @@ export default function Home() {
                 </form>
 
                 <form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                  {/* Password reset invalidates sessions only for the selected normal
-                      scheduler and never changes the administrator account. */}
+                  {/* 密码重置只撤销所选普通排课账号的会话，绝不修改管理员账号。 */}
                   <p className="font-black">Reset scheduler password</p>
                   <div className="mt-4 grid gap-3">
                     <select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select>
@@ -1382,8 +1309,7 @@ export default function Home() {
                 </form>
               </div>
 
-              {/* The account list is read-only except for normal scheduler status;
-                  the administrator cannot accidentally deactivate itself. */}
+              {/* 账号清单除普通账号启停外保持只读；管理员不能在这里误停用自己。 */}
               <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
                 <div className="border-b border-slate-200 p-4"><p className="font-black">Current accounts</p></div>
                 <div className="divide-y divide-slate-100">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><p className="font-bold">{account.username}</p><p className="text-xs text-slate-500">{account.isAdmin ? "Administrator · can create accounts" : "Scheduler · full timetable access"}</p></div><div className="flex items-center gap-2"><Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>{!account.isAdmin && <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">{account.isActive ? "Deactivate" : "Activate"}</button>}</div></div>)}</div>
@@ -1392,7 +1318,7 @@ export default function Home() {
           )}
 
           {view === "Rules & issues" && (
-            /* Optional policy rules are editable here; core collision checks remain fixed. */
+            /* 可变部门政策在此开关；教师、教室和学生班级同时冲突等核心检查始终固定启用。 */
             <div className="mb-4 rounded-2xl border border-slate-200 bg-white shadow-sm">
               <div className="border-b border-slate-200 p-4"><p className="font-black">Policy rule settings</p><p className="mt-1 text-xs text-slate-500">Changes immediately recalculate the issue list and future candidate slots.</p></div>
               <div className="grid gap-px bg-slate-100 md:grid-cols-2">
@@ -1409,7 +1335,7 @@ export default function Home() {
           {view === "Rules & issues" && <div className="mb-6 grid gap-4 lg:grid-cols-2"><form onSubmit={(event) => saveUnavailableWindow(event, "Teacher")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Teacher unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: a PT teacher can only teach on selected days.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" required className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Choose teacher</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name}</option>)}</select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add teacher restriction</button></form><form onSubmit={(event) => saveUnavailableWindow(event, "Year")} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="font-black text-slate-950">Year unavailable time</p><p className="mb-3 text-xs text-slate-500">Example: Year 1 has no classes on Wednesday.</p><div className="grid gap-2 sm:grid-cols-2"><select name="ownerId" className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><select name="dayOfWeek" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select><select name="startHour" defaultValue="8" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((hour) => <option key={hour} value={hour}>{hour}:00 start</option>)}</select><select name="endHour" defaultValue="18" className="rounded-lg border border-slate-200 px-3 py-2 text-sm">{[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}</select></div><button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">Add year restriction</button></form><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="border-b border-slate-200 p-4"><p className="font-black">Current unavailable windows</p></div>{unavailableWindows.length === 0 ? <p className="p-4 text-sm text-slate-500">No unavailable windows have been added.</p> : <div className="divide-y divide-slate-100">{unavailableWindows.map((window) => <div key={window.id} className="flex items-center justify-between gap-3 p-4 text-sm"><div><Pill tone={window.kind === "Teacher" ? "amber" : "blue"}>{window.kind}</Pill><span className="ml-3 font-bold">{window.ownerLabel}</span><span className="ml-3 text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][window.dayOfWeek - 1]} {window.startHour}:00–{window.endHour}:00</span></div><button onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700" type="button">Remove</button></div>)}</div>}</div><div className="rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-2"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4"><div><p className="font-black">Current timetable issues</p><p className="text-xs text-slate-500">Recalculated from every scheduled lesson and current rule.</p></div><div className="flex gap-2"><Pill tone="red">{scheduleIssues.filter((issue) => issue.severity === "High").length} high</Pill><Pill tone="amber">{scheduleIssues.filter((issue) => issue.severity === "Warning").length} warnings</Pill><Pill tone="blue">{scheduleIssues.filter((issue) => issue.severity === "Advisory").length} advisory</Pill></div></div>{scheduleIssues.length === 0 ? <p className="p-4 text-sm text-emerald-700">No issues found in scheduled lessons.</p> : <div className="max-h-[520px] divide-y divide-slate-100 overflow-y-auto">{scheduleIssues.map((issue) => <div key={issue.id} className="grid gap-2 p-4 text-sm md:grid-cols-[110px_1fr_auto]"><div><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill><p className="mt-2 text-xs font-semibold text-slate-500">{issue.category}</p></div><div><p className="font-black text-slate-950">{issue.sectionLabel} · Year {issue.primaryYear}</p><p className="mt-1 font-semibold text-slate-700">{issue.message}</p><p className="mt-1 text-xs text-slate-500">{issue.teacherName ?? "Teacher pending"} · {issue.studentGroups.join(", ") || "Student group pending"} · {issue.roomCode ?? "Room pending"}</p></div><div className="text-right"><p className="text-xs font-semibold text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00–{String(issue.endHour).padStart(2, "0")}:00</p><button onClick={() => void openScheduleIssue(issue)} className="mt-2 rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-bold text-blue-700 hover:bg-blue-50" type="button">Open lesson</button></div></div>)}</div>}</div></div>}
 
           {view !== "Year timetables" && view !== "Personal timetables" && view !== "Rules & issues" && view !== "Cycle" && view !== "Accounts" && view !== "Profile" && <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
-            {/* Table tabs and search share the same data card to minimise navigation. */}
+            {/* 资料分页与搜索共用同一卡片，减少页面跳转并保持操作位置一致。 */}
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
                 {(["Teachers", "Student groups", "Rooms", "Courses"] as View[]).map((item) => (
@@ -1420,8 +1346,7 @@ export default function Home() {
             </div>
 
             {showForm && view === "Courses" && !editingCourse && (
-              /* Import remains the normal path; the second form is the explicit
-                 correction path for a course missing from the workbook. */
+              /* Excel 导入是正常入口；右侧表单只用于明确补充工作簿遗漏课程，不能代替 teaching allocation。 */
               <div className="grid border-b border-blue-100 bg-blue-50/60 lg:grid-cols-2 lg:divide-x lg:divide-blue-100">
                 <form onSubmit={importTeachingMembers} className="p-4">
                   <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
@@ -1437,27 +1362,25 @@ export default function Home() {
             )}
 
             {showForm && view === "Courses" && editingCourse && (
-              /* Course settings are stored once and applied to all of its sections. */
+              /* 课程课时、周次数、主年级和教室要求只保存一次，并统一应用到该课程全部班次。 */
               <form key={editingCourse.id} onSubmit={saveCourseSetup} className="border-b border-emerald-100 bg-emerald-50/60 p-4">
                 <p className="mb-1 text-sm font-bold text-emerald-950">Configure {editingCourse.code}</p>
                 <p className="mb-3 text-xs leading-5 text-emerald-800">These requirements are retained when Teaching Members is imported again.</p>
                 <div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Duration (hours)<input name="durationHours" required min="2" max="4" defaultValue={editingCourse.durationHours ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label><label className="text-xs font-semibold text-slate-700">Sessions/week<select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="1">1</option><option value="2">2</option></select></label><label className="text-xs font-semibold text-slate-700">Primary year<select name="primaryYear" defaultValue={editingCourse.primaryYear ?? ""} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="">Choose later</option><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select></label><label className="text-xs font-semibold text-slate-700">Minimum capacity<input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label></div>
-                {/* Blank week bounds mean every week; entering both supports any
-                    inclusive interval such as 1–4, 3–6 or 5–8. */}
+                {/* 起止周都留空表示每周上课；同时填写时支持 1–4、3–6、5–8 等包含两端的区间。 */}
                 <div className="mt-3 max-w-lg rounded-xl border border-emerald-100 bg-white/70 p-3"><p className="text-xs font-bold text-slate-700">Teaching weeks</p><div className="mt-2 grid grid-cols-2 gap-3"><label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" defaultValue={editingCourse.weekStart ?? ""} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label><label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" defaultValue={editingCourse.weekEnd ?? ""} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label></div><p className="mt-2 text-xs text-emerald-800">Leave both blank for every week. Limited ranges include both the start and end week.</p></div>
                 <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-700"><label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} type="checkbox" /> Lab</label><label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} type="checkbox" /> Multi projector</label><label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} type="checkbox" /> Smart classroom</label><label className="flex items-center gap-2"><input name="separateSectionsAcrossDays" defaultChecked={editingCourse.separateSectionsAcrossDays} type="checkbox" /> Keep sections on different days</label><button className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white" type="submit">Save course setup</button></div>
               </form>
             )}
 
             {showForm && view !== "Courses" && (
-              /* Manual forms only collect the minimum information required for this milestone. */
+              /* 手工资料表只收集当前排课和冲突检查真正需要的字段，避免加入没有明确用途的资料。 */
               <form onSubmit={addRecord} className="border-b border-blue-100 bg-blue-50/60 p-4">
                 <p className="mb-3 text-sm font-bold text-blue-950">{editingTeacher ? `Edit ${editingTeacher.name}` : editingGroup ? `Edit ${editingGroup.code}` : editingRoom ? `Edit ${editingRoom.code}` : `New ${view.slice(0, -1)}`}</p>
                 {view === "Teachers" && <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]"><input name="name" required defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="staffType" defaultValue={editingTeacher?.staffType ?? "FT"} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingTeacher ? "Save changes" : "Save teacher"}</button></div>}
                 {view === "Student groups" && <div className="grid gap-3 sm:grid-cols-[1fr_120px_130px_auto]"><input name="code" required defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><select name="year" defaultValue={editingGroup?.year ?? 1} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select><input name="program" required defaultValue={editingGroup?.program} placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" /><button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingGroup ? "Save changes" : "Save group"}</button></div>}
                 {view === "Rooms" && (
-                  /* The same form creates or edits a room. Existing facility flags are
-                     filled from the selected table row to prevent accidental loss. */
+                  /* 教室新增和编辑共用表单；编辑时回填原容量和设施，避免只改地址却意外清除设备标记。 */
                   <div className="grid gap-3 lg:grid-cols-[1fr_110px_auto_auto_auto_auto]">
                     <input name="room" required defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <input name="capacity" required min="1" defaultValue={editingRoom?.capacity} type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
@@ -1471,7 +1394,7 @@ export default function Home() {
             )}
 
             <div className="overflow-x-auto">
-              {/* Each table is rendered only after the initial database request has completed. */}
+              {/* 首次数据库请求完成后才渲染资料表，避免加载中短暂空表被误认为资料消失。 */}
               {isLoading && <div className="p-8 text-sm text-slate-500">Loading data...</div>}
               {!isLoading && view === "Teachers" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Teacher</th><th className="px-5 py-3 font-bold">Type</th><th className="px-5 py-3 font-bold">Allocated sections</th><th className="px-5 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredTeachers.map((teacher) => <tr className="border-t border-slate-100" key={teacher.id}><td className="px-5 py-4 font-semibold text-slate-800">{teacher.name}</td><td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td><td className="px-5 py-4 text-slate-600">{teacher.sections}</td><td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td><td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => { setEditingTeacher(teacher); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></div></td></tr>)}</tbody></table>}
               {!isLoading && view === "Student groups" && <table className="w-full min-w-[650px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400"><tr><th className="px-5 py-3 font-bold">Student group</th><th className="px-5 py-3 font-bold">Year</th><th className="px-5 py-3 font-bold">Programme</th><th className="px-5 py-3 font-bold">Scheduling scope</th><th className="px-5 py-3 font-bold" /></tr></thead><tbody>{filteredGroups.map((group) => <tr className="border-t border-slate-100" key={group.id}><td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td><td className="px-5 py-4 text-right"><button onClick={() => { setEditingGroup(group); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button></td></tr>)}</tbody></table>}
@@ -1480,14 +1403,13 @@ export default function Home() {
             </div>
 
             {selectedCourse && (
-              /* Section assignment is separate from course setup because each class can differ. */
+              /* 班次分配与课程统一设置分开，因为不同班次可有不同教师和学生班级。 */
               <div className="border-t border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                   <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
                   <button onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button>
                 </div>
-                {/* Count corrections keep lower-numbered sections stable. The server
-                    refuses to remove any section that still contains scheduling work. */}
+                {/* 修正班次数量时保留低编号班次；仍含排课或班级关联的班次，服务端会拒绝删除。 */}
                 <form key={`${selectedCourse.id}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
                   <label className="text-xs font-semibold text-amber-950">Total sections<input name="sectionCount" required min="1" max="999" defaultValue={sections.length} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm" /></label>
                   <button className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900" type="submit">Update count</button>

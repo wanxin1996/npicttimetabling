@@ -5,15 +5,14 @@ import { createVerifiedSystemBackup, restoreVerifiedSystemBackup, SystemBackupVa
 export const runtime = "nodejs";
 
 export async function GET(request: NextRequest) {
-  // A full backup contains account password hashes and all department records, so
-  // normal scheduler accounts must not be able to download it.
+  // 完整备份包含账号密码哈希和全部院系资料，因此普通排课账号不能下载。
   const token = sessionToken(request);
   const user = token ? validateSession(token) : null;
   if (!user?.isAdmin) return Response.json({ error: "Only the administrator can download a full system backup." }, { status: 403 });
 
   try {
-    // The database layer creates and verifies a consistent snapshot before any bytes
-    // are sent. Content-Disposition supplies a dated filename to the browser.
+    // 数据库层在发送任何字节前先生成并验证一致快照；
+    // Content-Disposition 响应头为浏览器提供带日期的下载文件名。
     const backup = await createVerifiedSystemBackup();
     return new Response(new Uint8Array(backup.contents), {
       headers: {
@@ -24,45 +23,43 @@ export async function GET(request: NextRequest) {
       },
     });
   } catch (error) {
-    // Do not expose server file paths or SQLite details in the browser. The fixed
-    // message tells the administrator that no trustworthy download was produced.
+    // 不向浏览器暴露服务器文件路径或 SQLite 细节；固定消息只告知管理员未生成可信下载。
     console.error("System backup failed.", error);
     return Response.json({ error: "The database backup failed its safety checks. No backup was downloaded." }, { status: 500 });
   }
 }
 
 export async function POST(request: NextRequest) {
-  // Restoration replaces accounts and every timetable record, so it is restricted
-  // to the one administrator just like full-backup download.
+  // 恢复会替换账号及全部时间表记录，因此和完整备份下载一样，只允许管理员执行。
   const token = sessionToken(request);
   const user = token ? validateSession(token) : null;
   if (!user?.isAdmin) return Response.json({ error: "Only the administrator can restore a full system backup." }, { status: 403 });
 
   let formData: FormData;
   try {
-    // Route Handlers expose multipart fields through the standard Web FormData API.
-    // Malformed requests are rejected before any file or database operation begins.
+    // Route Handler 通过标准 Web FormData API 读取 multipart 字段；
+    // 格式错误的请求会在任何文件或数据库操作开始前被拒绝。
     formData = await request.formData();
   } catch {
     return Response.json({ error: "Choose a valid SQLite backup file." }, { status: 400 });
   }
 
-  // Two acknowledgements and an exact phrase provide the agreed repeated confirmation
-  // for an operation that replaces current data and signs out every browser.
+  // 两项勾选确认加准确短语，为“替换当前资料并退出所有浏览器”的高风险操作
+  // 提供约定的重复确认保护。
   if (formData.get("understandReplace") !== "on" || formData.get("understandSignOut") !== "on" || formData.get("confirmation") !== "RESTORE FULL BACKUP") {
     return Response.json({ error: "Complete both confirmations and type RESTORE FULL BACKUP exactly." }, { status: 400 });
   }
 
-  // Keep uploads below the authenticated proxy's 25 MB request limit. The normal
-  // department database is much smaller, while the cap prevents accidental huge files.
+  // 上传大小保持在认证代理 25 MB 请求上限以内。正常院系数据库远小于此值，
+  // 上限可防止误选巨大文件。
   const uploadedFile = formData.get("backupFile");
   const maximumBytes = 20 * 1024 * 1024;
   if (!(uploadedFile instanceof File) || !uploadedFile.name.toLowerCase().endsWith(".sqlite") || uploadedFile.size < 16 || uploadedFile.size > maximumBytes) {
     return Response.json({ error: "Choose a .sqlite backup file between 16 bytes and 20 MB." }, { status: 400 });
   }
 
-  // A valid SQLite 3 file begins with this fixed 16-byte header. Deeper structural,
-  // schema, relationship and administrator checks remain in the database layer.
+  // 有效 SQLite 3 文件以固定的 16 字节文件头开始；更深入的结构、表结构、
+  // 外键关系和管理员检查仍由数据库层完成。
   const contents = Buffer.from(await uploadedFile.arrayBuffer());
   if (contents.subarray(0, 16).toString("utf8") !== "SQLite format 3\u0000") {
     return Response.json({ error: "The selected file is not a SQLite database." }, { status: 400 });
@@ -72,8 +69,8 @@ export async function POST(request: NextRequest) {
     const result = await restoreVerifiedSystemBackup(contents);
     return Response.json({ restored: true, ...result });
   } catch (error) {
-    // Validation messages are safe and actionable; unexpected failures use a fixed
-    // response because server paths and SQL details must not reach the browser.
+    // 已知验证消息可以安全展示且能指导修正；意外故障则返回固定响应，
+    // 防止服务器路径和 SQL 细节进入浏览器。
     if (error instanceof SystemBackupValidationError) return Response.json({ error: error.message }, { status: 400 });
     console.error("System restore failed.", error);
     return Response.json({ error: "The system restore failed. Sign in again and verify the current data before retrying." }, { status: 500 });

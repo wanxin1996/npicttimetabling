@@ -5,21 +5,21 @@ import { createAppUser, listAppUsers, resetAppUserPassword, setAppUserStatus, va
 export const runtime = "nodejs";
 
 function administrator(request: NextRequest) {
-  // Resolve the session once for each account operation and require the additional
-  // administrator flag before reading or changing another user's account.
+  // 每次账号操作只解析一次登录会话，并额外检查管理员标记；
+  // 普通排课账号不能读取或修改其他人的账号。
   const token = sessionToken(request);
   return token ? validateSession(token) : null;
 }
 
 export async function GET(request: NextRequest) {
-  // Return the small account roster only to an authenticated administrator.
+  // 只有已经通过身份验证的管理员才能取得账号清单。
   const user = administrator(request);
   if (!user?.isAdmin) return Response.json({ error: "Only the administrator can manage accounts." }, { status: 403 });
   return Response.json(listAppUsers());
 }
 
 export async function POST(request: NextRequest) {
-  // Validate the initial username and password before creating a scheduler account.
+  // 创建排课账号前先验证用户名和初始密码，避免无效资料进入数据库。
   const user = administrator(request);
   if (!user?.isAdmin) return Response.json({ error: "Only the administrator can create accounts." }, { status: 403 });
   const body = await request.json();
@@ -30,8 +30,8 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest) {
-  // The requested action selects either reversible activation or password reset;
-  // both operations remain restricted to the administrator.
+  // 请求中的 action 决定执行可恢复的启用/停用，还是管理员密码重置；
+  // 两种操作都只允许管理员调用。
   const user = administrator(request);
   if (!user?.isAdmin) return Response.json({ error: "Only the administrator can manage accounts." }, { status: 403 });
   const body = await request.json();

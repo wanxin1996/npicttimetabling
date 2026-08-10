@@ -5,8 +5,7 @@ import { createInitialAdmin } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
-  // First-run setup accepts one administrator credential pair; the database layer
-  // rejects the request once any account already exists.
+  // 首次初始化只接受一组管理员登录资料；一旦已有任何账号，数据库层就会拒绝再次初始化。
   const body = await request.json();
   const username = typeof body.username === "string" ? body.username.trim() : "";
   const password = typeof body.password === "string" ? body.password : "";

@@ -1,16 +1,14 @@
 import { listPersonalScheduledLessons } from "@/lib/database";
 
-// Personal views are read-only projections of the same saved lessons used by the
-// three year master tables, so they cannot drift into separate timetable copies.
+// 个人视图是三个年级总表共用排课记录的只读投影，不会产生可能彼此不一致的时间表副本。
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
-  // Read the chosen owner type and id before projecting the shared timetable across
-  // all three master years.
+  // 先读取所选对象类型和 ID，再从三个主要年级的共享时间表中投影其个人日程。
   const parameters = new URL(request.url).searchParams;
   const kind = parameters.get("kind");
   const ownerId = parameters.get("ownerId") ?? "";
-  // Restrict the query to the three supported read-only timetable projections.
+  // 查询只允许教师、学生班级和教室三种受支持的只读时间表投影。
   if ((kind !== "Teacher" && kind !== "StudentGroup" && kind !== "Room") || !ownerId) return Response.json({ error: "Choose a teacher, student group or room." }, { status: 400 });
   return Response.json(listPersonalScheduledLessons(kind, ownerId));
 }

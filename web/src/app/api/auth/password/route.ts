@@ -5,8 +5,8 @@ import { changeOwnPassword, validateSession } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function PATCH(request: NextRequest) {
-  // Users may change only their own password and must present a valid current
-  // session plus the existing password before all sessions are revoked.
+  // 用户只能修改自己的密码，并且必须提供有效会话和正确旧密码；
+  // 修改成功后，该账号的所有现有会话都会撤销。
   const token = sessionToken(request);
   const user = token ? validateSession(token) : null;
   if (!user) return NextResponse.json({ error: "Authentication required." }, { status: 401 });

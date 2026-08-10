@@ -1,12 +1,10 @@
 import { listCandidateSlots } from "@/lib/database";
 
-// Suggestions are calculated on demand because every timetable edit can change which
-// teacher, student-group and room combinations are completely clear.
+// 候选建议按需实时计算，因为每次时间表编辑都可能改变哪些教师、班级、教室组合无冲突。
 export const runtime = "nodejs";
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
-  // The path identifies the generated section and the query selects which of its
-  // one or two weekly occurrences needs clear room-and-time options.
+  // URL 路径指定生成的课程班次，查询参数则指出每周一次或两次课中的哪一次需要候选时段。
   const { id } = await context.params;
   const occurrence = Number(new URL(request.url).searchParams.get("occurrence") ?? 1);
   try {

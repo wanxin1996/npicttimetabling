@@ -2,11 +2,11 @@ import { NextResponse, type NextRequest } from "next/server";
 import { sessionToken } from "@/lib/auth";
 import { validateSession } from "@/lib/database";
 
-// Every business API is protected centrally. Authentication endpoints stay public so
-// a new installation can create its first administrator and logged-out users can sign in.
+// 所有业务 API 在这里统一进行身份保护。认证接口保持公开，
+// 使全新安装能够创建首位管理员，退出状态的用户也能正常登录。
 export function proxy(request: NextRequest) {
-  // Hosting platforms need one exact unauthenticated endpoint to decide whether the
-  // service and its persistent database are ready; all business data stays protected.
+  // 托管平台需要一个明确且无需登录的健康接口，用来判断服务及持久化数据库是否就绪；
+  // 除此之外的全部业务数据仍受登录保护。
   if (request.nextUrl.pathname === "/api/health") return NextResponse.next();
   if (request.nextUrl.pathname.startsWith("/api/auth/")) return NextResponse.next();
   const token = sessionToken(request);

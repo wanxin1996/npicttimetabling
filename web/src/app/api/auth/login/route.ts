@@ -6,8 +6,7 @@ import { clearLoginFailures, loginRateLimitStatus, recordFailedLogin } from "@/l
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
-  // Malformed public requests should receive a controlled response rather than a
-  // framework error page that can expose unnecessary implementation details.
+  // 格式错误的公开登录请求应收到受控错误响应，不能返回可能泄露实现细节的框架错误页。
   let body: unknown;
   try {
     body = await request.json();
@@ -18,7 +17,7 @@ export async function POST(request: NextRequest) {
   const username = typeof credentials.username === "string" ? credentials.username.trim() : "";
   const password = typeof credentials.password === "string" ? credentials.password : "";
 
-  // Check before running password hashing, which is intentionally CPU intensive.
+  // 密码哈希刻意消耗较多 CPU，因此先执行频率限制检查，避免攻击者滥用服务器资源。
   const limit = loginRateLimitStatus(request, username);
   if (!limit.allowed) {
     return NextResponse.json(

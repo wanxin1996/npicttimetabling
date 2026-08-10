@@ -3,18 +3,18 @@ import { cycleStatus, restoreLastCycleBackup, startNewCycle } from "@/lib/databa
 export const runtime = "nodejs";
 
 export function GET() {
-  // The cycle page needs only counts and latest emergency-backup metadata.
+  // 周期页面只需要当前记录数量和最新紧急备份的基本资料，不读取完整快照。
   return Response.json(cycleStatus());
 }
 
 export async function POST(request: Request) {
-  // One endpoint handles the two related high-risk actions; the action name and
-  // exact confirmation phrase decide which database transaction may run.
+  // 同一接口处理“开始新周期”和“恢复周期”两项相关高风险操作；
+  // action 名称及准确确认短语共同决定允许执行哪个数据库事务。
   const body = await request.json();
   try {
     if (body.action === "start") {
-      // An exact server-side phrase prevents bypassing the three confirmations by
-      // calling the protected API directly with an accidental generic request.
+      // 服务器要求完全匹配确认短语，防止有人绕过界面三次确认，
+      // 用一个误发的普通请求直接调用受保护 API。
       if (body.confirmation !== "START NEW CYCLE") return Response.json({ error: "Type START NEW CYCLE exactly to continue." }, { status: 400 });
       return Response.json(startNewCycle());
     }
