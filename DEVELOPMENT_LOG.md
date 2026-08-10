@@ -1753,3 +1753,46 @@
 1. 修复教师停用后已有课程 warning、候选位置和 Inspector 下拉仍可能使用旧教师的关联语义。
 2. 升级存在已知漏洞的 Excel 解析依赖，并限制只解析 Teaching Members 工作表和允许的最大行数。
 3. 继续补齐 CRUD 自动化回归、主数据跨账号同步、规则性能和发布安全检查。
+
+## 2026-08-11｜保留停用教师关联并实时显示严重警告
+
+### 已完成
+
+- 明确统一教师状态语义：`Inactive` 只表示不能建立新的教师分配，不会删除或清空既有 Teaching allocation、课程班次、已排课程、个人课表或不可用时段关联。
+- 教师停用／启用和全部课程 warning 重算现在位于同一个 `IMMEDIATE` SQLite 事务；重算中途失败时，教师状态、更新时间和已经开始更新的 warning 会全部回滚。
+- 统一警告引擎新增 `Teacher is inactive`，问题清单明确归类为 `Availability / High`；已有停用教师的课程仍可移动、换教室、改学生班级或手工排入总表，但会持续显示红色严重警告。
+- Course Sections 和已排课程 PATCH 只在教师 ID 真正改变时要求目标教师为 Active；保留原停用教师并修改其他字段可以正常保存，尝试把停用教师改派到另一班次会得到受控 400。
+- 教师变更验证和数据库写入改用 `IMMEDIATE` 次序，并在持有写锁后再次检查 Active 状态，避免另一服务进程恰好在验证与保存之间停用教师。
+- 新增共用 `TeacherSelect`：当前教师始终使用稳定 option；停用时显示 `Inactive — current assignment` 和说明，Active 教师仍可改选。切换课程或跨账号启用／停用时都不会落到 `Teacher pending`。
+- 教师下拉改为受控草稿：若老师刚选择的新教师在保存前被另一账号停用，选项会保留为 `Inactive — choose another teacher` 并显示明确说明，不会静默跳回原教师或空值；继续保存会由服务端拒绝，原关联保持不变。
+- Inspector 编辑表单加入 `lesson id + revision` key；不关闭 Inspector 连续点击两门课程时，星期、时间、教师和教室会按新课程完整重建，不会把上一门课的默认值误存到下一门。
+- 待排接口增加 `teacherIsActive`；停用教师卡片显示红色 `Inactive teacher`，排在 Active PT／FT 之后且不再错误标成 PT priority。手工排课表单明确说明仍可保存但会产生严重警告。
+- Clear slots 在教师缺失或停用时返回清楚说明，并把 Inspector 恢复到手工排课表单；网络错误也会解除 loading，不再用普通“零候选”掩盖资料问题。
+- 个人课表重新列出停用教师并标记 `Inactive`，历史课程不会因教师离开 Active 名单而从界面消失。
+- 五秒同步在年级总表和个人课表中同时刷新教师清单；年级总表还会按稳定 ID 更新已经打开的课程编辑器、手工排课和候选对象，使另一账号改变教师状态后，卡片、警告、下拉和说明在同一轮同步中更新。
+- Teaching allocation 重导不再把既有教师自动重新启用；同一停用教师的原有自动分配可以保留稳定 ID，新增班次或把其他自动班次改派给停用教师会返回 409 并回滚整次导入。
+- 教师状态接口补齐损坏 JSON、`null` 等非对象输入的受控 400；warning 重算异常只向浏览器返回通用 500，不暴露 SQLite 或 trigger 细节。
+- 把 Inspector 原本压缩成一行的编辑表单拆成标题、问题、时间、教师、教室和操作区块，并补充初学者可读的中文业务注释。
+
+### 本次验证
+
+- `git diff --check`、`npm run lint`、`npm exec prisma validate` 与隔离副本中的 `npm run build` 全部通过；TypeScript 和 24 个页面／API 成功构建。
+- 在一次性 SQLite 建立两位教师、三个班次、三组学生和两条已排课程；停用前 Clear slots 有 33 个候选，重新启用后仍有 29 个符合当时其他课程占用情况的候选。
+- 使用 SQLite trigger 让 warning 重算在第二条课程中途失败：停用请求返回通用 500，教师仍为 Active，第一条已执行的 warning 更新也回滚；反向启用失败时教师仍为 Inactive，原 `Teacher is inactive` 仍完整保留。
+- 正常停用后，年级课程保留相同 teacher ID／姓名与 revision，warning 精确包含 `Teacher is inactive`、最高等级为 High；问题清单为 Availability／High，待排接口返回 `teacherIsActive: false`。
+- 已排课程保持原停用教师并只改开始时间成功，revision 正常增加且 warning 保留；Course Sections 保留同一停用教师并改学生班级成功；把另一 Active 教师班次改派给停用教师得到 400 且资料不变。
+- 停用教师的待排班次使用普通手工 POST 得到 201 和 High warning，证明 Clear slots 限制没有错误变成禁止保存；退回待排区后关联仍完整。
+- 个人课表 API 和真实界面都能选择停用教师并查看其历史课程；重新启用后关联不变、inactive warning 清除、候选时段恢复。
+- Teaching Members 最小工作簿首次建立一班后，停用教师再导入相同工作簿得到 200，教师保持 Inactive、班次 ID／revision／来源教师和分配数量不变；把数量从 1 增为 2 得到明确 409，数据库仍只有原班次和原分配。
+- 另一门自动维护课程尝试从 Active 教师改派到 Inactive 教师同样得到 409；班次教师、来源教师、revision 和 teaching allocation 全部保持原值。
+- 浏览器实际验证待排卡红色状态、Inspector 当前停用教师选项、Course Sections 三个班次下拉、Clear slots 回到手工表单、个人课表停用教师选项，以及只改时间后教师未被清空。
+- 不关闭 Inspector 从停用教师课程切到 Active 教师课程再切回，教师与开始时间两次都恢复正确默认值。
+- 双会话最终验收：第二会话停用教师后，打开中的 Inspector 在五秒内自动出现 High warning 且仍选中原教师；再次启用后 warning 与卡片标记自动消失，教师仍选中且 `Teacher pending` 没有被选中。
+- 未保存草稿竞态验收：课程原教师为 `TEACHER A`，界面先选择 `TEACHER B` 但不保存；第二会话停用 B 后，五秒同步仍选中并显示 `TEACHER B (Inactive — choose another teacher)`，没有回退到 A 或 pending。点击 Save 得到 `Choose an active teacher.`，数据库 section 仍为 A、section revision 与 lesson revision 均未变化。
+- 最终 `PRAGMA integrity_check` 为 `ok`、`foreign_key_check` 为空；全部账号、工作簿、trigger、教师和课程仅存在于 `/private/tmp/timetabling-inactive.fnaMNT` 隔离环境，没有修改老师正在使用的本地数据库。
+
+### 下一步
+
+1. 升级存在已知漏洞的 Excel 解析依赖，并限制解析器只读取 Teaching Members 工作表和允许的最大行数。
+2. 建立可重复执行的 API／SQLite CRUD 与外键行为自动化回归，不再只依赖开发日志中的一次性验收记录。
+3. 减少问题清单轮询造成的全库 warning 重算与写入，并补齐数据库索引和并发性能基准。

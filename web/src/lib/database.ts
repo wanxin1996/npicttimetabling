@@ -108,6 +108,7 @@ export type UnscheduledSectionRecord = {
   id: string;
   label: string;
   teacherName: string | null;
+  teacherIsActive: boolean | null;
   staffType: "FT" | "PT" | null;
   durationHours: number;
   studentGroups: string[];
@@ -775,8 +776,14 @@ export function updateTeacher(id: string, input: { name: string; staffType: "FT"
 
 export function setTeacherStatus(id: string, isActive: boolean) {
   // 停用教师只会把其从后续可选名单中隐藏，同时完整保留旧时间表中的历史记录。
-  const result = database().prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
-  return result.changes > 0;
+  // 状态和全部相关 warning 必须一起提交；重算失败时回滚状态，不能留下界面与警告互相矛盾的资料。
+  const db = database();
+  const statusTransaction = db.transaction(() => {
+    const result = db.prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
+    if (result.changes > 0) refreshAllScheduleWarnings(db);
+    return result.changes > 0;
+  });
+  return statusTransaction.immediate();
 }
 
 export function listStudentGroups(): StudentGroupRecord[] {
@@ -1227,9 +1234,11 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     if (!section) return null;
     if (section.revision !== input.revision) throw new CourseSectionRevisionConflictError();
 
-    // 教师必须仍处于启用状态；学生班级先去重，再确认每个 ID 都真实存在。
-    // 所有验证放在写入事务中，任何一项失败都不会留下半套新关联。
-    if (input.teacherId) {
+    const teacherChanged = input.teacherId !== section.teacher_id;
+
+    // 停用教师不能被分配给新的班次，但旧班次必须能够保留原教师并继续修改学生班级。
+    // 因此只有教师 ID 真正改变时才要求目标教师处于启用状态；所有验证仍留在同一个事务中。
+    if (input.teacherId && teacherChanged) {
       const teacher = db.prepare("SELECT id FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId);
       if (!teacher) throw new CourseSectionInputError("Choose an active teacher.");
     }
@@ -1244,8 +1253,6 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     const currentGroupIds = currentGroups.map((group) => group.student_group_id);
     const sortedStudentGroupIds = [...studentGroupIds].sort();
     const groupsChanged = currentGroupIds.length !== sortedStudentGroupIds.length || currentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
-    const teacherChanged = input.teacherId !== section.teacher_id;
-
     // revision 的比较必须出现在 UPDATE 条件中，不能只依靠前面的 SELECT；这样即使另一进程
     // 恰好在两条语句之间先保存，changes 也会变成 0，并触发明确的并发冲突。
     const updateResult = teacherChanged
@@ -1267,7 +1274,8 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     }
     return { courseId: section.course_id, revision: section.revision + 1 };
   });
-  return transaction();
+  // IMMEDIATE 先取得写入次序，避免另一进程恰好在验证 Active 状态与保存教师之间插入停用操作。
+  return transaction.immediate();
 }
 
 export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
@@ -1350,7 +1358,8 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   const rows = database().prepare(`
     SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
       courses.sessions_per_week, courses.week_start, courses.week_end, occurrences.occurrence,
-      teachers.name AS teacher_name, teachers.staff_type, student_groups.code AS group_code
+      teachers.name AS teacher_name, teachers.is_active AS teacher_is_active,
+      teachers.staff_type, student_groups.code AS group_code
     FROM course_sections sections
     JOIN courses ON courses.id = sections.course_id
     JOIN (SELECT 1 AS occurrence UNION ALL SELECT 2) occurrences
@@ -1360,14 +1369,18 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
     LEFT JOIN student_groups ON student_groups.id = links.student_group_id
     WHERE courses.primary_year = ? AND courses.duration_hours IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM scheduled_lessons WHERE scheduled_lessons.section_id = sections.id AND scheduled_lessons.occurrence = occurrences.occurrence)
-    ORDER BY CASE WHEN teachers.staff_type = 'PT' THEN 0 ELSE 1 END,
+    ORDER BY CASE
+      WHEN teachers.is_active = 1 AND teachers.staff_type = 'PT' THEN 0
+      WHEN teachers.is_active = 1 THEN 1
+      ELSE 2
+    END,
       courses.code, sections.sequence, occurrences.occurrence, student_groups.code
-  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null; occurrence: number; teacher_name: string | null; staff_type: "FT" | "PT" | null; group_code: string | null }>;
+  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null; occurrence: number; teacher_name: string | null; teacher_is_active: number | null; staff_type: "FT" | "PT" | null; group_code: string | null }>;
   const sections = new Map<string, UnscheduledSectionRecord>();
   for (const row of rows) {
     // 每周上两次的同一班次会生成两张独立待排卡片，分别代表第一和第二次课。
     const occurrenceKey = `${row.id}:${row.occurrence}`;
-    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
+    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, teacherIsActive: row.teacher_is_active === null ? null : row.teacher_is_active === 1, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
     if (row.group_code) section.studentGroups.push(row.group_code);
     sections.set(occurrenceKey, section);
   }
@@ -1444,6 +1457,10 @@ function calculatePlacementWarnings(db: DatabaseInstance, input: { sectionId: st
   // 草拟阶段允许暂时缺少教师、学生班级或教室分配，但系统会持续显示警告提醒补齐。
   if (!input.teacherId) warnings.push("Teacher not assigned");
   else {
+    // 停用不会删除旧排课中的教师关联。系统用高优先级警告说明这位教师已不在可用名单中，
+    // 让老师仍可移动课程或修正其他资料，同时候选位置会因为存在警告而自动排除该班次。
+    const teacher = db.prepare("SELECT is_active FROM teachers WHERE id = ?").get(input.teacherId) as { is_active: number } | undefined;
+    if (!teacher || teacher.is_active !== 1) warnings.push("Teacher is inactive");
     if (overlaps.some((row) => row.teacher_id === input.teacherId)) warnings.push("Teacher conflict");
     const unavailable = db.prepare("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?").get(input.teacherId, input.dayOfWeek, endHour, input.startHour);
     if (unavailable) warnings.push("Teacher is unavailable at this time");
@@ -1564,6 +1581,7 @@ function describeIssue(message: string): Pick<ScheduleIssueRecord, "category" | 
   // 摘要标签帮助老师快速浏览较长的问题列表，但不会改变底层规则行为：
   // 所有问题都只是警告，永远不会阻止用户保存排课。
   if (message.includes("not assigned")) return { category: "Assignment", severity: "Advisory" };
+  if (message.includes("inactive")) return { category: "Availability", severity: "High" };
   if (message.includes("unavailable")) return { category: "Availability", severity: "High" };
   if (message.includes("conflict")) return { category: "Conflict", severity: "High" };
   if (message.includes("required") || message.includes("capacity too small")) return { category: "Room", severity: "High" };
@@ -1654,6 +1672,11 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
   if (!Number.isInteger(occurrence) || occurrence < 1 || occurrence > section.sessions_per_week) throw new Error("Choose a valid weekly session.");
   const alreadyScheduled = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? AND occurrence = ?").get(sectionId, occurrence);
   if (alreadyScheduled) throw new Error("Candidate slots are only available for an unscheduled weekly session.");
+
+  // Clear slots 只展示“完全没有问题”的组合。没有教师或教师已停用时，不应返回一个含糊的空清单，
+  // 而是直接说明需要先选择 Active 教师；老师仍可绕过候选功能手工放课并保留红色警告。
+  const assignedTeacher = section.teacher_id ? db.prepare("SELECT is_active FROM teachers WHERE id = ?").get(section.teacher_id) as { is_active: number } | undefined : undefined;
+  if (!assignedTeacher || assignedTeacher.is_active !== 1) throw new Error("Assign an active teacher before looking for clear options.");
 
   // 遍历每个启用教室和所有合法整点位置；现有警告引擎是唯一判断标准，
   // 只有零条警告的排法才会通过候选筛选。
@@ -1769,8 +1792,11 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   if (!lesson) throw new Error("Scheduled lesson not found.");
   if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
-  const teacher = input.teacherId ? db.prepare("SELECT id, name FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId) as { id: string; name: string } | undefined : undefined;
-  if (input.teacherId && !teacher) throw new Error("Choose an active teacher.");
+  const teacher = input.teacherId ? db.prepare("SELECT id, name, is_active FROM teachers WHERE id = ?").get(input.teacherId) as { id: string; name: string; is_active: number } | undefined : undefined;
+  const teacherChanged = input.teacherId !== lesson.section_teacher_id;
+  // 旧排课可以继续保留已经停用的教师；只有把另一位教师新分配进来时，才强制其仍为 Active。
+  // 这可避免老师只调整时间、教室或学生班级时，隐藏的停用教师被意外清空。
+  if (input.teacherId && (!teacher || (teacherChanged && teacher.is_active !== 1))) throw new Error("Choose an active teacher.");
 
   // 去重后确认每个 ID 都来自现有学生班级，避免拼写错误或过期页面把无效关联写进数据库。
   const studentGroupIds = [...new Set(input.studentGroupIds)];
@@ -1784,12 +1810,16 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   const currentStudentGroupIds = currentStudentGroups.map((group) => group.id).sort();
   const sortedStudentGroupIds = [...studentGroupIds].sort();
   const groupsChanged = currentStudentGroupIds.length !== sortedStudentGroupIds.length || currentStudentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
-  const teacherChanged = input.teacherId !== lesson.section_teacher_id;
   const sharedAssignmentsChanged = teacherChanged || groupsChanged;
 
   // 教师、班级关联和当前课次位置必须在同一个事务中完成；任何一步失败都会整体回滚，不会留下只更新一半的排课资料。
   let refreshedWarnings = new Map<string, string[]>();
-  db.transaction(() => {
+  const updateTransaction = db.transaction(() => {
+    // 若这次真的换教师，在持有写入锁后再次检查 Active 状态；这可封住“刚验证完就被另一账号停用”的竞态。
+    if (teacherChanged && input.teacherId) {
+      const activeTeacher = db.prepare("SELECT 1 FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId);
+      if (!activeTeacher) throw new Error("Choose an active teacher.");
+    }
     // 拖动课程也会把未改变的教师和班级原样提交；只有共享分配真的变化时才修改班次 revision。
     // 教师改变才清除 Excel 来源，纯粹移动时间、改教室或只改班级都不会误伤教师来源资料。
     if (sharedAssignmentsChanged) {
@@ -1815,7 +1845,8 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
 
     // warning 属于保存结果的一部分；放在相同事务中后，若重算失败，位置、共享分配和全部 revision 会一起回滚。
     refreshedWarnings = refreshAllScheduleWarnings(db);
-  })();
+  });
+  updateTransaction.immediate();
 
   const currentLessonWarnings = refreshedWarnings.get(id) ?? [];
   const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
@@ -1866,25 +1897,29 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
     const existing = allocations.get(key);
     allocations.set(key, existing ? { ...existing, groupCount: existing.groupCount + row.groupCount } : row);
   }
-
   const transaction = db.transaction(() => {
     // 整个导入保持“全部成功或全部失败”的原子性，老师不会看到只导入了一半的教学分配。
-    const findTeacher = db.prepare("SELECT id FROM teachers WHERE name = ?");
+    const findTeacher = db.prepare("SELECT id, is_active FROM teachers WHERE name = ?");
     const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
-    const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
     const findCourse = db.prepare("SELECT id FROM courses WHERE code = ?");
     const insertCourse = db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)");
     const updateCourse = db.prepare("UPDATE courses SET catalog = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
     const courseIds = new Map<string, string>();
     const teacherIds = new Map<string, string>();
+    const teacherActiveById = new Map<string, boolean>();
+    const teacherNameById = new Map<string, string>();
 
     for (const teacher of teachers.values()) {
-      // 如果已有同名手动教师则复用其稳定 ID；否则才根据文件建立新教师。
-      const existing = findTeacher.get(teacher.name) as { id: string } | undefined;
+      // 如果已有同名手动教师则复用其稳定 ID，并保留老师在系统内明确设置的 Active／Inactive 状态；
+      // Excel 只能维护教师类型，不能用一次重新导入偷偷覆盖人工停用决定。新教师仍使用数据库默认的 Active 状态。
+      const existing = findTeacher.get(teacher.name) as { id: string; is_active: number } | undefined;
       const id = existing?.id ?? crypto.randomUUID();
       if (existing) updateTeacher.run(teacher.staffType, id);
       else insertTeacher.run(id, teacher.name, teacher.staffType);
       teacherIds.set(teacher.name, id);
+      teacherActiveById.set(id, existing ? existing.is_active === 1 : true);
+      teacherNameById.set(id, teacher.name);
     }
     for (const course of courses.values()) {
       // 这里刻意不覆盖课程时长、年级和教室要求等手动设置，只刷新 Excel 课程目录资料，
@@ -1948,8 +1983,16 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
         const desiredTeacherId = desiredTeachers[sequence - 1];
         const existingSection = existingBySequence.get(sequence);
         if (!existingSection) {
+          // 增加班次数会建立一条全新的教师分配；目标教师若已停用，整次导入必须回滚并要求先人工确认。
+          if (!teacherActiveById.get(desiredTeacherId)) {
+            throw new TeachingAllocationImportConflictError(`${teacherNameById.get(desiredTeacherId) ?? "The allocated teacher"} is inactive. Activate this teacher before assigning new sections through Teaching allocation.`);
+          }
           insertSection.run(crypto.randomUUID(), courseId, sequence, desiredTeacherId, desiredTeacherId);
         } else if (existingSection.allocation_teacher_id !== null && (existingSection.teacher_id !== desiredTeacherId || existingSection.allocation_teacher_id !== desiredTeacherId)) {
+          // 同一个停用教师已经属于该班次时可 grandfather 并保持稳定 ID；只有实际改派到停用教师才属于被禁止的新分配。
+          if (existingSection.teacher_id !== desiredTeacherId && !teacherActiveById.get(desiredTeacherId)) {
+            throw new TeachingAllocationImportConflictError(`${teacherNameById.get(desiredTeacherId) ?? "The allocated teacher"} is inactive. Activate this teacher before changing section assignments through Teaching allocation.`);
+          }
           // 自动维护的教师真的变化时提高班次 revision，使已经打开的 Sections 表单不能用旧资料覆盖导入结果。
           updateImportedSection.run(desiredTeacherId, desiredTeacherId, existingSection.id);
         }
@@ -1968,7 +2011,8 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       }
     }
   });
-  transaction();
+  // 导入会同时读取教师状态并写入教师、课程和班次；IMMEDIATE 让停用操作与导入形成清楚的先后次序。
+  transaction.immediate();
 
   // 返回精简的审计摘要，供上传完成提示显示导入了多少教师、课程、分配和班次。
   return {

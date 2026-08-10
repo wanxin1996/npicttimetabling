@@ -61,7 +61,7 @@ type CourseSection = {
 };
 type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
-type UnscheduledSection = { id: string; label: string; teacherName: string | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
+type UnscheduledSection = { id: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
@@ -132,6 +132,53 @@ function StudentGroupSelector({ groups, selectedIds }: { groups: StudentGroup[];
         ))}
       </div>
     </fieldset>
+  );
+}
+
+function TeacherSelect({ teachers, selectedTeacherId, selectedTeacherName, ariaLabel }: { teachers: Teacher[]; selectedTeacherId: string | null; selectedTeacherName: string | null; ariaLabel: string }) {
+  // Active 教师是唯一允许建立“新分配”的选项；如果旧班次当前引用的教师已经停用，
+  // 仍额外渲染这一项，避免浏览器因为找不到 defaultValue 而自动退回 Teacher pending。
+  const [draftTeacherId, setDraftTeacherId] = useState(selectedTeacherId ?? "");
+  const selectedTeacher = selectedTeacherId ? teachers.find((teacher) => teacher.id === selectedTeacherId) : undefined;
+  const draftTeacher = draftTeacherId ? teachers.find((teacher) => teacher.id === draftTeacherId) : undefined;
+  const currentTeacherIsUnavailable = Boolean(selectedTeacherId) && selectedTeacher?.status !== "Active";
+  const newDraftTeacherIsUnavailable = Boolean(draftTeacherId) && draftTeacherId !== selectedTeacherId && draftTeacher?.status !== "Active";
+  const currentTeacherLabel = selectedTeacher?.status === "Active"
+    ? `${selectedTeacher.name} (${selectedTeacher.staffType})`
+    : `${selectedTeacherName ?? selectedTeacher?.name ?? "Current teacher"} (Inactive — current assignment)`;
+
+  return (
+    <div className="grid gap-1">
+      <select
+        name="teacherId"
+        value={draftTeacherId}
+        onChange={(event) => setDraftTeacherId(event.target.value)}
+        aria-label={ariaLabel}
+        aria-invalid={newDraftTeacherIsUnavailable || undefined}
+        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"
+      >
+        <option value="">Teacher pending</option>
+        {/* 当前教师无论 Active／Inactive 都保留同一个 key 和 value；跨账号状态刷新只改标签，不会让原生 select 跳回首项。 */}
+        {selectedTeacherId && (
+          <option key={`current-${selectedTeacherId}`} value={selectedTeacherId}>{currentTeacherLabel}</option>
+        )}
+        {/* 未保存的新选择可能被另一账号停用；保留原草稿值并显示失效原因，不能让原生 select 静默跳回空值或原教师。 */}
+        {newDraftTeacherIsUnavailable && (
+          <option key={`unavailable-draft-${draftTeacherId}`} value={draftTeacherId}>
+            {draftTeacher?.name ?? "Selected teacher"} (Inactive — choose another teacher)
+          </option>
+        )}
+        {teachers.filter((teacher) => teacher.status === "Active" && teacher.id !== selectedTeacherId).map((teacher) => (
+          <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>
+        ))}
+      </select>
+      {currentTeacherIsUnavailable && (
+        <p className="text-[10px] leading-4 text-red-700">This teacher is inactive. Keep the current assignment temporarily, or choose an active teacher.</p>
+      )}
+      {newDraftTeacherIsUnavailable && (
+        <p className="text-[10px] font-semibold leading-4 text-red-700">Your unsaved teacher selection became inactive. Choose an active teacher before saving.</p>
+      )}
+    </div>
   );
 }
 
@@ -518,30 +565,33 @@ export default function Home() {
   }
 
   async function openTimetable(year: number, signal?: AbortSignal): Promise<boolean> {
-    // 系里分别维护三个年级总表，因此这里只加载一个年级的已排课程、待排课程和问题，减少页面数据量并保持年级边界清楚。
+    // 系里分别维护三个年级总表，因此这里只加载一个年级的已排课程、待排课程、问题和教师状态。
     // 返回 boolean 让多人冲突处理能够准确说明“最新资料已重载”或“需要手动刷新”，不能给老师错误的成功保证。
-    // 可选 signal 只由首次排课链传入，使 POST 成功后的三个刷新请求也受同一个 30 秒总时限保护。
+    // 可选 signal 只由首次排课链传入，使 POST 成功后的四个刷新请求也受同一个 30 秒总时限保护。
     try {
-      const [lessonResponse, unscheduledResponse, issuesResponse] = await Promise.all([
+      const [lessonResponse, unscheduledResponse, issuesResponse, teacherResponse] = await Promise.all([
         fetch(`/api/schedule/lessons?year=${year}`, { signal }),
         fetch(`/api/schedule/unscheduled?year=${year}`, { signal }),
         fetch("/api/issues", { signal }),
+        fetch("/api/teachers", { signal }),
       ]);
-      if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok) {
+      if (!lessonResponse.ok || !unscheduledResponse.ok || !issuesResponse.ok || !teacherResponse.ok) {
         setNotice("The year timetable could not be loaded.");
         return false;
       }
-      // 三个响应必须全部成功解析后才一起写入 React state；若网络在解析中断，
+      // 四个响应必须全部成功解析后才一起写入 React state；若网络在解析中断，
       // 页面会完整保留上一版，而不会出现“新课程 + 旧待排区 + 旧问题”的混合画面。
-      const [nextLessons, nextUnscheduledSections, nextScheduleIssues] = await Promise.all([
+      const [nextLessons, nextUnscheduledSections, nextScheduleIssues, nextTeachers] = await Promise.all([
         lessonResponse.json() as Promise<ScheduledLesson[]>,
         unscheduledResponse.json() as Promise<UnscheduledSection[]>,
         issuesResponse.json() as Promise<ScheduleIssue[]>,
+        teacherResponse.json() as Promise<Teacher[]>,
       ]);
       setTimetableYear(year);
       setLessons(nextLessons);
       setUnscheduledSections(nextUnscheduledSections);
       setScheduleIssues(nextScheduleIssues);
+      setTeachers(nextTeachers);
       setView("Year timetables");
       setShowForm(false);
       setEditingLesson(null);
@@ -611,7 +661,8 @@ export default function Home() {
   async function loadPersonalTimetable(kind: "Teacher" | "StudentGroup" | "Room", requestedOwnerId?: string) {
     // 首次打开或切换个人课表类型时选择一个仍有效的默认对象；后续下拉变化始终明确保存教师、班级或教室编号。
     const availableOwners = kind === "Teacher"
-      ? teachers.filter((teacher) => teacher.status === "Active")
+      // 个人课表属于历史排课查询，因此停用教师仍必须可见；首次打开时则优先选择 Active 教师。
+      ? [...teachers].sort((left, right) => Number(right.status === "Active") - Number(left.status === "Active"))
       : kind === "Room"
         ? rooms.filter((room) => room.status === "Active")
         : groups;
@@ -622,7 +673,7 @@ export default function Home() {
     setShowForm(false);
     if (!ownerId) {
       setPersonalLessons([]);
-      const missingOwner = kind === "Teacher" ? "active teacher" : kind === "Room" ? "active room" : "student group";
+      const missingOwner = kind === "Teacher" ? "teacher" : kind === "Room" ? "active room" : "student group";
       return setNotice(`Add at least one ${missingOwner} before opening a personal timetable.`);
     }
     const response = await fetch(`/api/schedule/personal?kind=${kind}&ownerId=${encodeURIComponent(ownerId)}`);
@@ -738,12 +789,25 @@ export default function Home() {
     setCandidateSlots([]);
     setCandidatesLoading(true);
     const [sectionId] = section.id.split(":");
-    const response = await fetch(`/api/course-sections/${sectionId}/candidates?occurrence=${section.occurrence}`);
-    const body = await response.json();
-    setCandidatesLoading(false);
-    if (!response.ok) return setNotice(body.error ?? "Candidate slots could not be calculated.");
-    setCandidateSlots(body.slots);
-    setNotice(body.slots.length ? `${body.slots.length} completely clear room and time options found for ${section.label}.` : `No completely clear options found for ${section.label}. Check its assignments and restrictions.`);
+    try {
+      const response = await fetch(`/api/course-sections/${sectionId}/candidates?occurrence=${section.occurrence}`);
+      const body = await response.json();
+      if (!response.ok) {
+        // 教师缺失或停用等资料问题不应伪装成“没有空位”；返回原排课表单后，老师仍可手工放课并接受警告。
+        setCandidateSection(null);
+        setPlacingSection(section);
+        return setNotice(body.error ?? "Candidate slots could not be calculated.");
+      }
+      setCandidateSlots(body.slots);
+      setNotice(body.slots.length ? `${body.slots.length} completely clear room and time options found for ${section.label}.` : `No completely clear options found for ${section.label}. Check its assignments and restrictions.`);
+    } catch {
+      // 网络中断也要恢复面板和 loading 状态，不能把 Inspector 永久留在 Checking 状态。
+      setCandidateSection(null);
+      setPlacingSection(section);
+      setNotice("Candidate slots could not be calculated. Check the connection and try again.");
+    } finally {
+      setCandidatesLoading(false);
+    }
   }
 
   async function placeCandidate(slot: CandidateSlot) {
@@ -894,8 +958,8 @@ export default function Home() {
     async function refreshVisibleWorkspace() {
       // 轮询只请求当前可见的年级表、个人表或规则页，既保持多浏览器同步，也避免反复下载无关资料表。
       let responses: Response[] = [];
-      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues")]);
-      if (view === "Personal timetables" && personalOwnerId) responses = [await fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`)];
+      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues"), fetch("/api/teachers")]);
+      if (view === "Personal timetables" && personalOwnerId) responses = await Promise.all([fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`), fetch("/api/teachers")]);
       if (view === "Rules & issues") responses = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
       if (!active || responses.length === 0) return;
       if (responses.some((response) => response.status === 401)) {
@@ -906,8 +970,24 @@ export default function Home() {
       if (responses.some((response) => !response.ok)) return;
       const payloads = await Promise.all(responses.map((response) => response.json()));
       if (!active) return;
-      if (view === "Year timetables") { setLessons(payloads[0]); setUnscheduledSections(payloads[1]); setScheduleIssues(payloads[2]); }
-      if (view === "Personal timetables") setPersonalLessons(payloads[0]);
+      if (view === "Year timetables") {
+        const nextLessons = payloads[0] as ScheduledLesson[];
+        const nextUnscheduledSections = payloads[1] as UnscheduledSection[];
+        setLessons(nextLessons);
+        setUnscheduledSections(nextUnscheduledSections);
+        setScheduleIssues(payloads[2] as ScheduleIssue[]);
+        setTeachers(payloads[3] as Teacher[]);
+
+        // Inspector 和手工排课表单保存的是“当前记录对象”；只更新背景清单会让已打开面板继续显示旧教师状态。
+        // 每次轮询按稳定 ID 对齐这些对象，使另一账号停用／启用教师后，警告、下拉和红色说明一起更新。
+        setEditingLesson((current) => current ? nextLessons.find((lesson) => lesson.id === current.id) ?? null : null);
+        setPlacingSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? null : null);
+        setCandidateSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? null : null);
+      }
+      if (view === "Personal timetables") {
+        setPersonalLessons(payloads[0] as ScheduledLesson[]);
+        setTeachers(payloads[1] as Teacher[]);
+      }
       if (view === "Rules & issues") { setUnavailableWindows(payloads[0]); setScheduleIssues(payloads[1]); setRuleSettings(payloads[2]); }
       setLastSyncedAt(new Date());
     }
@@ -1396,6 +1476,7 @@ export default function Home() {
                   {personalKind === "Teacher" ? "Teacher" : personalKind === "Room" ? "Room" : "Student group"}
                   <select value={personalOwnerId} onChange={(event) => void loadPersonalTimetable(personalKind, event.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
                     {personalKind === "Teacher" && teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}
+                    {personalKind === "Teacher" && teachers.filter((teacher) => teacher.status === "Inactive").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType}, Inactive)</option>)}
                     {personalKind === "StudentGroup" && groups.map((group) => <option key={group.id} value={group.id}>{group.code} · Year {group.year}</option>)}
                     {personalKind === "Room" && rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
                   </select>
@@ -1440,10 +1521,16 @@ export default function Home() {
                 </div>
                 <div className="grid min-h-0 flex-1 content-start gap-2 overflow-y-auto pr-1">
                   {filteredUnscheduledSections.map((section) => (
-                    <div key={section.id} draggable={placingSessionKey === null} onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, section.label); }} className={`rounded-lg border p-2 text-[11px] ${placingSessionKey ? "cursor-wait opacity-60" : "cursor-grab active:cursor-grabbing"} ${section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
-                      <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
+                    <div key={section.id} draggable={placingSessionKey === null} onDragStart={(event) => { event.dataTransfer.setData("text/plain", section.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, section.label); }} className={`rounded-lg border p-2 text-[11px] ${placingSessionKey ? "cursor-wait opacity-60" : "cursor-grab active:cursor-grabbing"} ${section.teacherIsActive === false ? "border-red-300 bg-red-50 text-red-950" : section.staffType === "PT" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-blue-200 bg-blue-50 text-blue-950"}`}>
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="font-black">{section.label}</p>
+                        <div className="flex flex-wrap justify-end gap-1">
+                          {section.teacherIsActive === false && <Pill tone="red">Inactive teacher</Pill>}
+                          {section.teacherIsActive !== false && section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}
+                        </div>
+                      </div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
-                      <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
+                      <p className={`mt-1 ${section.teacherIsActive === false ? "text-red-700" : section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
                       {/* 使用按钮开始排课或寻找空位时，右侧 Inspector 会接管下一步操作，因此同步收起待排抽屉，避免两个面板夹窄总表。 */}
                       <div className="mt-1.5 grid grid-cols-2 gap-1">
                         <button
@@ -1572,7 +1659,63 @@ export default function Home() {
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
                   {/* 学生班级选择器使用 form 属性连接到下方编辑表单，因此可以保持独立、易读的代码区块，同时仍由同一个 Save changes 一次提交。 */}
                   {editingLesson && <div className="mb-3"><StudentGroupSelector key={`${editingLesson.id}:${editingLesson.revision}`} groups={groups} selectedIds={editingLesson.studentGroupIds} /></div>}
-                  {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
+                  {editingLesson ? (
+                    <form key={`${editingLesson.id}:${editingLesson.revision}`} id="lesson-editor" onSubmit={saveLesson} className="grid gap-3">
+                      {/* 标题和关闭按钮只控制当前课程编辑器，不会关闭整个 Inspector。 */}
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p>
+                          <p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p>
+                        </div>
+                        <button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button>
+                      </div>
+
+                      {/* 当前规则消息直接放在表单上方，老师保存前可以确认哪些问题仍会保留。 */}
+                      {editingLesson.warnings.length > 0 && (
+                        <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800">
+                          <p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p>
+                          <ul className="mt-1 list-disc space-y-1 pl-4">
+                            {editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* 星期和开始时间都使用整点选项，并按课程时长排除超过 18:00 的开始时间。 */}
+                      <label className="text-xs font-semibold text-slate-700">
+                        Day
+                        <select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                          {["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold text-slate-700">
+                        Start hour
+                        <select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                          {timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+                        </select>
+                      </label>
+
+                      {/* 停用教师若已经属于这门课，会作为“当前分配”保留；其他可改选项只来自 Active 名单。 */}
+                      <div className="grid gap-1 text-xs font-semibold text-slate-700">
+                        <span>Teacher</span>
+                        <TeacherSelect teachers={teachers} selectedTeacherId={editingLesson.teacherId} selectedTeacherName={editingLesson.teacherName} ariaLabel={`Teacher for ${editingLesson.sectionLabel}`} />
+                      </div>
+
+                      {/* 教室允许暂时留空，因为草稿可以带警告保存；新选择仍只显示 Active 教室。 */}
+                      <label className="text-xs font-semibold text-slate-700">
+                        Room
+                        <select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                          <option value="">Room pending</option>
+                          {rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
+                        </select>
+                      </label>
+
+                      {/* Return to tray 删除当前课次位置；Save changes 则保留课次并重新计算全部警告。 */}
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button>
+                        <button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button>
+                      </div>
+                    </form>
+                  )
                   : placingSection ? (
                     <form onSubmit={placeSectionWithoutDrag} className="grid gap-3">
                       {/* 标题区始终保留当前班次编号；保存进行中不允许关闭，避免老师误以为请求已经取消。 */}
@@ -1585,9 +1728,10 @@ export default function Home() {
                       </div>
 
                       {/* 共享教师、学生班级和课时来自班次资料；首次放置这里只决定时间与教室。 */}
-                      <div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900">
-                        <p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p>
+                      <div className={`rounded-xl p-3 text-xs ${placingSection.teacherIsActive === false ? "bg-red-50 text-red-900" : "bg-blue-50 text-blue-900"}`}>
+                        <p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}{placingSection.teacherIsActive === false ? " (Inactive)" : ""}</p>
                         <p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p>
+                        {placingSection.teacherIsActive === false && <p className="mt-1 font-semibold">Manual placement is allowed, but it will be saved with a serious warning.</p>}
                       </div>
 
                       {/* 请求发出后锁定三个选择器，确保按钮显示的资料与服务器实际收到的资料完全一致。 */}
@@ -1864,10 +2008,8 @@ export default function Home() {
                     <form key={`${section.id}:${section.revision}`} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3">
                       <div className="grid gap-3 md:grid-cols-[130px_1fr_auto]">
                         <p className="pt-2 font-bold text-slate-900">{section.label}</p>
-                        <select name="teacherId" defaultValue={section.teacherId ?? ""} aria-label={`Teacher for ${section.label}`} className="rounded-lg border border-slate-200 px-3 py-2 text-sm">
-                          <option value="">Teacher pending</option>
-                          {teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}
-                        </select>
+                        {/* 旧班次可保留当前停用教师，但只有 Active 教师会出现在可改选名单中。 */}
+                        <TeacherSelect teachers={teachers} selectedTeacherId={section.teacherId} selectedTeacherName={section.teacherName} ariaLabel={`Teacher for ${section.label}`} />
                         <button disabled={savingSectionId !== null} className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit" aria-label={`Save ${section.label} assignments`}>
                           {savingSectionId === section.id ? "Saving..." : "Save"}
                         </button>
