@@ -77,6 +77,22 @@ function Pill({ children, tone = "slate" }: { children: React.ReactNode; tone?: 
   return <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
 }
 
+function WorkspaceMenuButton({ active, icon, label, onClick }: { active: boolean; icon: string; label: string; onClick: () => void }) {
+  // 顶部 Workspace 的所有入口共用这一种按钮，避免不同页面各自复制颜色、间距和无障碍属性后逐渐出现差异。
+  // aria-current 会让屏幕阅读器说明当前所在页面；按钮保持 shrink-0，窗口不足时由外层菜单横向滚动，而不是压扁文字。
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs transition ${active ? "bg-blue-50 font-black text-blue-800 ring-1 ring-inset ring-blue-100" : "font-semibold text-slate-600 hover:bg-slate-50 hover:text-slate-950"}`}
+      type="button"
+      aria-current={active ? "page" : undefined}
+    >
+      <span className="text-sm" aria-hidden="true">{icon}</span>
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
   // 按需求约定统一课程卡颜色：红色代表严重冲突，黄色代表每日时数等软性上限，蓝色代表建议事项或尚未完成的教师／教室分配。
   if (severity === "High") return { card: "bg-red-50 text-red-950 ring-red-300", message: "text-red-700" };
@@ -157,11 +173,11 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<TimetableDropTarget | null>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
-  // 先统计每天最多有多少门课同时上课，再只给繁忙日期有限的额外宽度；每条并排课程预留约 36px，但一天的最低宽度最多只增长到 252px。
-  // 旧版会继续按通道数无限放大繁忙日期；现在宽度增长有上限，并且普通日期缩到 104px，把有限屏幕优先留给需要显示教师姓名的卡片。
+  // 先统计每天最多有多少门课同时上课，再给繁忙日期有限的额外宽度；每条并排课程预留约 44px，一天最多增长到 288px。
+  // 三个最宽日期连同时间轴约占 924px，在 1024px 电脑和个人课表内仍给滚动条、边距及像素舍入保留安全空间。
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
-  const dayWidthWeights = laneCountsByDay.map((laneCount) => laneCount <= 2 ? 1 : Math.min(2.5, 1 + ((laneCount - 2) * 0.3)));
-  const dayMinimumWidths = laneCountsByDay.map((laneCount) => Math.min(252, Math.max(104, laneCount * 36)));
+  const dayWidthWeights = laneCountsByDay.map((laneCount) => laneCount <= 2 ? 1 : Math.min(2.4, 1 + ((laneCount - 2) * 0.28)));
+  const dayMinimumWidths = laneCountsByDay.map((laneCount) => Math.min(288, Math.max(136, laneCount * 44)));
   const minimumGridWidth = 48 + dayMinimumWidths.reduce((total, width) => total + width, 0) + (timetableDays.length * 4);
   const timetableColumns = `48px ${dayMinimumWidths.map((width, index) => `minmax(${width}px, ${dayWidthWeights[index]}fr)`).join(" ")}`;
 
@@ -217,9 +233,9 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 
   return (
     <div>
-      {/* 五天默认保持在同一屏；繁忙日期只取得有限的额外宽度，横向导航只作为小窗口的备用方式。 */}
+      {/* 总表只承诺至少三个连续工作日同屏；繁忙日期可以更宽，其余日期通过明确的左右按钮查看，不再为了五天全塞入而无限缩小课程卡。 */}
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-        <span>{onCellDrop ? "All five days stay on screen. Busy days receive limited extra space for readable cards." : "All five days stay on screen; use the arrows only on a narrow window."}</span>
+        <span>{onCellDrop ? "At least three days stay visible. Busy days use wider cards; use the arrows for the rest." : "At least three days stay visible; use the arrows to review the rest."}</span>
         <div className="flex gap-1">
           <button onClick={() => scrollTimetable(-1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable left">← Left</button>
           <button onClick={() => scrollTimetable(1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable right">Right →</button>
@@ -1116,61 +1132,52 @@ export default function Home() {
     return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
   }
 
-  // 桌面端年级排课工作区占满可视高度：总表默认占据导航之外的全部宽度，待排抽屉只在需要时临时加入左栏。
+  // 桌面端年级排课工作区占满可视高度：Workspace 已移到顶栏，总表默认占据页面安全边距之外的全部宽度，待排抽屉只在需要时临时加入左栏。
   // Inspector 浮在总表右侧并独立滚动；操作提示固定在顶部且可关闭，避免遮住 Inspector 底部的保存按钮。
   return (
-    <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "xl:flex xl:h-screen xl:min-h-0 xl:flex-col xl:overflow-hidden" : ""}`}>
-      {notice && showNoticeToast && <div className="pointer-events-none fixed inset-x-3 top-3 z-50 flex justify-end sm:left-auto sm:right-4 sm:max-w-sm"><div role="status" aria-live="polite" aria-atomic="true" className={`pointer-events-auto flex max-h-32 w-full items-start gap-3 overflow-hidden rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span><p className="min-w-0 flex-1 overflow-y-auto leading-5">{notice}</p><button onClick={() => setShowNoticeToast(false)} className="-mr-1 shrink-0 rounded-md px-2 py-1 text-base leading-none opacity-70 hover:bg-black/5 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current" type="button" aria-label="Dismiss notification">×</button></div></div>}
-      {/* 顶部身份栏始终显示系统名称、同步时间和当前账号，让老师确认自己正在操作哪一个工作区。 */}
+    <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "lg:flex lg:h-screen lg:min-h-0 lg:flex-col lg:overflow-hidden" : ""}`}>
+      {/* Workspace 进入顶栏后，操作提示改放在顶栏下方中央，只覆盖无操作的页面标题；这样不会挡住菜单、账号、总表工具栏或 Inspector。 */}
+      {notice && showNoticeToast && <div className="pointer-events-none fixed left-1/2 top-28 z-50 flex w-[calc(100%-1.5rem)] max-w-md -translate-x-1/2 justify-center md:top-16"><div role="status" aria-live="polite" aria-atomic="true" className={`pointer-events-auto flex max-h-32 w-full items-start gap-3 overflow-hidden rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span><p className="min-w-0 flex-1 overflow-y-auto leading-5">{notice}</p><button onClick={() => setShowNoticeToast(false)} className="-mr-1 shrink-0 rounded-md px-2 py-1 text-base leading-none opacity-70 hover:bg-black/5 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current" type="button" aria-label="Dismiss notification">×</button></div></div>}
+      {/* 顶栏同时容纳系统身份、Workspace 菜单和当前账号；桌面端保持单行以保留课表高度，窄屏时只有菜单换到下一行并自行横向滚动。 */}
       <header className="shrink-0 border-b border-slate-200 bg-white">
-        <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "w-full" : "max-w-7xl sm:px-6 sm:py-4"}`}>
-          <div className="flex items-center gap-3">
+        <div className={`mx-auto flex flex-wrap items-center gap-x-3 gap-y-2 py-2 ${view === "Year timetables" ? "w-full px-3" : "w-full max-w-7xl px-3 sm:px-6"}`}>
+          <div className="flex shrink-0 items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#153d75] text-sm font-black tracking-tight text-white">NP</div>
             <div>
               <p className="text-sm font-bold tracking-tight text-slate-950">ICT Timetabling</p>
-              <p className="text-xs text-slate-500">Department scheduling workspace</p>
+              <p className="hidden text-xs text-slate-500 sm:block">Department scheduling workspace</p>
             </div>
           </div>
-          <div className="hidden items-center gap-2 md:flex">
-            <Pill tone="amber">Draft workspace</Pill>
+
+          {/* 菜单按钮不换行也不压缩；如果电脑窗口不足，只有这个 nav 区域横向滚动，账号和退出按钮始终留在画面中。 */}
+          <nav className="order-3 w-full min-w-0 overflow-x-auto border-t border-slate-100 pt-1.5 md:order-none md:w-auto md:flex-1 md:border-t-0 md:pt-0" aria-label="Workspace">
+            <div className="flex w-max items-center gap-1">
+              <WorkspaceMenuButton active={view === "Year timetables"} icon="▦" label="Year timetables" onClick={() => void openTimetable(timetableYear)} />
+              <WorkspaceMenuButton active={view === "Personal timetables"} icon="▥" label="Personal timetables" onClick={() => void loadPersonalTimetable(personalKind, personalOwnerId)} />
+              <WorkspaceMenuButton active={view === "Courses"} icon="◫" label="Courses" onClick={() => openView("Courses")} />
+              <WorkspaceMenuButton active={["Teachers", "Student groups", "Rooms"].includes(view)} icon="▤" label="Data management" onClick={() => openView("Teachers")} />
+              <WorkspaceMenuButton active={view === "Rules & issues"} icon="◌" label="Rules & issues" onClick={() => void openRules()} />
+              <WorkspaceMenuButton active={view === "Cycle"} icon="↻" label="New cycle & recovery" onClick={() => void openCycle()} />
+              {currentUser?.isAdmin && <WorkspaceMenuButton active={view === "Accounts"} icon="⚿" label="Accounts" onClick={() => void openAccounts()} />}
+            </div>
+          </nav>
+
+          {/* 超宽屏显示同步与班次数量；一般电脑优先把有限宽度交给导航，资料不会丢失，页面定时刷新逻辑仍然照常运行。 */}
+          <div className="hidden shrink-0 items-center gap-2 2xl:flex">
+            <Pill tone="amber">Draft · {courses.reduce((total, course) => total + course.configuredSections, 0)} sections</Pill>
             <span className="text-xs text-slate-400">{lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Sync starting"}</span>
-            <button onClick={() => setView("Profile")} className="ml-2 text-sm font-bold text-slate-700 hover:text-blue-700" type="button">{currentUser?.username}</button>
-            <button onClick={() => void logout()} className="rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Sign out</button>
           </div>
-          <div className="flex items-center gap-2 md:hidden">
-            <button onClick={() => setView("Profile")} className="max-w-28 truncate text-sm font-bold text-slate-700" type="button">{currentUser?.username}</button>
+
+          <div className="ml-auto flex shrink-0 items-center gap-2 md:ml-0">
+            <button onClick={() => setView("Profile")} className="max-w-24 truncate text-sm font-bold text-slate-700 hover:text-blue-700" type="button">{currentUser?.username}</button>
             <button onClick={() => void logout()} className="rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-semibold text-slate-600" type="button">Sign out</button>
           </div>
         </div>
       </header>
 
-      <div className={`mx-auto grid ${view === "Year timetables" ? "w-full max-w-none gap-3 px-3 py-3 lg:grid-cols-[140px_minmax(0,1fr)] xl:min-h-0 xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
-        {/* 左侧导航集中全部排课模块，并用选中样式标明当前位置，避免在相似资料页面之间迷失。 */}
-        <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
-          <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
-          <button onClick={() => void openTimetable(timetableYear)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Year timetables" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">▦</span> Year timetables
-          </button>
-          <button onClick={() => void loadPersonalTimetable(personalKind, personalOwnerId)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Personal timetables" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">▥</span> Personal timetables
-          </button>
-          <button onClick={() => openView("Courses")} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Courses" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">◫</span> Courses
-          </button>
-          <button onClick={() => openView("Teachers")} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${["Teachers", "Student groups", "Rooms"].includes(view) ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">▤</span> Data management
-          </button>
-          <button onClick={() => void openRules()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Rules & issues" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">◌</span> Rules & issues
-          </button>
-          <button onClick={() => void openCycle()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Cycle" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button">
-            <span className="text-base">↻</span> New cycle & recovery
-          </button>
-          {currentUser?.isAdmin && <button onClick={() => void openAccounts()} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${view === "Accounts" ? "bg-blue-50 font-bold text-blue-800" : "font-medium text-slate-500 hover:bg-slate-50"}`} type="button"><span className="text-base">⚿</span> Accounts</button>}
-          {view !== "Year timetables" && <><div className="my-3 border-t border-slate-100" /><p className="px-3 pb-2 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Current cycle</p><div className="rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">Working timetable · {courses.reduce((total, course) => total + course.configuredSections, 0)} generated sections</div></>}
-        </aside>
-
-        <section className={`min-w-0 ${view === "Year timetables" ? "xl:flex xl:min-h-0 xl:flex-col" : ""}`}>
+      {/* 左侧导航已经移除，内容区现在是真正的单栏；年级总表取得原来 140px 导航列及间距，资料页面也取得原来 220px 导航列。 */}
+      <div className={`mx-auto ${view === "Year timetables" ? "flex w-full max-w-none flex-col gap-3 px-3 py-3 lg:min-h-0 lg:flex-1" : "w-full max-w-7xl px-6 py-8"}`}>
+        <section className={`min-w-0 ${view === "Year timetables" ? "flex flex-col lg:min-h-0 lg:flex-1" : ""}`}>
           {/* 页面标题说明当前任务；右侧只保留与当前资料类型对应的主要操作，减少误点。 */}
           <div className={`${view === "Year timetables" ? "mb-3" : "mb-6"} flex flex-col justify-between gap-4 sm:flex-row sm:items-end`}>
             <div>
