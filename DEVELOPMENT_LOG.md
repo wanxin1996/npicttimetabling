@@ -1639,3 +1639,25 @@
 ### 下一步
 
 1. 继续 UI、CRUD、数据关联、可靠性与中文注释覆盖的完整发布审查。
+
+## 2026-08-11｜防止已有排课因清空主年级而消失
+
+### 已完成
+
+- 课程清单 API 新增 `scheduledLessons` 数量，界面可以准确知道一门课程是否已经出现在总表中，而不是根据班次数或配置状态猜测。
+- 已有排课的课程设置会把 `Choose later` 选项设为不可选，并明确说明 Primary year 是必填项；尚未排课的课程仍可稍后选择年级。
+- 数据库共用写入函数增加第二层保护：任何调用者只要尝试把已有排课课程的主要年级清空，都会在写入前被拒绝。
+- 课程设置 API 将这种当前资料状态冲突返回为 409，并提供清楚的英文提示；一般字段格式错误仍保持 400。
+- 把课程设置第一行的超长 JSX 拆成易读的小区块，并补充中文注释说明为何已有排课不能取消所属总表。
+
+### 本次验证
+
+- `git diff --check`、`npm run lint` 与 `npm run build` 全部通过；TypeScript 和 24 个页面、API 均成功构建。
+- 在隔离生产构建中读取 `BED`，API 正确返回 `scheduledLessons: 1`；实际尝试把 Primary year 改为 `null` 时得到 409 与 `Choose a primary year before saving a course that already has scheduled lessons.`。
+- 拒绝请求后直接读取隔离 SQLite，`BED.primary_year` 仍为 1，`BED_01` 仍在周二 13:00 且 revision 仍为 5，证明没有产生半完成写入或隐藏排课。
+- 浏览器实际打开 `Configure BED`，`Choose later` 已禁用、`Year 1` 保持选中，并显示已有排课必须选择年级的说明。
+
+### 下一步
+
+1. 修复重复导入 Teaching allocation 时可能覆盖尚未排课班次的手工教师与学生班级关联。
+2. 继续补齐并发 revision、网络错误处理、CRUD 自动化回归和发布安全检查。

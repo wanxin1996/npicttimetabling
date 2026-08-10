@@ -33,6 +33,10 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     if (!saved) return Response.json({ error: "Course not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "Course setup could not be saved." }, { status: 400 });
+    const message = error instanceof Error ? error.message : "Course setup could not be saved.";
+    // 已有排课却清空主年级属于当前数据库状态与请求互相冲突，而不是字段格式错误；
+    // 409 让前端和后续自动化测试能准确区分这种业务冲突。
+    const status = message.includes("already has scheduled lessons") ? 409 : 400;
+    return Response.json({ error: message }, { status });
   }
 }

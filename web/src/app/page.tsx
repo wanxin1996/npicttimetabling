@@ -46,6 +46,7 @@ type Course = {
   weekEnd: number | null;
   allocatedSections: number;
   configuredSections: number;
+  scheduledLessons: number;
   allocationVarianceCount: number;
 };
 
@@ -1589,7 +1590,34 @@ export default function Home() {
               <form key={editingCourse.id} onSubmit={saveCourseSetup} className="border-b border-emerald-100 bg-emerald-50/60 p-4">
                 <p className="mb-1 text-sm font-bold text-emerald-950">Configure {editingCourse.code}</p>
                 <p className="mb-3 text-xs leading-5 text-emerald-800">These requirements are retained when Teaching Members is imported again.</p>
-                <div className="grid gap-3 md:grid-cols-4"><label className="text-xs font-semibold text-slate-700">Duration (hours)<input name="durationHours" required min="2" max="4" defaultValue={editingCourse.durationHours ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label><label className="text-xs font-semibold text-slate-700">Sessions/week<select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="1">1</option><option value="2">2</option></select></label><label className="text-xs font-semibold text-slate-700">Primary year<select name="primaryYear" defaultValue={editingCourse.primaryYear ?? ""} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm"><option value="">Choose later</option><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select></label><label className="text-xs font-semibold text-slate-700">Minimum capacity<input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label></div>
+                <div className="grid gap-3 md:grid-cols-4">
+                  <label className="text-xs font-semibold text-slate-700">
+                    Duration (hours)
+                    <input name="durationHours" required min="2" max="4" defaultValue={editingCourse.durationHours ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-xs font-semibold text-slate-700">
+                    Sessions/week
+                    <select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm">
+                      <option value="1">1</option>
+                      <option value="2">2</option>
+                    </select>
+                  </label>
+                  <label className="text-xs font-semibold text-slate-700">
+                    Primary year
+                    {/* 已有排课必须始终属于一张年级总表；禁用空选项可在界面第一层防止课程被无意隐藏。 */}
+                    <select name="primaryYear" required={editingCourse.scheduledLessons > 0} defaultValue={editingCourse.primaryYear ?? ""} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm">
+                      <option value="" disabled={editingCourse.scheduledLessons > 0}>Choose later</option>
+                      <option value="1">Year 1</option>
+                      <option value="2">Year 2</option>
+                      <option value="3">Year 3</option>
+                    </select>
+                    {editingCourse.scheduledLessons > 0 && <span className="mt-1 block font-normal text-emerald-800">Required because this course is already on a timetable.</span>}
+                  </label>
+                  <label className="text-xs font-semibold text-slate-700">
+                    Minimum capacity
+                    <input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" />
+                  </label>
+                </div>
                 {/* 起止周都留空表示每周上课；同时填写时支持 1–4、3–6、5–8 等包含两端的区间。 */}
                 <div className="mt-3 max-w-lg rounded-xl border border-emerald-100 bg-white/70 p-3"><p className="text-xs font-bold text-slate-700">Teaching weeks</p><div className="mt-2 grid grid-cols-2 gap-3"><label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" defaultValue={editingCourse.weekStart ?? ""} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label><label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" defaultValue={editingCourse.weekEnd ?? ""} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm" /></label></div><p className="mt-2 text-xs text-emerald-800">Leave both blank for every week. Limited ranges include both the start and end week.</p></div>
                 <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-700"><label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} type="checkbox" /> Lab</label><label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} type="checkbox" /> Multi projector</label><label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} type="checkbox" /> Smart classroom</label><label className="flex items-center gap-2"><input name="separateSectionsAcrossDays" defaultChecked={editingCourse.separateSectionsAcrossDays} type="checkbox" /> Keep sections on different days</label><button className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white" type="submit">Save course setup</button></div>

@@ -46,6 +46,7 @@ export type CourseRecord = {
   weekEnd: number | null;
   allocatedSections: number;
   configuredSections: number;
+  scheduledLessons: number;
   allocationVarianceCount: number;
 };
 
@@ -997,10 +998,13 @@ export function listCourses(): CourseRecord[] {
       courses.requires_multi_projector, courses.requires_smart_classroom,
       courses.separate_sections_across_days, courses.week_pattern, courses.week_start, courses.week_end,
       (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
+      (SELECT COUNT(*) FROM scheduled_lessons
+        JOIN course_sections ON course_sections.id = scheduled_lessons.section_id
+        WHERE course_sections.course_id = courses.id) AS scheduled_lessons,
       (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
     FROM courses
     ORDER BY courses.code ASC
-  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; allocated_sections: number }>;
+  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; scheduled_lessons: number; allocated_sections: number }>;
   return rows.map((row) => ({
     id: row.id,
     code: row.code,
@@ -1018,6 +1022,7 @@ export function listCourses(): CourseRecord[] {
     weekEnd: row.week_end,
     allocatedSections: row.allocated_sections,
     configuredSections: row.configured_sections,
+    scheduledLessons: row.scheduled_lessons,
     allocationVarianceCount: listCourseAllocationVariances(row.id).length,
   }));
 }
@@ -1081,7 +1086,7 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
   return resize();
 }
 
-export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "weekPattern" | "allocatedSections" | "configuredSections" | "allocationVarianceCount"> & { durationHours: number }) {
+export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "weekPattern" | "allocatedSections" | "configuredSections" | "scheduledLessons" | "allocationVarianceCount"> & { durationHours: number }) {
   // 课程要求适用于该课生成的每个班次，因此只保存在课程层级；
   // 像 LEAD 有 18 个班次时无需重复存储 18 份相同设置。
   const db = database();
@@ -1092,6 +1097,18 @@ export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "
   }
   if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isInteger(input.weekStart) || !Number.isInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd < input.weekStart))) {
     throw new Error("Teaching weeks must be blank for all weeks or a valid positive start and end range.");
+  }
+  // 年级总表只按课程的主要年级读取资料。若已有排课时把主要年级清空，课程仍留在数据库，
+  // 却会从 Year 1–3 总表和问题清单全部消失；因此在共用数据库边界阻止这种隐藏资料的状态。
+  const hasScheduledLesson = db.prepare(`
+    SELECT 1
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    WHERE sections.course_id = ?
+    LIMIT 1
+  `).get(id);
+  if (input.primaryYear === null && hasScheduledLesson) {
+    throw new Error("Choose a primary year before saving a course that already has scheduled lessons.");
   }
   // 如果第二次每周课次已经排入时间表，不允许静默把它隐藏或删除。
   const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
