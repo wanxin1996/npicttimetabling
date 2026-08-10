@@ -307,7 +307,14 @@ export default function Home() {
   const [unscheduledGroupId, setUnscheduledGroupId] = useState("");
   const [unscheduledProgram, setUnscheduledProgram] = useState("");
   const [editingLesson, setEditingLesson] = useState<ScheduledLesson | null>(null);
+  // 总表默认只显示最重要的排课网格；老师需要课程或编辑资料时，再分别打开左右两侧的工具面板。
+  const [showUnscheduledDrawer, setShowUnscheduledDrawer] = useState(false);
   const [showTimetableInspector, setShowTimetableInspector] = useState(false);
+  // 开关和关闭按钮的引用用于管理键盘焦点：打开面板后进入面板，关闭后回到原来的工具栏按钮。
+  const unscheduledToggleButtonRef = useRef<HTMLButtonElement>(null);
+  const unscheduledCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const inspectorToggleButtonRef = useRef<HTMLButtonElement>(null);
+  const inspectorCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [unavailableWindows, setUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [scheduleIssues, setScheduleIssues] = useState<ScheduleIssue[]>([]);
   const [placingSection, setPlacingSection] = useState<UnscheduledSection | null>(null);
@@ -351,6 +358,32 @@ export default function Home() {
     const timeout = window.setTimeout(() => setRecentlySavedLesson(null), 6000);
     return () => window.clearTimeout(timeout);
   }, [recentlySavedLesson]);
+
+  useEffect(() => {
+    // 待排抽屉完成渲染后，把键盘焦点移到明确的关闭按钮；Schedule 等原按钮即使被卸载，焦点也不会落回页面主体。
+    if (!showUnscheduledDrawer) return;
+    const frame = window.requestAnimationFrame(() => unscheduledCloseButtonRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [showUnscheduledDrawer]);
+
+  useEffect(() => {
+    // Inspector 可能由工具栏、课程卡片或问题清单打开；统一聚焦其关闭按钮，让所有入口都有相同的键盘行为。
+    if (!showTimetableInspector) return;
+    const frame = window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [showTimetableInspector]);
+
+  function closeUnscheduledDrawerAndRestoreFocus() {
+    // 先请求关闭面板，再把焦点交回仍然存在的工具栏开关，方便键盘用户继续浏览总表。
+    setShowUnscheduledDrawer(false);
+    window.requestAnimationFrame(() => unscheduledToggleButtonRef.current?.focus());
+  }
+
+  function closeInspectorAndRestoreFocus() {
+    // Inspector 是非模态浮层；关闭后回到工具栏入口，不强迫用户从页面顶部重新开始 Tab 导航。
+    setShowTimetableInspector(false);
+    window.requestAnimationFrame(() => inspectorToggleButtonRef.current?.focus());
+  }
 
   function revealSavedLesson(id: string) {
     // 每次保存都创建新的请求编号，即使课程编号没有改变也一样；这样快速连续编辑同一门课时，滚动定位和六秒高亮都会重新触发。
@@ -451,6 +484,8 @@ export default function Home() {
     setPlacingSection(null);
     setCandidateSection(null);
     setCandidateSlots([]);
+    // 从问题清单进入编辑时，先收起左侧待排抽屉，给右侧 Inspector 和五天总表留下足够空间。
+    setShowUnscheduledDrawer(false);
     setShowTimetableInspector(true);
     setView("Year timetables");
     setShowForm(false);
@@ -1081,14 +1116,14 @@ export default function Home() {
     return <main className="grid min-h-screen place-items-center bg-[#f6f8fb] p-6 text-slate-900"><div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-7 shadow-xl"><div className="mb-6 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#153d75] font-black text-white">NP</div><div><p className="font-black">ICT Timetabling</p><p className="text-xs text-slate-500">Department scheduling workspace</p></div></div>{authScreen === "checking" ? <p className="text-sm text-slate-500">Checking secure session...</p> : <form onSubmit={submitAuthentication}><h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1><p className="mt-2 text-sm leading-6 text-slate-500">{authScreen === "setup" ? "This first account can create the small team of scheduler accounts." : "Use your department scheduler account."}</p><div className="mt-5 grid gap-3"><label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="username" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label><label className="text-sm font-semibold">Password<input name="password" required minLength={10} autoComplete={authScreen === "setup" ? "new-password" : "current-password"} type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal" /></label></div><button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">{authScreen === "setup" ? "Create administrator" : "Sign in"}</button></form>}<p className="mt-4 text-xs text-amber-700">{notice}</p></div></main>;
   }
 
-  // 桌面端年级排课工作区占满可视高度，待排区、总表和 Inspector 各自滚动；
-  // 操作提示固定在顶部并可关闭，避免像旧版底部提示一样遮住 Inspector 的保存按钮。
+  // 桌面端年级排课工作区占满可视高度：总表默认占据导航之外的全部宽度，待排抽屉只在需要时临时加入左栏。
+  // Inspector 浮在总表右侧并独立滚动；操作提示固定在顶部且可关闭，避免遮住 Inspector 底部的保存按钮。
   return (
     <main className={`min-h-screen bg-[#f6f8fb] text-slate-900 ${view === "Year timetables" ? "xl:flex xl:h-screen xl:min-h-0 xl:flex-col xl:overflow-hidden" : ""}`}>
       {notice && showNoticeToast && <div className="pointer-events-none fixed inset-x-3 top-3 z-50 flex justify-end sm:left-auto sm:right-4 sm:max-w-sm"><div role="status" aria-live="polite" aria-atomic="true" className={`pointer-events-auto flex max-h-32 w-full items-start gap-3 overflow-hidden rounded-xl border px-4 py-3 text-sm font-semibold shadow-lg ${noticeTone(notice)}`}><span className="sr-only">System status: </span><p className="min-w-0 flex-1 overflow-y-auto leading-5">{notice}</p><button onClick={() => setShowNoticeToast(false)} className="-mr-1 shrink-0 rounded-md px-2 py-1 text-base leading-none opacity-70 hover:bg-black/5 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current" type="button" aria-label="Dismiss notification">×</button></div></div>}
       {/* 顶部身份栏始终显示系统名称、同步时间和当前账号，让老师确认自己正在操作哪一个工作区。 */}
       <header className="shrink-0 border-b border-slate-200 bg-white">
-        <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "max-w-[1920px]" : "max-w-7xl sm:px-6 sm:py-4"}`}>
+        <div className={`mx-auto flex items-center justify-between gap-4 px-3 py-3 ${view === "Year timetables" ? "w-full" : "max-w-7xl sm:px-6 sm:py-4"}`}>
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#153d75] text-sm font-black tracking-tight text-white">NP</div>
             <div>
@@ -1109,7 +1144,7 @@ export default function Home() {
         </div>
       </header>
 
-      <div className={`mx-auto grid ${view === "Year timetables" ? "max-w-[1920px] gap-3 px-3 py-3 lg:grid-cols-[140px_minmax(0,1fr)] xl:min-h-0 xl:w-full xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
+      <div className={`mx-auto grid ${view === "Year timetables" ? "w-full max-w-none gap-3 px-3 py-3 lg:grid-cols-[140px_minmax(0,1fr)] xl:min-h-0 xl:flex-1" : "max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_1fr]"}`}>
         {/* 左侧导航集中全部排课模块，并用选中样式标明当前位置，避免在相似资料页面之间迷失。 */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm lg:h-fit">
           <p className="px-3 pb-2 pt-1 text-xs font-bold uppercase tracking-[0.14em] text-slate-400">Workspace</p>
@@ -1192,11 +1227,19 @@ export default function Home() {
           )}
 
           {view === "Year timetables" && (
-            <div className={`grid gap-2 xl:min-h-0 xl:flex-1 ${showTimetableInspector ? "xl:grid-cols-[190px_minmax(0,1fr)_220px]" : "xl:grid-cols-[190px_minmax(0,1fr)]"}`}>
-              <aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-                <div className="mb-2">
-                  <p className="font-bold text-slate-950">Unscheduled sessions</p>
-                  <p className="text-xs text-slate-500">{filteredUnscheduledSections.length} of {unscheduledSections.length} ready to place</p>
+            // Master timetable 始终是唯一长期占据宽度的主栏；待排抽屉只在用户主动打开时加入左栏，关闭后不保留任何空白列。
+            <div className={`relative grid gap-2 lg:min-h-0 lg:flex-1 ${showUnscheduledDrawer ? "lg:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)]" : "lg:grid-cols-1"}`}>
+              {showUnscheduledDrawer && <aside
+                id="unscheduled-drawer"
+                className="flex max-h-[420px] min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-lg lg:max-h-none"
+                aria-labelledby="unscheduled-drawer-title"
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") closeUnscheduledDrawerAndRestoreFocus();
+                }}
+              >
+                <div className="mb-2 flex items-start justify-between gap-2">
+                  <div><p id="unscheduled-drawer-title" className="font-bold text-slate-950">Unscheduled sessions</p><p className="text-xs text-slate-500">{filteredUnscheduledSections.length} of {unscheduledSections.length} ready to place</p></div>
+                  <button ref={unscheduledCloseButtonRef} onClick={closeUnscheduledDrawerAndRestoreFocus} className="rounded-md px-2 py-1 text-xs font-bold text-slate-500 hover:bg-slate-100 hover:text-slate-900" type="button" aria-label="Close unscheduled sessions">Close</button>
                 </div>
                 {/* 待排筛选直接处理当前年级已加载资料；即使有数百个班次也能即时缩小范围，不产生额外接口请求。 */}
                 <div className="mb-2 grid shrink-0 gap-2 rounded-xl bg-slate-50 p-2">
@@ -1211,20 +1254,100 @@ export default function Home() {
                       <div className="flex items-start justify-between gap-2"><p className="font-black">{section.label}</p>{section.staffType === "PT" && <Pill tone="amber">PT priority</Pill>}</div>
                       <p className="mt-1">{section.durationHours}h · {section.teacherName ?? "Teacher pending"}</p>
                       <p className={`mt-1 ${section.staffType === "PT" ? "text-amber-800" : "text-blue-700"}`}>{section.studentGroups.join(", ") || "Student group pending"}</p>
-                      <div className="mt-1.5 grid grid-cols-2 gap-1"><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); setPlacingSection(section); setEditingLesson(null); setCandidateSection(null); }} className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white" type="button">Schedule</button><button draggable={false} onClick={(event) => { event.stopPropagation(); setShowTimetableInspector(true); void findCandidateSlots(section); }} className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400" type="button">Clear slots</button></div>
+                      {/* 使用按钮开始排课或寻找空位时，右侧 Inspector 会接管下一步操作，因此同步收起待排抽屉，避免两个面板夹窄总表。 */}
+                      <div className="mt-1.5 grid grid-cols-2 gap-1">
+                        <button
+                          draggable={false}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setShowUnscheduledDrawer(false);
+                            setShowTimetableInspector(true);
+                            setPlacingSection(section);
+                            setEditingLesson(null);
+                            setCandidateSection(null);
+                          }}
+                          className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white"
+                          type="button"
+                        >
+                          Schedule
+                        </button>
+                        <button
+                          draggable={false}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setShowUnscheduledDrawer(false);
+                            setShowTimetableInspector(true);
+                            void findCandidateSlots(section);
+                          }}
+                          className="rounded-md border border-blue-200 bg-white px-1.5 py-1 font-bold text-blue-800 hover:border-blue-400"
+                          type="button"
+                        >
+                          Clear slots
+                        </button>
+                      </div>
                     </div>
                   ))}
                   {/* Excel 导入只知道课程和教师分配，无法自动猜测课时与所属年级。
                       当待排区为空时，直接解释缺少的资料并提供课程设置入口，避免老师误以为导入失败。 */}
                   {filteredUnscheduledSections.length === 0 && (unscheduledSections.length === 0 ? <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-xs leading-5 text-blue-900"><p className="font-black">No sessions are ready for Year {timetableYear} yet.</p><p className="mt-1">The allocation was imported, but every course still needs its duration and primary year before its sections can enter this tray.</p><button onClick={() => openView("Courses")} className="mt-2 rounded-lg bg-[#153d75] px-3 py-1.5 font-bold text-white" type="button">Configure courses</button></div> : <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No sessions match these filters.</p>)}
                 </div>
-              </aside>
+              </aside>}
 
-              {/* min-w-0 强制高冲突总表留在中间栏；需要时只滚动总表本身，不把整个页面和导航一起撑宽。 */}
-              <div className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+              {/* 总表是年级页唯一永久主栏；relative 只为右侧浮动 Inspector 提供定位边界，面板打开时不会改变五个日期栏的宽度。 */}
+              <div className="relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <div><p className="text-xs font-semibold text-blue-700">Master timetable</p><h2 className="text-lg font-black">Year {timetableYear}</h2></div>
-                  <div className="flex items-center gap-2"><div className="hidden gap-1 sm:flex"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div><button onClick={() => setShowTimetableInspector((current) => !current)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button">{showTimetableInspector ? "Hide inspector" : "Show inspector"}</button><div className="flex gap-1 rounded-xl bg-slate-100 p-1">{[1, 2, 3].map((year) => <button key={year} onClick={() => void openTimetable(year)} className={`rounded-lg px-2.5 py-1.5 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`} type="button">Y{year}</button>)}</div></div>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    {/* 问题数字只作快速总览；详细内容仍由 Inspector 或 Rules & issues 页面负责展示。 */}
+                    <div className="hidden gap-1 sm:flex">
+                      <Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill>
+                      <Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill>
+                    </div>
+
+                    {/* 左右工具面板保持互斥：老师一次只处理一种辅助任务，中央总表不会同时被两个面板遮挡或挤压。 */}
+                    <button
+                      ref={unscheduledToggleButtonRef}
+                      onClick={() => {
+                        const willOpen = !showUnscheduledDrawer;
+                        setShowUnscheduledDrawer(willOpen);
+                        if (willOpen) setShowTimetableInspector(false);
+                      }}
+                      className={`rounded-lg border px-2.5 py-1.5 text-xs font-bold ${showUnscheduledDrawer ? "border-blue-300 bg-blue-50 text-blue-800" : "border-slate-200 bg-white text-slate-700 hover:border-blue-400 hover:text-blue-700"}`}
+                      type="button"
+                      aria-expanded={showUnscheduledDrawer}
+                      aria-controls="unscheduled-drawer"
+                    >
+                      {showUnscheduledDrawer ? "Hide unscheduled sessions" : "Unscheduled sessions"} ({unscheduledSections.length})
+                    </button>
+                    <button
+                      ref={inspectorToggleButtonRef}
+                      onClick={() => {
+                        const willOpen = !showTimetableInspector;
+                        setShowTimetableInspector(willOpen);
+                        if (willOpen) setShowUnscheduledDrawer(false);
+                      }}
+                      className={`rounded-lg border px-2.5 py-1.5 text-xs font-bold ${showTimetableInspector ? "border-blue-300 bg-blue-50 text-blue-800" : "border-slate-200 bg-white text-slate-700 hover:border-blue-400 hover:text-blue-700"}`}
+                      type="button"
+                      aria-expanded={showTimetableInspector}
+                      aria-controls="timetable-inspector"
+                    >
+                      {showTimetableInspector ? "Hide inspector" : "Inspector"}
+                    </button>
+
+                    {/* 三个年级仍共享同一个排课工作区，切换年级只重新加载对应总表数据。 */}
+                    <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
+                      {[1, 2, 3].map((year) => (
+                        <button
+                          key={year}
+                          onClick={() => void openTimetable(year)}
+                          className={`rounded-lg px-2.5 py-1.5 text-sm font-semibold ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`}
+                          type="button"
+                        >
+                          Y{year}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto"><WeeklyTimetableGrid
                     lessons={lessons}
@@ -1234,7 +1357,7 @@ export default function Home() {
                       // 总表卡片的实际高度已经表达两、三或四小时，因此不重复显示“3h”；
                       // 无论同一时间有多少门课，都优先保留课程编号和教师姓名，教室与问题数排在其后。
                       const issueClasses = lessonIssueClasses(lesson.warningSeverity);
-                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded text-left ${isDense ? "p-0.5 text-[9px] leading-[1.05]" : "p-1 text-[10px] leading-tight"} shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
+                      return <button title={`${lesson.sectionLabel} · ${String(lesson.startHour).padStart(2, "0")}:00–${String(lesson.startHour + lesson.durationHours).padStart(2, "0")}:00 · ${lesson.teacherName ?? "Teacher pending"} · ${lesson.roomCode ?? "Room pending"}`} draggable onDragStart={(event) => { event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id); event.dataTransfer.effectAllowed = "move"; setCompactDragPreview(event, lesson.sectionLabel); }} onClick={() => { setShowUnscheduledDrawer(false); setShowTimetableInspector(true); setEditingLesson(lesson); setPlacingSection(null); setCandidateSection(null); }} className={`h-full w-full cursor-pointer overflow-hidden rounded text-left ${isDense ? "p-0.5 text-[9px] leading-[1.05]" : "p-1 text-[10px] leading-tight"} shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${issueClasses.card}`} type="button">
                         <span className={`block font-black ${isDense ? "whitespace-nowrap text-[7px] tracking-[-0.06em]" : "truncate"}`}>{lesson.sectionLabel}</span>
                         <span className={`mt-0.5 block ${isDense ? "break-words" : "truncate"}`}>{lesson.teacherName ?? "Teacher pending"}</span>
                         <span className="block truncate font-semibold">{lesson.roomCode ?? "Room pending"}</span>
@@ -1242,18 +1365,25 @@ export default function Home() {
                       </button>;
                     }}
                   /></div>
-              </div>
 
-              {/* Inspector 只在主动点击或选择课程时打开；总览阶段把右侧宽度还给总表，方便一次看见更多课程。 */}
-              {showTimetableInspector && <aside className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-label="Timetable inspector">
-                <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill></div></div>
+                {/* Inspector 以绝对定位覆盖总表右侧，不再成为 CSS Grid 的第三栏；关闭时不会留下任何空白宽度。 */}
+                {showTimetableInspector && <aside
+                  id="timetable-inspector"
+                  className="absolute inset-y-0 right-0 z-40 flex w-full min-h-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-2xl sm:w-[320px]"
+                  aria-labelledby="timetable-inspector-title"
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") closeInspectorAndRestoreFocus();
+                  }}
+                >
+                <div className="flex items-center justify-between border-b border-slate-200 p-3"><div><p id="timetable-inspector-title" className="font-black text-slate-950">Inspector</p><p className="text-xs text-slate-500">Edit or resolve in context</p></div><div className="flex items-center gap-1"><Pill tone="red">{visibleYearIssues.filter((issue) => issue.severity === "High").length}</Pill><Pill tone="amber">{visibleYearIssues.filter((issue) => issue.severity === "Warning").length}</Pill><button ref={inspectorCloseButtonRef} onClick={closeInspectorAndRestoreFocus} className="ml-1 rounded-md px-2 py-1 text-base font-bold leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-900" type="button" aria-label="Close inspector">×</button></div></div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
                   {editingLesson ? <form id="lesson-editor" onSubmit={saveLesson} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Edit {editingLesson.sectionLabel}</p><p className="text-xs text-slate-500">{editingLesson.durationHours} hours · occurrence {editingLesson.occurrence}</p></div><button onClick={() => setEditingLesson(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{editingLesson.warnings.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-2 text-xs text-red-800"><p className="font-black">Resolve {editingLesson.warnings.length} issue{editingLesson.warnings.length === 1 ? "" : "s"}</p><ul className="mt-1 list-disc space-y-1 pl-4">{editingLesson.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}<label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" defaultValue={editingLesson.dayOfWeek} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" defaultValue={editingLesson.startHour} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + editingLesson.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Teacher<select name="teacherId" defaultValue={editingLesson.teacherId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Teacher pending</option>{teachers.filter((teacher) => teacher.status === "Active").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType})</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">Room pending</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><div className="grid grid-cols-2 gap-2"><button onClick={() => void unscheduleLesson()} className="rounded-lg border border-red-200 px-3 py-2 text-xs font-bold text-red-700" type="button">Return to tray</button><button className="rounded-lg bg-[#153d75] px-3 py-2 text-xs font-bold text-white" type="submit">Save changes</button></div></form>
                   : placingSection ? <form onSubmit={placeSectionWithoutDrag} className="grid gap-3"><div className="flex items-start justify-between gap-2"><div><p className="font-black text-slate-950">Schedule {placingSection.label}</p><p className="text-xs text-slate-500">Keyboard and click alternative to dragging</p></div><button onClick={() => setPlacingSection(null)} className="text-xs font-bold text-slate-500" type="button">Close</button></div><div className="rounded-xl bg-blue-50 p-3 text-xs text-blue-900"><p className="font-bold">{placingSection.teacherName ?? "Teacher pending"}</p><p className="mt-1">{placingSection.studentGroups.join(", ") || "Student group pending"} · {placingSection.durationHours}h</p></div><label className="text-xs font-semibold text-slate-700">Day<select name="dayOfWeek" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map((day, index) => <option key={day} value={index + 1}>{day}</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Start hour<select name="startHour" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm">{timetableHours.filter((hour) => hour + placingSection.durationHours <= 18).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label><label className="text-xs font-semibold text-slate-700">Room<select name="roomId" className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"><option value="">Assign later</option>{rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}</select></label><button className="rounded-lg bg-[#153d75] px-3 py-2.5 text-sm font-bold text-white" type="submit">Place session</button><button onClick={() => void findCandidateSlots(placingSection)} className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-bold text-emerald-800" type="button">Show only clear options</button></form>
                   : candidateSection ? <div><div className="flex items-start justify-between gap-2"><div><p className="font-black text-emerald-950">Clear slots</p><p className="text-xs text-emerald-800">{candidateSection.label} · no saved issue</p></div><button onClick={() => { setCandidateSection(null); setCandidateSlots([]); }} className="text-xs font-bold text-slate-500" type="button">Close</button></div>{candidatesLoading ? <p className="mt-4 text-sm text-slate-500">Checking every room and hour...</p> : candidateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">No completely clear option is available. Check assignments and restrictions.</p> : <div className="mt-3 grid gap-2">{candidateSlots.map((slot) => <button key={`${slot.dayOfWeek}-${slot.startHour}-${slot.roomId}`} onClick={() => void placeCandidate(slot)} className="rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-left text-xs hover:border-emerald-500" type="button"><span className="block font-black text-emerald-950">{timetableDays[slot.dayOfWeek - 1]} {String(slot.startHour).padStart(2, "0")}:00–{String(slot.endHour).padStart(2, "0")}:00</span><span className="mt-1 block font-semibold text-slate-700">{slot.roomCode} · {slot.roomCapacity} seats</span></button>)}</div>}</div>
                   : <div><p className="text-xs leading-5 text-slate-500">Select a lesson to edit it, or choose Schedule on an unscheduled session.</p><div className="my-3 border-t border-slate-100" /><div className="mb-2 flex items-center justify-between"><p className="text-sm font-black text-slate-950">Year {timetableYear} issues</p><button onClick={() => void openRules()} className="text-xs font-bold text-blue-700" type="button">All rules</button></div>{visibleYearIssues.length === 0 ? <p className="rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">No issues in this year.</p> : <div className="grid gap-2">{visibleYearIssues.map((issue) => <button key={issue.id} onClick={() => void openScheduleIssue(issue)} className="rounded-xl border border-slate-200 p-2.5 text-left text-xs hover:border-blue-300 hover:bg-blue-50" type="button"><span className="flex items-center justify-between gap-2"><span className="font-black text-slate-900">{issue.sectionLabel}</span><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill></span><span className="mt-1 block font-semibold text-slate-700">{issue.message}</span><span className="mt-1 block text-slate-500">{timetableDays[issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00</span></button>)}</div>}</div>}
                 </div>
-              </aside>}
+                </aside>}
+              </div>
             </div>
           )}
 
