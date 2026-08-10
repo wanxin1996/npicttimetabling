@@ -1084,7 +1084,7 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
   const resize = db.transaction(() => {
     const course = db.prepare("SELECT id FROM courses WHERE id = ?").get(courseId) as { id: string } | undefined;
     if (!course) return false;
-    const currentSections = db.prepare("SELECT id, sequence FROM course_sections WHERE course_id = ? ORDER BY sequence ASC").all(courseId) as Array<{ id: string; sequence: number }>;
+    const currentSections = db.prepare("SELECT id, sequence, teacher_id FROM course_sections WHERE course_id = ? ORDER BY sequence ASC").all(courseId) as Array<{ id: string; sequence: number; teacher_id: string | null }>;
 
     if (sectionCount > currentSections.length) {
       const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, NULL)");
@@ -1098,9 +1098,10 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
       const hasScheduledLesson = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? LIMIT 1");
       const hasStudentGroup = db.prepare("SELECT 1 FROM section_student_groups WHERE section_id = ? LIMIT 1");
       for (const section of removable) {
-        // 若要删除的班次已经排课或关联学生班级，用户必须先把课程退回待排区并清除关联，
-        // 防止修正数量时无提示地删除真实工作。
+        // 若要删除的班次已经排课、分配教师或关联学生班级，用户必须先明确清除资料，
+        // 防止修正数量时无提示地删除真实工作。即使班次尚未排入总表，教师也是人工决定。
         if (hasScheduledLesson.get(section.id)) throw new Error(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
+        if (section.teacher_id) throw new Error(`${section.sequence} has a teacher. Clear its assignments before reducing the count.`);
         if (hasStudentGroup.get(section.id)) throw new Error(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
       }
       const removeSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
@@ -1108,7 +1109,8 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
     }
     return true;
   });
-  return resize();
+  // IMMEDIATE 让“检查尾部是否仍有资料”和真正删除之间不会被另一服务进程插入新分配。
+  return resize.immediate();
 }
 
 export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "weekPattern" | "allocatedSections" | "configuredSections" | "scheduledLessons" | "allocationVarianceCount"> & { durationHours: number }) {
@@ -1733,6 +1735,33 @@ export class ScheduledLessonPlacementInputError extends Error {
   }
 }
 
+export class ScheduledLessonRevisionConflictError extends Error {
+  // 已排课程编辑使用 revision 识别旧 Inspector 或另一账号先完成的修改；
+  // 独立类型让 API 稳定返回 409，不再依靠英文句子内容猜测错误类别。
+  constructor() {
+    super("This lesson was changed by another scheduler. Review the latest timetable and try again.");
+    this.name = "ScheduledLessonRevisionConflictError";
+  }
+}
+
+export class ScheduledLessonNotFoundError extends Error {
+  // 不存在或已经被删除的课程位置属于资源状态，不是老师填写的时间、教室等字段错误。
+  // 独立类型让 API 返回准确的 404，同时仍隐藏底层查询和表结构。
+  constructor() {
+    super("Scheduled lesson not found.");
+    this.name = "ScheduledLessonNotFoundError";
+  }
+}
+
+export class ScheduledLessonUpdateInputError extends Error {
+  // 时间、教师、班级和教室等可修正输入可以安全显示给老师；未知 SQLite
+  // 或 warning 重算异常必须由 API 转换为通用 500，不能暴露底层资料。
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduledLessonUpdateInputError";
+  }
+}
+
 function isScheduledOccurrenceUniqueError(error: unknown) {
   // 预先查询能提供友好提示，但多个应用进程仍可能在查询后同时写入。
   // 这里依赖 SQLite 的稳定错误代码而不是可能随版本或语言变化的英文错误文字。
@@ -1785,41 +1814,46 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; studentGroupIds: string[]; revision: number }): ScheduledLessonRecord {
   // 修订版本检查防止多人编辑时静默覆盖；教师、学生班级和课程位置一起保存，
-  // 确保重新计算的冲突始终与界面显示的卡片资料一致。
+  // 确保重新计算的冲突始终与界面显示的卡片资料一致。读取、验证和写入全部
+  // 放进 IMMEDIATE 事务，另一服务进程不能在验证教师或教室后抢先改变状态。
   const db = database();
-  // 先读取课程班次和当前修订号；学生班级属于班次而非单次课程，所以后面还要同步更新同班次的其他每周课次。
-  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, sections.teacher_id AS section_teacher_id, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; section_teacher_id: string | null; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
-  if (!lesson) throw new Error("Scheduled lesson not found.");
-  if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
-  if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
-  const teacher = input.teacherId ? db.prepare("SELECT id, name, is_active FROM teachers WHERE id = ?").get(input.teacherId) as { id: string; name: string; is_active: number } | undefined : undefined;
-  const teacherChanged = input.teacherId !== lesson.section_teacher_id;
-  // 旧排课可以继续保留已经停用的教师；只有把另一位教师新分配进来时，才强制其仍为 Active。
-  // 这可避免老师只调整时间、教室或学生班级时，隐藏的停用教师被意外清空。
-  if (input.teacherId && (!teacher || (teacherChanged && teacher.is_active !== 1))) throw new Error("Choose an active teacher.");
-
-  // 去重后确认每个 ID 都来自现有学生班级，避免拼写错误或过期页面把无效关联写进数据库。
-  const studentGroupIds = [...new Set(input.studentGroupIds)];
-  if (studentGroupIds.length > 0) {
-    const placeholders = studentGroupIds.map(() => "?").join(", ");
-    const validGroups = db.prepare(`SELECT id FROM student_groups WHERE id IN (${placeholders})`).all(...studentGroupIds) as Array<{ id: string }>;
-    if (validGroups.length !== studentGroupIds.length) throw new Error("Choose valid student groups.");
-  }
-
-  const currentStudentGroups = listSectionStudentGroupAssignments(db, lesson.section_id);
-  const currentStudentGroupIds = currentStudentGroups.map((group) => group.id).sort();
-  const sortedStudentGroupIds = [...studentGroupIds].sort();
-  const groupsChanged = currentStudentGroupIds.length !== sortedStudentGroupIds.length || currentStudentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
-  const sharedAssignmentsChanged = teacherChanged || groupsChanged;
-
-  // 教师、班级关联和当前课次位置必须在同一个事务中完成；任何一步失败都会整体回滚，不会留下只更新一半的排课资料。
-  let refreshedWarnings = new Map<string, string[]>();
   const updateTransaction = db.transaction(() => {
-    // 若这次真的换教师，在持有写入锁后再次检查 Active 状态；这可封住“刚验证完就被另一账号停用”的竞态。
-    if (teacherChanged && input.teacherId) {
-      const activeTeacher = db.prepare("SELECT 1 FROM teachers WHERE id = ? AND is_active = 1").get(input.teacherId);
-      if (!activeTeacher) throw new Error("Choose an active teacher.");
+    // 先在写锁内读取课程、当前 revision、共享教师和原教室；学生班级属于班次，
+    // 后面还要同步更新同班次的其他每周课次。
+    const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, lessons.room_id AS lesson_room_id, courses.code, sections.sequence, sections.teacher_id AS section_teacher_id, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; lesson_room_id: string | null; code: string; sequence: number; section_teacher_id: string | null; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
+    if (!lesson) throw new ScheduledLessonNotFoundError();
+    if (lesson.revision !== input.revision) throw new ScheduledLessonRevisionConflictError();
+    if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) {
+      throw new ScheduledLessonUpdateInputError("Lessons must remain Monday to Friday between 08:00 and 18:00.");
     }
+
+    // 旧排课可以保留已经停用的教师；只有教师 ID 真正改变时才要求目标教师仍为 Active。
+    const teacher = input.teacherId ? db.prepare("SELECT id, name, is_active FROM teachers WHERE id = ?").get(input.teacherId) as { id: string; name: string; is_active: number } | undefined : undefined;
+    const teacherChanged = input.teacherId !== lesson.section_teacher_id;
+    if (input.teacherId && !teacher) throw new ScheduledLessonUpdateInputError("Choose a valid teacher.");
+    if (teacherChanged && input.teacherId && teacher?.is_active !== 1) throw new ScheduledLessonUpdateInputError("Choose an active teacher.");
+
+    // 教室采用相同的 grandfather 规则：现有停用教室可以在调整其他字段时原样保留，
+    // 但不存在的教室或新改派的停用教室不能进入课程记录。
+    const room = input.roomId ? db.prepare("SELECT id, code, is_active FROM rooms WHERE id = ?").get(input.roomId) as { id: string; code: string; is_active: number } | undefined : undefined;
+    const roomChanged = input.roomId !== lesson.lesson_room_id;
+    if (input.roomId && !room) throw new ScheduledLessonUpdateInputError("Choose a valid room.");
+    if (roomChanged && input.roomId && room?.is_active !== 1) throw new ScheduledLessonUpdateInputError("Choose an active room.");
+
+    // 去重后确认每个 ID 都来自现有学生班级，避免过期页面写入悬空关联。
+    const studentGroupIds = [...new Set(input.studentGroupIds)];
+    if (studentGroupIds.length > 0) {
+      const placeholders = studentGroupIds.map(() => "?").join(", ");
+      const validGroups = db.prepare(`SELECT id FROM student_groups WHERE id IN (${placeholders})`).all(...studentGroupIds) as Array<{ id: string }>;
+      if (validGroups.length !== studentGroupIds.length) throw new ScheduledLessonUpdateInputError("Choose valid student groups.");
+    }
+
+    const currentStudentGroups = listSectionStudentGroupAssignments(db, lesson.section_id);
+    const currentStudentGroupIds = currentStudentGroups.map((group) => group.id).sort();
+    const sortedStudentGroupIds = [...studentGroupIds].sort();
+    const groupsChanged = currentStudentGroupIds.length !== sortedStudentGroupIds.length || currentStudentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
+    const sharedAssignmentsChanged = teacherChanged || groupsChanged;
+
     // 拖动课程也会把未改变的教师和班级原样提交；只有共享分配真的变化时才修改班次 revision。
     // 教师改变才清除 Excel 来源，纯粹移动时间、改教室或只改班级都不会误伤教师来源资料。
     if (sharedAssignmentsChanged) {
@@ -1841,28 +1875,28 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
       db.prepare("UPDATE scheduled_lessons SET revision = revision + 1 WHERE section_id = ? AND id <> ?").run(lesson.section_id, id);
     }
     const updateResult = db.prepare("UPDATE scheduled_lessons SET day_of_week = ?, start_hour = ?, room_id = ?, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.dayOfWeek, input.startHour, input.roomId, id, input.revision);
-    if (updateResult.changes !== 1) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
+    if (updateResult.changes !== 1) throw new ScheduledLessonRevisionConflictError();
 
     // warning 属于保存结果的一部分；放在相同事务中后，若重算失败，位置、共享分配和全部 revision 会一起回滚。
-    refreshedWarnings = refreshAllScheduleWarnings(db);
+    const currentLessonWarnings = refreshAllScheduleWarnings(db).get(id) ?? [];
+    const studentGroupAssignments = listSectionStudentGroupAssignments(db, lesson.section_id);
+    // 返回结构与普通时间表查询保持一致，使 Inspector 保存后立即拥有完整关联资料。
+    return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: currentLessonWarnings, warningSeverity: highestIssueSeverity(currentLessonWarnings) } satisfies ScheduledLessonRecord;
   });
-  updateTransaction.immediate();
-
-  const currentLessonWarnings = refreshedWarnings.get(id) ?? [];
-  const room = input.roomId ? db.prepare("SELECT code FROM rooms WHERE id = ?").get(input.roomId) as { code: string } | undefined : undefined;
-  // 修改操作的返回结构与普通时间表查询保持一致，使卡片编辑后立刻保留学生班级信息，
-  // 不必等待下一次轮询刷新。
-  const studentGroupAssignments = listSectionStudentGroupAssignments(db, lesson.section_id);
-  return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: currentLessonWarnings, warningSeverity: highestIssueSeverity(currentLessonWarnings) };
+  return updateTransaction.immediate();
 }
 
 export function removeScheduledLesson(id: string, revision: number) {
   // 删除一条排课只会把对应的每周课次退回待排区；若该班次每周上两次，
   // 另一课次仍保留在原时间表位置。
   const db = database();
-  const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
-  if (removed) refreshAllScheduleWarnings(db);
-  return removed;
+  const removeTransaction = db.transaction(() => {
+    const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
+    // 退回待排区会改变其他课程的冲突和连续时长；DELETE 与 warning 重算必须一起回滚或提交。
+    if (removed) refreshAllScheduleWarnings(db);
+    return removed;
+  });
+  return removeTransaction.immediate();
 }
 
 export class TeachingAllocationImportConflictError extends Error {

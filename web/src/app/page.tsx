@@ -182,6 +182,53 @@ function TeacherSelect({ teachers, selectedTeacherId, selectedTeacherName, ariaL
   );
 }
 
+function RoomSelect({ rooms, selectedRoomId, selectedRoomCode, ariaLabel }: { rooms: Room[]; selectedRoomId: string | null; selectedRoomCode: string | null; ariaLabel: string }) {
+  // 教室状态与教师状态采用相同原则：Inactive 教室不能成为新的选择，但旧课程当前
+  // 使用的教室必须继续显示。否则原生 select 找不到当前 value，会静默跳到 Room pending。
+  const [draftRoomId, setDraftRoomId] = useState(selectedRoomId ?? "");
+  const selectedRoom = selectedRoomId ? rooms.find((room) => room.id === selectedRoomId) : undefined;
+  const draftRoom = draftRoomId ? rooms.find((room) => room.id === draftRoomId) : undefined;
+  const currentRoomIsUnavailable = Boolean(selectedRoomId) && selectedRoom?.status !== "Active";
+  const newDraftRoomIsUnavailable = Boolean(draftRoomId) && draftRoomId !== selectedRoomId && draftRoom?.status !== "Active";
+  const currentRoomLabel = selectedRoom?.status === "Active"
+    ? `${selectedRoom.code} · ${selectedRoom.capacity} seats`
+    : `${selectedRoomCode ?? selectedRoom?.code ?? "Current room"} (Inactive — current assignment)`;
+
+  return (
+    <div className="grid gap-1">
+      <select
+        name="roomId"
+        value={draftRoomId}
+        onChange={(event) => setDraftRoomId(event.target.value)}
+        aria-label={ariaLabel}
+        aria-invalid={newDraftRoomIsUnavailable || undefined}
+        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"
+      >
+        <option value="">Room pending</option>
+        {/* 当前教室保留稳定的 key/value；后台状态刷新只改变文字，不会把已保存的 roomId 清空。 */}
+        {selectedRoomId && (
+          <option key={`current-${selectedRoomId}`} value={selectedRoomId}>{currentRoomLabel}</option>
+        )}
+        {/* 未保存的新教室若被另一账号停用，继续显示该草稿并要求重选，避免浏览器自行换成空值。 */}
+        {newDraftRoomIsUnavailable && (
+          <option key={`unavailable-draft-${draftRoomId}`} value={draftRoomId}>
+            {draftRoom?.code ?? "Selected room"} (Inactive — choose another room)
+          </option>
+        )}
+        {rooms.filter((room) => room.status === "Active" && room.id !== selectedRoomId).map((room) => (
+          <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>
+        ))}
+      </select>
+      {currentRoomIsUnavailable && (
+        <p className="text-[10px] leading-4 text-red-700">This room is inactive. Keep the current assignment temporarily, or choose an active room.</p>
+      )}
+      {newDraftRoomIsUnavailable && (
+        <p className="text-[10px] font-semibold leading-4 text-red-700">Your unsaved room selection became inactive. Choose an active room before saving.</p>
+      )}
+    </div>
+  );
+}
+
 function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
   // 按需求约定统一课程卡颜色：红色代表严重冲突，黄色代表每日时数等软性上限，蓝色代表建议事项或尚未完成的教师／教室分配。
   if (severity === "High") return { card: "bg-red-50 text-red-950 ring-red-300", message: "text-red-700" };
@@ -958,7 +1005,7 @@ export default function Home() {
     async function refreshVisibleWorkspace() {
       // 轮询只请求当前可见的年级表、个人表或规则页，既保持多浏览器同步，也避免反复下载无关资料表。
       let responses: Response[] = [];
-      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues"), fetch("/api/teachers")]);
+      if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/lessons?year=${timetableYear}`), fetch(`/api/schedule/unscheduled?year=${timetableYear}`), fetch("/api/issues"), fetch("/api/teachers"), fetch("/api/rooms")]);
       if (view === "Personal timetables" && personalOwnerId) responses = await Promise.all([fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`), fetch("/api/teachers")]);
       if (view === "Rules & issues") responses = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
       if (!active || responses.length === 0) return;
@@ -977,9 +1024,11 @@ export default function Home() {
         setUnscheduledSections(nextUnscheduledSections);
         setScheduleIssues(payloads[2] as ScheduleIssue[]);
         setTeachers(payloads[3] as Teacher[]);
+        setRooms(payloads[4] as Room[]);
 
-        // Inspector 和手工排课表单保存的是“当前记录对象”；只更新背景清单会让已打开面板继续显示旧教师状态。
-        // 每次轮询按稳定 ID 对齐这些对象，使另一账号停用／启用教师后，警告、下拉和红色说明一起更新。
+        // Inspector 和手工排课表单保存的是“当前记录对象”；只更新背景清单会让已打开面板继续显示旧状态。
+        // 每次轮询按稳定 ID 对齐对象，并同步教师、教室清单，使另一账号停用／启用资料后，
+        // 警告、下拉和红色说明一起更新，同时保留老师尚未保存的受控选择草稿。
         setEditingLesson((current) => current ? nextLessons.find((lesson) => lesson.id === current.id) ?? null : null);
         setPlacingSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? null : null);
         setCandidateSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? null : null);
@@ -1700,14 +1749,11 @@ export default function Home() {
                         <TeacherSelect teachers={teachers} selectedTeacherId={editingLesson.teacherId} selectedTeacherName={editingLesson.teacherName} ariaLabel={`Teacher for ${editingLesson.sectionLabel}`} />
                       </div>
 
-                      {/* 教室允许暂时留空，因为草稿可以带警告保存；新选择仍只显示 Active 教室。 */}
-                      <label className="text-xs font-semibold text-slate-700">
-                        Room
-                        <select name="roomId" defaultValue={editingLesson.roomId ?? ""} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
-                          <option value="">Room pending</option>
-                          {rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
-                        </select>
-                      </label>
+                      {/* 当前停用教室会作为旧分配保留；新改选项只来自 Active 名单，空值仍表示稍后再分配。 */}
+                      <div className="grid gap-1 text-xs font-semibold text-slate-700">
+                        <span>Room</span>
+                        <RoomSelect rooms={rooms} selectedRoomId={editingLesson.roomId} selectedRoomCode={editingLesson.roomCode} ariaLabel={`Room for ${editingLesson.sectionLabel}`} />
+                      </div>
 
                       {/* Return to tray 删除当前课次位置；Save changes 则保留课次并重新计算全部警告。 */}
                       <div className="grid grid-cols-2 gap-2">
