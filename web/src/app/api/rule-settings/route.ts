@@ -10,8 +10,21 @@ export async function GET() {
 
 export async function PATCH(request: Request) {
   // 每次只保存一个已登记规则开关；状态改变后，数据库层立即刷新所有已排课程警告。
-  const body = await request.json();
+  let parsedBody: unknown;
+  try {
+    parsedBody = await request.json();
+  } catch {
+    return Response.json({ error: "Rule key and enabled state are invalid." }, { status: 400 });
+  }
+  const body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+    ? parsedBody as Record<string, unknown>
+    : {};
   if (typeof body.key !== "string" || typeof body.enabled !== "boolean") return Response.json({ error: "Rule key and enabled state are invalid." }, { status: 400 });
-  if (!updateRuleSetting(body.key, body.enabled)) return Response.json({ error: "Rule setting not found." }, { status: 404 });
-  return Response.json({ ok: true });
+  try {
+    if (!updateRuleSetting(body.key, body.enabled)) return Response.json({ error: "Rule setting not found." }, { status: 404 });
+    return Response.json({ ok: true });
+  } catch (error) {
+    console.error("Rule setting update failed", error);
+    return Response.json({ error: "The rule setting could not be updated. Try again." }, { status: 500 });
+  }
 }

@@ -1894,3 +1894,35 @@
 1. 把同一课次首次排课的并发回归扩展到两个独立登录会话和两个共享 SQLite 的 standalone 进程；当前自动化已覆盖同进程并发请求，跨进程路径仍只有之前的一次性验收记录。
 2. 为学生班级、教室、规则与不可用时段的写入／warning 重算补齐 trigger 故障回滚，并统一未知数据库错误的 500 响应。
 3. 减少 `/api/issues` 每五秒触发的全库 warning 写入，补齐 runtime 数据库索引和满负载性能基准。
+
+## 2026-08-11｜主资料与 warning 重算改为原子事务
+
+### 已完成
+
+- 学生班级资料修改改为 `IMMEDIATE` SQLite 事务：编号、年级、专业与全部课程 warning 在同一次提交中保存；warning 重算中途失败时，班级资料和已经开始更新的 warning 会一起回滚。
+- 教室资料修改与 Active／Inactive 状态切换采用同样的原子事务；容量、设施、Block、状态和 `Room is unavailable` 等警告始终来自同一个数据库版本，不再出现接口说失败但教室其实已经改变的半完成状态。
+- 教师及年级不可用时段的新增／删除与 warning 重算合并为一个事务；删除失败时原时段仍存在，新增失败时不会留下没有对应警告的时段。
+- 新增 Teacher 不可用时段时，数据库在取得写锁后再次确认教师 ID 存在；错误 ID 得到安全的 400，避免把外键错误或表结构发送到浏览器。
+- 可修改规则的开关与全库 warning 重算改为原子事务；开关更新失败时规则值和所有课程警告均保持原状。
+- 建立 `MasterDataUniqueConflictError` 与 `MasterDataInputError`：只有稳定的 `SQLITE_CONSTRAINT_UNIQUE` 会成为学生班级／教室编号重复的 409；trigger、磁盘或其他未知数据库故障只写服务器日志，并向界面返回通用 JSON 500。
+- 学生班级、教室、规则和不可用时段的 JSON 路由统一处理损坏 JSON、`null`、数组与无效字段，全部返回可修正的 400；未知故障不会穿过 Next.js 形成 HTML 错误页。
+- 教室设施字段改为严格布尔值验证；字符串 `"false"` 不会再被 JavaScript 的 `Boolean("false")` 错误保存成 `true`。Smart Classroom 仍会按照院系规则自动同时标记为 Multi Projector。
+- 自动化完整业务快照新增教师不可用时段、年级禁排时段和规则开关，后续任何原子回归都会同时检查这些关系，而不只比较课程数量。
+- 保留老师工作树中尚未提交的 UX 测试命令、脚本和文档；本次没有暂存或修改这些文件。
+
+### 本次验证
+
+- `node --check scripts/verify-api-crud.mjs`、`git diff --check`、`npm run lint`、独立 TypeScript 检查和完整 `npm test` 全部通过；production build 的 24 个页面／API 成功生成。
+- 在一次性 SQLite 中建立真实课程后，用 `BEFORE UPDATE OF warnings_json` trigger 强制 warning 重算失败；随后依次修改学生班级、教室资料、教室状态、`lunch_break` 规则、新增 Teacher 不可用时段和删除与现有课程重叠的 Year 不可用时段，六个请求均得到安全 500。
+- 六次故障中的每一次都独立比较完整业务快照：教师、学生班级、教室、课程、Teaching allocation、班次、班级关联、已排课程、教师不可用时段、年级禁排时段和规则开关逐字段完全相同，证明不存在主资料先提交的半更新。
+- 另为学生班级和教室新增分别建立 `BEFORE INSERT` trigger；非唯一键数据库故障得到通用 500，不会被误报成“编号已存在”，响应不含 `SQLite`、trigger、constraint、表名或列名，失败后完整业务快照不变。
+- 六个 JSON 写入入口分别使用 `null` 和损坏 JSON 测试，全部得到 JSON 400；教室新增／修改传入字符串布尔值也得到 400，没有建立或修改资料。
+- 删除故障 trigger 后，规则可以正常切换并恢复原值，Year 不可用时段可以正常删除；随机不存在的教师 ID 新增不可用时段得到明确 400 且数据库零变化。
+- 原有身份、Excel 边界、Teaching allocation 重导、CRUD／revision、多人首次排课、注销、SQLite `RESTRICT`／`SET NULL`／`CASCADE`、`integrity_check` 与 `foreign_key_check` 回归仍全部通过。
+- 测试只使用 `os.tmpdir()` 下自动清理的一次性数据库和随机 localhost 端口；正式 `web/data/timetabling.db` 修改时间仍为 `2026-08-11 01:06:13`。
+
+### 下一步
+
+1. 把新周期建立和上次周期恢复中的资料写入、快照与 warning 重算合并为同一个可回滚事务。
+2. 把课程配置与相关课次 revision／warning 重算合并为同一个原子事务，并增加 trigger 故障回归。
+3. 把 `/api/issues` 改为纯读取已保存 warning，避免每个账号五秒一次全库写入；随后补齐运行时索引和满负载性能基准。

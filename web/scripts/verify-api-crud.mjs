@@ -198,6 +198,9 @@ function readBusinessSnapshot() {
       sections: db.prepare("SELECT * FROM course_sections ORDER BY id").all(),
       sectionGroups: db.prepare("SELECT * FROM section_student_groups ORDER BY section_id, student_group_id").all(),
       lessons: db.prepare("SELECT * FROM scheduled_lessons ORDER BY id").all(),
+      teacherUnavailableWindows: db.prepare("SELECT * FROM teacher_unavailable_windows ORDER BY id").all(),
+      yearBlockedWindows: db.prepare("SELECT * FROM year_blocked_windows ORDER BY id").all(),
+      ruleSettings: db.prepare("SELECT * FROM rule_settings ORDER BY rule_key").all(),
     };
   } finally {
     db.close();
@@ -877,6 +880,149 @@ async function verifyCrudAndRevisions() {
   };
 }
 
+async function verifyAtomicMasterDataWarnings(ids) {
+  // 先正常建立一条年级不可用时段。稍后故意让删除后的 warning 重算失败，
+  // 便能确认 DELETE 不是先提交、再在重算时才报告一个误导性的失败。
+  const yearWindow = (await requestApi("/api/unavailability", {
+    method: "POST",
+    expectedStatus: 201,
+    // 现有课程位于 Year 1、Tuesday 11:00–14:00；这个时段会真实改变该课 warning，
+    // 因此未来即使刷新逻辑改成增量计算，本测试仍会触发目标 lesson 的更新。
+    json: { kind: "Year", ownerId: "1", dayOfWeek: 2, startHour: 10, endHour: 12 },
+  })).body;
+  assert.equal(typeof yearWindow.id, "string");
+
+  const rules = (await requestApi("/api/rule-settings")).body;
+  const lunchBreakRule = rules.find((rule) => rule.key === "lunch_break");
+  assert(lunchBreakRule, "The lunch_break rule fixture was not found.");
+
+  // 每条失败请求都使用完整业务快照验证“零变化”，并检查浏览器响应只包含安全业务文字。
+  // 若未来有人把事务拆开，这些断言会直接看到编号、状态、时段或 warning 的半完成写入。
+  async function expectAtomicFailure(pathname, expectedError, options) {
+    const before = readBusinessSnapshot();
+    const failed = await requestApi(pathname, { ...options, expectedStatus: 500 });
+    // 完整对象相等既锁定业务分类，也禁止未来意外追加 SQL、error code、query、stack 或路径字段。
+    assert.deepEqual(failed.body, { error: expectedError });
+    assert(
+      !/forced|sqlite|database|trigger|constraint|scheduled_lessons|warnings_json|update |insert |delete |table|column|stack/i.test(JSON.stringify(failed.body)),
+      `${options.method} ${pathname} leaked database implementation details.`,
+    );
+    assert.deepEqual(readBusinessSnapshot(), before, `${options.method} ${pathname} left a partial business write.`);
+  }
+
+  // Trigger 只作用于本次隔离库的一节课；每次 refreshAllScheduleWarnings 更新该课时
+  // 都会抛错。六个 API 必须把主资料更新与全部 warning 一起回滚。
+  executeTestDatabase((db) => {
+    const lessonIdLiteral = db.prepare("SELECT quote(?) AS value").get(ids.lessonId).value;
+    db.exec(`CREATE TRIGGER zz_fail_master_warning_refresh BEFORE UPDATE OF warnings_json ON scheduled_lessons WHEN NEW.id = ${lessonIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced master warning refresh failure'); END;`);
+  });
+  try {
+    await expectAtomicFailure(`/api/student-groups/${ids.studentGroupId}`, "The student group could not be updated. Try again.", {
+      method: "PATCH",
+      json: { code: "AAA_ATOMIC_FAIL", year: 3, program: "ATOMIC" },
+    });
+    await expectAtomicFailure(`/api/rooms/${ids.roomId}`, "The room could not be updated. Try again.", {
+      method: "PATCH",
+      json: { code: "34-08-40", capacity: 60, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
+    });
+    await expectAtomicFailure(`/api/rooms/${ids.roomId}`, "The room status could not be updated. Try again.", {
+      method: "PATCH",
+      json: { isActive: false },
+    });
+    await expectAtomicFailure("/api/rule-settings", "The rule setting could not be updated. Try again.", {
+      method: "PATCH",
+      json: { key: lunchBreakRule.key, enabled: !lunchBreakRule.enabled },
+    });
+    await expectAtomicFailure("/api/unavailability", "The unavailable window could not be saved. Try again.", {
+      method: "POST",
+      json: { kind: "Teacher", ownerId: ids.teacherId, dayOfWeek: 2, startHour: 10, endHour: 12 },
+    });
+    await expectAtomicFailure(`/api/unavailability?id=${yearWindow.id}&kind=Year`, "The unavailable window could not be removed. Try again.", {
+      method: "DELETE",
+    });
+  } finally {
+    // 即使中间断言失败也删除故障 trigger，避免后续清理请求被测试夹具继续阻挡。
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_master_warning_refresh"));
+  }
+
+  // Trigger 移除后，规则可以正常切换并恢复原值，预建时段也能正常删除；
+  // 这证明前面的 500 来自故障注入，而不是接口本身永久不可用。
+  await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    json: { key: lunchBreakRule.key, enabled: !lunchBreakRule.enabled },
+  });
+  await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    json: { key: lunchBreakRule.key, enabled: lunchBreakRule.enabled },
+  });
+  await requestApi(`/api/unavailability?id=${yearWindow.id}&kind=Year`, { method: "DELETE" });
+
+  // 不存在的教师是可修正输入错误，应得到安全 400，并且不能建立悬空不可用时段。
+  const beforeInvalidOwner = readBusinessSnapshot();
+  const invalidOwner = await requestApi("/api/unavailability", {
+    method: "POST",
+    expectedStatus: 400,
+    json: { kind: "Teacher", ownerId: randomUUID(), dayOfWeek: 1, startHour: 8, endHour: 9 },
+  });
+  assert.match(invalidOwner.body.error, /valid teacher/i);
+  assert.deepEqual(readBusinessSnapshot(), beforeInvalidOwner);
+
+  // 新增接口也不能把任意 trigger 故障误报成“编号重复”。分别注入非 UNIQUE
+  // 约束错误，确认返回通用 500、隐藏表结构，且没有插入半条基础资料。
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_fail_student_group_creation BEFORE INSERT ON student_groups
+    WHEN NEW.code = 'ATOMIC_CREATE_FAIL' BEGIN SELECT RAISE(ABORT, 'forced student group creation failure'); END;
+    CREATE TRIGGER zz_fail_room_creation BEFORE INSERT ON rooms
+    WHEN NEW.code = '39-09-90' BEGIN SELECT RAISE(ABORT, 'forced room creation failure'); END;
+  `));
+  try {
+    await expectAtomicFailure("/api/student-groups", "The student group could not be created. Try again.", {
+      method: "POST",
+      json: { code: "ATOMIC_CREATE_FAIL", year: 1, program: "ATOMIC" },
+    });
+    await expectAtomicFailure("/api/rooms", "The room could not be created. Try again.", {
+      method: "POST",
+      json: { code: "39-09-90", capacity: 20, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec(`
+      DROP TRIGGER IF EXISTS zz_fail_student_group_creation;
+      DROP TRIGGER IF EXISTS zz_fail_room_creation;
+    `));
+  }
+
+  // 所有 JSON 写入路由都必须把 null 和损坏 JSON 转换成 400 JSON，不能让
+  // request.json() 的语法异常穿过 Next.js 形成 HTML 或未受控 500。
+  const jsonRoutes = [
+    ["/api/student-groups", "POST"],
+    [`/api/student-groups/${ids.studentGroupId}`, "PATCH"],
+    ["/api/rooms", "POST"],
+    [`/api/rooms/${ids.roomId}`, "PATCH"],
+    ["/api/rule-settings", "PATCH"],
+    ["/api/unavailability", "POST"],
+  ];
+  for (const [pathname, method] of jsonRoutes) {
+    await requestApi(pathname, { method, json: null, expectedStatus: 400 });
+    await requestApi(pathname, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: "{broken",
+      expectedStatus: 400,
+    });
+  }
+  await requestApi("/api/rooms", {
+    method: "POST",
+    expectedStatus: 400,
+    json: { code: "38-08-80", capacity: 20, hasLab: "false", hasMultiProjector: false, isSmartClassroom: false },
+  });
+  await requestApi(`/api/rooms/${ids.roomId}`, {
+    method: "PATCH",
+    expectedStatus: 400,
+    json: { code: "38-08-81", capacity: 20, hasLab: false, hasMultiProjector: "false", isSmartClassroom: false },
+  });
+  report("主资料、规则和不可用时段 warning 重算原子回滚及安全 JSON 错误");
+}
+
 async function verifyLogout() {
   // 测试结束时删除服务器会话，再使用旧 Cookie 访问业务 API；401 证明注销不仅
   // 清除了浏览器 Cookie 响应，也确实删除了 SQLite 中的会话记录。
@@ -976,6 +1122,7 @@ async function run() {
   await verifyWorkbookBoundaries();
   await verifyTeachingAllocationReimport();
   const relationshipIds = await verifyCrudAndRevisions();
+  await verifyAtomicMasterDataWarnings(relationshipIds);
   await verifyLogout();
 
   // 关闭应用连接后再直接验证数据库外键，避免后台请求或连接缓存干扰断言。

@@ -792,25 +792,57 @@ export function listStudentGroups(): StudentGroupRecord[] {
   return rows;
 }
 
+export class MasterDataUniqueConflictError extends Error {
+  // 基础资料的编号／名称重复属于可修正的 409，而 warning trigger 或 SQLite
+  // 其他故障必须走安全 500。独立类型避免 API 把所有异常都误报成“重复资料”。
+  constructor(message: string) {
+    super(message);
+    this.name = "MasterDataUniqueConflictError";
+  }
+}
+
+export class MasterDataInputError extends Error {
+  // 不可用时段等基础资料若引用不存在的教师，应返回明确 400，而不是暴露外键错误。
+  constructor(message: string) {
+    super(message);
+    this.name = "MasterDataInputError";
+  }
+}
+
 export function createStudentGroup(code: string, year: number, program: string): StudentGroupRecord {
   // 学生班级 ID 是冲突检查所依赖的稳定身份；年级和专业仍可修改，
   // 由数据库生成的 ID 则保护已有课程关联不受名称调整影响。
   const id = crypto.randomUUID();
-  database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
+  try {
+    database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
+  } catch (error) {
+    // 只有稳定的 SQLite 唯一键错误才代表班级编号重复；磁盘、trigger 等未知故障继续向上抛，
+    // 由 API 隐藏技术细节并返回通用 500，不能误导老师继续修改一个本来并未重复的编号。
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    throw error;
+  }
   return { id, code, year, program };
 }
 
 export function updateStudentGroup(id: string, input: { code: string; year: number; program: string }) {
   // 修改拼写、专业或年级时保留原班级 ID，因此已经分配给该班的所有课程班次都会继续存在。
   const db = database();
-  const result = db.prepare(`
-    UPDATE student_groups SET code = ?, year = ?, program = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(input.code, input.year, input.program, id);
-  // 冲突警告会直接显示班级名称，因此班级资料修改后立即重新计算已保存的警告，
-  // 避免时间表继续显示过期名称。
-  if (result.changes > 0) refreshAllScheduleWarnings(db);
-  return result.changes > 0;
+  const updateTransaction = db.transaction(() => {
+    const result = db.prepare(`
+      UPDATE student_groups SET code = ?, year = ?, program = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(input.code, input.year, input.program, id);
+    // 冲突警告会直接显示班级编号，因此资料修改和 warning 重算必须一起提交；
+    // 重算失败时保留原编号、年级和专业，避免接口假失败后资料其实已经改变。
+    if (result.changes > 0) refreshAllScheduleWarnings(db);
+    return result.changes > 0;
+  });
+  try {
+    return updateTransaction.immediate();
+  } catch (error) {
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    throw error;
+  }
 }
 
 export function listRooms(): RoomRecord[] {
@@ -833,7 +865,13 @@ export function createRoom(input: { code: string; capacity: number; hasLab: bool
   const block = input.code.split("-")[0] || null;
   // 本院系规定 Smart Classroom 一定具备 Multi Projector，所以保存时自动补上该标记。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
-  database().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
+  try {
+    database().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
+  } catch (error) {
+    // 与学生班级相同，只把真正的编号唯一键冲突转换为 409；其他数据库异常不能伪装成重复编号。
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A room with this code already exists.");
+    throw error;
+  }
   return { id, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
 }
 
@@ -844,22 +882,35 @@ export function updateRoom(id: string, input: { code: string; capacity: number; 
   // 编辑资料时同样强制执行“Smart Classroom 也是 Multi Projector”的院系规则。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
   const db = database();
-  const result = db.prepare(`
-    UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
-      is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, id);
-  if (result.changes > 0) refreshAllScheduleWarnings(db);
-  return result.changes > 0;
+  const updateTransaction = db.transaction(() => {
+    const result = db.prepare(`
+      UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
+        is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, id);
+    // 容量、设施和 Block 都会改变课程警告，因此和 warning 重算放在同一个事务。
+    if (result.changes > 0) refreshAllScheduleWarnings(db);
+    return result.changes > 0;
+  });
+  try {
+    return updateTransaction.immediate();
+  } catch (error) {
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A room with this code already exists.");
+    throw error;
+  }
 }
 
 export function setRoomStatus(id: string, isActive: boolean) {
   // 教室只停用、不直接删除，使旧时间表卡片仍能引用有效的历史教室；
   // 新的排课候选搜索则会自动排除已停用教室。
   const db = database();
-  const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
-  if (result.changes > 0) refreshAllScheduleWarnings(db);
-  return result.changes > 0;
+  const statusTransaction = db.transaction(() => {
+    const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
+    // 状态和 `Room is unavailable` warning 必须始终来自同一次提交。
+    if (result.changes > 0) refreshAllScheduleWarnings(db);
+    return result.changes > 0;
+  });
+  return statusTransaction.immediate();
 }
 
 export function listUnavailableWindows(): UnavailableWindowRecord[] {
@@ -873,19 +924,33 @@ export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; owner
   // 不可用时段采用左闭右开区间 [开始, 结束)，与课程重叠判断规则保持一致。
   const id = crypto.randomUUID();
   const db = database();
-  if (input.kind === "Teacher") db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
-  else db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
-  refreshAllScheduleWarnings(db);
-  return id;
+  const createTransaction = db.transaction(() => {
+    if (input.kind === "Teacher") {
+      // API 会先验证格式；数据库边界再确认教师仍存在，封住删除与保存同时发生的竞态。
+      const teacherExists = db.prepare("SELECT 1 FROM teachers WHERE id = ?").get(input.ownerId);
+      if (!teacherExists) throw new MasterDataInputError("Choose a valid teacher.");
+      db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
+    } else {
+      db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+    }
+    // 新时段和受影响课程 warning 必须一起出现；任何重算故障都会删除刚插入的时段。
+    refreshAllScheduleWarnings(db);
+    return id;
+  });
+  return createTransaction.immediate();
 }
 
 export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
   // 先根据类型选择准确的数据表，避免不同表中恰好出现相同 ID 时误删其他记录。
   const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
   const db = database();
-  const removed = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
-  if (removed) refreshAllScheduleWarnings(db);
-  return removed;
+  const deleteTransaction = db.transaction(() => {
+    const removed = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0;
+    // 删除时段和清除对应 warning 属于一个业务动作，必须一起成功或一起回滚。
+    if (removed) refreshAllScheduleWarnings(db);
+    return removed;
+  });
+  return deleteTransaction.immediate();
 }
 
 const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
@@ -911,9 +976,13 @@ export function updateRuleSetting(key: string, enabled: boolean) {
   // 因而不会被用户意外停用。
   if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
   const db = database();
-  const changed = db.prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
-  if (changed) refreshAllScheduleWarnings(db);
-  return changed;
+  const settingTransaction = db.transaction(() => {
+    const changed = db.prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
+    // 规则开关和由它生成／清除的所有 warning 对老师来说是一个不可分割的结果。
+    if (changed) refreshAllScheduleWarnings(db);
+    return changed;
+  });
+  return settingTransaction.immediate();
 }
 
 function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
@@ -1762,11 +1831,17 @@ export class ScheduledLessonUpdateInputError extends Error {
   }
 }
 
+function isSqliteUniqueConstraintError(error: unknown) {
+  // SQLite 提供稳定错误代码，可安全区分“唯一键重复”和 trigger、磁盘或其他数据库故障。
+  // 所有对外业务提示都通过这个代码判断，绝不解析可能变化或泄露表名的英文错误文字。
+  return error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_UNIQUE";
+}
+
 function isScheduledOccurrenceUniqueError(error: unknown) {
   // 预先查询能提供友好提示，但多个应用进程仍可能在查询后同时写入。
   // 这里依赖 SQLite 的稳定错误代码而不是可能随版本或语言变化的英文错误文字。
   // 当前事务只有 scheduled_lessons INSERT 会触发唯一键，所以这个代码可以准确代表同一课次已存在。
-  return error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_UNIQUE";
+  return isSqliteUniqueConstraintError(error);
 }
 
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
