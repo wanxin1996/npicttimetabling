@@ -205,7 +205,13 @@ function legacyWeekPattern(weekStart: number | null, weekEnd: number | null): "A
 // 可以避免每次刷新路由都重新打开一个 SQLite 连接，减少锁冲突和资源浪费。
 const globalForDatabase = globalThis as unknown as {
   timetableDatabase: DatabaseInstance | undefined;
+  timetableSchemaVersion: number | undefined;
 };
+
+// 这个数字只在 initializeTables 的表、列或索引定义发生变化时增加。
+// 开发热重载会保留全局 SQLite 连接，但会重新载入本文件；版本不同就补做一次迁移，
+// 同一版本的普通 API 请求则直接复用连接，不再每次解析整组 CREATE／ALTER 语句。
+const runtimeSchemaVersion = 2026081101;
 
 function databaseFilePath() {
   // 数据库路径统一从这里取得，确保正式数据库和恢复前自动生成的安全副本
@@ -217,10 +223,13 @@ function databaseFilePath() {
 }
 
 function database() {
-  // 即使数据库连接已经存在，也要重复执行可安全重入的建表和升级逻辑。
-  // 这样应用新增功能后，无需手工迁移就能补上新表或新字段。
+  // 已打开的连接只在代码里的 schema 版本变化时重复初始化。这样既保留开发热重载
+  // 自动补迁移的能力，也避免每个五秒轮询请求反复执行整套 DDL 和兼容 UPDATE。
   if (globalForDatabase.timetableDatabase) {
-    initializeTables(globalForDatabase.timetableDatabase);
+    if (globalForDatabase.timetableSchemaVersion !== runtimeSchemaVersion) {
+      initializeTables(globalForDatabase.timetableDatabase);
+      globalForDatabase.timetableSchemaVersion = runtimeSchemaVersion;
+    }
     return globalForDatabase.timetableDatabase;
   }
 
@@ -232,6 +241,7 @@ function database() {
   const db = new Database(databasePath);
   db.pragma("foreign_keys = ON");
   initializeTables(db);
+  globalForDatabase.timetableSchemaVersion = runtimeSchemaVersion;
   // 示例数据只用于本地开发时快速查看界面。部署环境中的空数据库必须保持干净，
   // 防止真实用户误把虚构的教师、学生班级或教室当成正式资料。
   if (process.env.NODE_ENV !== "production") seed(db);
@@ -618,6 +628,37 @@ function initializeTables(db: DatabaseInstance) {
     // 同时编辑同一个班次时，后提交者把先提交者的选择静默覆盖。
     db.exec("ALTER TABLE course_sections ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
   }
+
+  // SQLite 不会像 Prisma migration 那样自动建立 @@index，也不会为普通外键自动加索引。
+  // 这里只建立实际 API 查询会使用的最小集合；普通唯一键已经自动拥有索引，不再重复建立。
+  // 复合索引名称写出完整列清单，避免旧版本曾建立同名前缀索引时，IF NOT EXISTS
+  // 静默保留旧形状。开发热重载和旧数据库升级都可以安全重复执行这一组语句。
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx
+      ON auth_sessions (user_id);
+    CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx
+      ON auth_sessions (expires_at);
+    CREATE INDEX IF NOT EXISTS rooms_is_active_code_idx
+      ON rooms (is_active, code);
+    CREATE INDEX IF NOT EXISTS courses_primary_year_idx
+      ON courses (primary_year);
+    CREATE INDEX IF NOT EXISTS teaching_allocations_teacher_id_idx
+      ON teaching_allocations (teacher_id);
+    CREATE INDEX IF NOT EXISTS course_sections_teacher_id_idx
+      ON course_sections (teacher_id);
+    CREATE INDEX IF NOT EXISTS section_student_groups_student_group_id_section_id_idx
+      ON section_student_groups (student_group_id, section_id);
+    CREATE INDEX IF NOT EXISTS scheduled_lessons_room_id_day_of_week_start_hour_idx
+      ON scheduled_lessons (room_id, day_of_week, start_hour);
+    CREATE INDEX IF NOT EXISTS scheduled_lessons_day_of_week_start_hour_idx
+      ON scheduled_lessons (day_of_week, start_hour);
+    CREATE INDEX IF NOT EXISTS scheduled_lessons_section_id_day_of_week_start_hour_idx
+      ON scheduled_lessons (section_id, day_of_week, start_hour);
+    CREATE INDEX IF NOT EXISTS teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx
+      ON teacher_unavailable_windows (teacher_id, day_of_week, start_hour, end_hour);
+    CREATE INDEX IF NOT EXISTS year_blocked_windows_year_day_of_week_start_hour_end_hour_idx
+      ON year_blocked_windows (year, day_of_week, start_hour, end_hour);
+  `);
 }
 
 function seed(db: DatabaseInstance) {
@@ -679,7 +720,13 @@ function createSession(db: DatabaseInstance, userId: string) {
   // 没有原始 Cookie 的人即使复制了会话表，也难以利用其中的数据登录。
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
-  db.prepare("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)").run(sessionHash(token), userId, expiresAt);
+  // 过期会话只在低频登录／建立新会话时清理。若放在每次 validateSession，
+  // 即使 DELETE 没有匹配资料，所有五秒轮询 GET 仍会尝试取得 SQLite 写锁。
+  const saveSession = db.transaction(() => {
+    db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(new Date().toISOString());
+    db.prepare("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)").run(sessionHash(token), userId, expiresAt);
+  });
+  saveSession();
   return { token, expiresAt };
 }
 
@@ -695,7 +742,6 @@ export function validateSession(token: string): AppUserRecord | null {
   // 会话校验在一次查询中同时关联启用账号并检查过期时间，
   // 让被停用的用户或已过期的 Cookie 立即失去访问权限。
   const db = database();
-  db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(new Date().toISOString());
   const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
   return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) } : null;
 }
@@ -721,7 +767,16 @@ export function loginUser(username: string, password: string) {
   const db = database();
   const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
   if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
-  return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
+
+  // Scrypt 故意在写锁外运行，避免一次登录长时间挡住排课保存；但密码验证完成后，
+  // 管理员可能恰好重置密码或停用账号。因此建立会话前在 IMMEDIATE 事务内再次确认
+  // Active 状态和密码哈希仍是刚才验证的版本，旧请求不能在撤销之后补回新会话。
+  const finishLogin = db.transaction(() => {
+    const current = db.prepare("SELECT password_hash, is_active FROM app_users WHERE id = ?").get(row.id) as { password_hash: string; is_active: number } | undefined;
+    if (!current || current.is_active !== 1 || current.password_hash !== row.password_hash) return null;
+    return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
+  });
+  return finishLogin.immediate();
 }
 
 export function logoutSession(token: string) {
@@ -1621,7 +1676,12 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     ? "sections.teacher_id = ?"
     : kind === "Room"
       ? "lessons.room_id = ?"
-      : "EXISTS (SELECT 1 FROM section_student_groups personal_links WHERE personal_links.section_id = sections.id AND personal_links.student_group_id = ?)";
+      : "personal_links.student_group_id = ?";
+  // 学生班级视图从“每节课再执行一条关联子查询”改为直接 JOIN 反向索引。
+  // 教师和教室不需要这张关联表，因此只在 StudentGroup 分支加入 JOIN，避免产生重复课程行。
+  const personalGroupJoin = kind === "StudentGroup"
+    ? "JOIN section_student_groups personal_links ON personal_links.section_id = sections.id"
+    : "";
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence,
       teachers.id AS teacher_id, teachers.name AS teacher_name, lessons.day_of_week,
@@ -1640,6 +1700,7 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     FROM scheduled_lessons lessons
     JOIN course_sections sections ON sections.id = lessons.section_id
     JOIN courses ON courses.id = sections.course_id
+    ${personalGroupJoin}
     LEFT JOIN teachers ON teachers.id = sections.teacher_id
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE ${ownerFilter}

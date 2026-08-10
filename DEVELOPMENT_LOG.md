@@ -2008,3 +2008,44 @@
 1. 把 `/api/issues` 改成纯读取已保存 warning，避免每个账号五秒一次全库写入，并确认所有 warning 依赖资料的修改入口都主动刷新。
 2. 补齐 Prisma 中已经声明但 runtime SQLite 尚未建立的索引，并以接近实际 374 个班次、多账号轮询的资料量建立性能基准。
 3. 把 Course Setup 的浏览器级双会话冲突加入可重复 UI 验收；当前 production API 已覆盖旧 Configure／旧 Inspector 两类 revision 保护。
+
+## 2026-08-11｜补齐运行时索引并建立 374 班次性能回归
+
+### 已完成
+
+- 在 SQLite 实际初始化路径建立 12 个高频索引，覆盖登录会话、Active 教室、课程主年级、教师反向关联、学生班级反向关联、全局／教室／班次时段、教师不可用时段和年级禁排时段；普通主键与唯一键已经自动拥有的索引不重复建立。
+- 索引集合按真实 SQL 查询计划收敛：没有保留教师类型排序、学生班级排序、Block 筛选和 Excel 来源教师等当前查询不会使用的低收益索引，减少每次拖放保存时不必要的索引写入。
+- 学生班级、教师不可用和年级禁排的复合索引使用包含完整列名的新名称；旧开发版本即使曾建立同名前缀短索引，`IF NOT EXISTS` 也不会静默跳过新结构。
+- 新增 `scheduled_lessons(section_id, day_of_week, start_hour)`；否则加入全局星期／时间索引后，SQLite 会在“同一班次是否同日”检查中错误优先扫描当天全部课程。
+- Prisma schema 与 runtime SQLite 的 12 个索引名称、列和顺序完全一致；`prisma migrate diff` 生成的 SQL 已逐项核对，设计模型不再声明 runtime 没有部署的低收益索引。
+- 数据库连接新增明确的 runtime schema 版本。每个 production 进程只初始化一次表、兼容列和索引；开发热重载发现版本变化时仍会自动补迁移，不再让每个五秒轮询请求重复解析 DDL 和兼容 UPDATE。
+- 学生班级个人时间表从每节课执行 correlated `EXISTS` 改为直接 JOIN `section_student_groups(student_group_id, section_id)`；教师、教室分支仍不连接该表，跨年级课程会在两个参与班级中出现一次且只出现一次。
+- 登录会话验证改为纯 SELECT；过去每个已登录 GET 都会先执行一次可能零匹配的过期会话 DELETE，即使没有删到资料也会尝试取得 SQLite 写锁。过期记录现在只在低频的成功登录／建立新会话事务中清理。
+- 登录完成阶段新增 `IMMEDIATE` 复核：Scrypt 密码验证仍在写锁外执行，但真正建立会话前会重新确认账号仍 Active、密码哈希仍是刚才验证的版本，管理员并发停用或重置密码后旧请求不能补回新会话。
+- 新增独立 `verify-api-performance.mjs`：production standalone、随机 localhost 端口和一次性 SQLite 固定生成 52 门课程、374 个班次、360 条已排课、184 条 Teaching allocation、87 位教师、54 个学生班级、30 间教室和 6 个独立 scheduler 会话。
+- 性能夹具精确锁定三个年级已排数量 `123／122／115`、待排数量 `7／0／7`、270 条初始问题和所有主资料数量；错误返回空数组不能以“更快”的结果让性能门槛假通过。
+- 测试为候选班次保留第 87 位教师、第 54 个学生班级和第 30 间教室，仍遍历完整满载资料，但确定存在真实可用候选；同时验证该保留教室确实出现在结果中。
+- 纯读阶段建立 warning UPDATE trigger、session DELETE trigger，并由辅助连接持有 `BEGIN IMMEDIATE`；Issues、总表、待排区、候选、个人时间表和六账号轮询只要执行任何写语句（包括零行 DELETE）就会失败。
+- 真实 SHA-256 过期 Cookie 得到 401，持锁期间过期记录保持且不影响读取；释放锁后的下一次成功登录会删除它，证明减少读锁竞争没有破坏会话过期和清理语义。
+- Warning 写入性能先通过审计 trigger 记录 360 个不同 lesson ID，证明计时包含真实全量重算；之后才测五次 PATCH 和“一个写入 + 十个读取”，不会把漏刷新误判成性能提升。
+- 新增 `test:performance` 和 `test:release`。日常 `npm test` 保持确定性的功能回归；发布门槛在同一次 production build 后依次运行完整 CRUD／Excel／Cycle 回归和规模性能回归，杜绝直接执行脚本误测旧 `.next`。
+- 所有新数据库、查询、会话和性能测试区块都加入面向基础开发人员的中文注释；老师尚未提交的 UX 命令、脚本和文档保持在工作树中，本次提交只会选择性暂存自己的两条测试命令。
+
+### 本次验证
+
+- `node --check scripts/verify-api-performance.mjs`、`git diff --check`、`npm run lint`、独立 TypeScript 检查、Prisma validate／migration diff 和最终 `npm run test:release` 全部通过；production build 的 24 个页面／API 成功生成。
+- 12 个 runtime 索引的名称和列顺序逐项与预期相同；另对课程年级、教师班次、学生班级真实 JOIN、教室时段、全局时段、同班次同日、教师不可用和年级禁排八条热点查询执行 `EXPLAIN QUERY PLAN`，均命中对应索引。
+- 教师、学生班级和教室三类 Personal timetable 逐项对照 SQLite 精确 lesson ID，没有重复或遗漏；`PERF_C001_01` 同时关联 Year 1 与 Year 2 的两个班级，两个班级个人表及教师／教室视图都保留完整标签。
+- 满载纯读最终基线：Issues p95 中位 `17.8 ms`，Year timetable p95 `14.8 ms`；六账号同时发出 30 个页面轮询请求的整轮中位 `51.2 ms`、单请求 p95 `52.8 ms`。
+- 30 间教室的完整候选位置搜索中位 `553.8 ms`；360 条课次 warning 全量重算中位 `194.3 ms`；一个 warning 写入加十个并发读取的整轮中位 `232.8 ms`。门槛分别保留 1.5／6／10／15 秒级宽松余量，只拦数量级退化，不把普通电脑抖动误报成失败。
+- 六个 scheduler 使用不同用户名和六个随机 Cookie；真实轮询、候选、Personal timetable 和写读混合请求全部得到预期数量，没有 500、503、超时或资料缺失。
+- 性能与功能测试全部使用 `os.tmpdir()` 下的独立数据库，结束后没有残留 `timetabling-api-crud-*` 或 `timetabling-api-performance-*` 目录，测试没有连接正式数据库。
+- 正在运行的本地开发服务在本轮热重载时确实为 `web/data/timetabling.db` 建立了索引，文件当前修改时间为 `2026-08-11 04:45:51`、大小 544,768 bytes；不能再声称正式数据库文件未修改。
+- 正式库只读后验为 87 位教师、7 个学生班级、3 间教室、52 门课程、184 条 allocation、374 个班次、20 条已排课、各 1 条教师／年级不可用时段、1 个会话和 1 个应急备份；`integrity_check=ok`、`foreign_key_check` 为空。审查期间观察到索引迁移前后这些行数保持，但没有迁移前逐字段 hash，因此不夸大为正式业务记录逐字段不变。
+- 正式库还保留本轮早期草案曾建立的 8 个冗余旧索引，共 20 个显式索引；它们不影响资料、查询正确性或备份恢复，只带来很小写入开销。为避免对老师数据库做不必要的 DROP，本轮不主动删除；全新数据库只建立最终 12 个索引。
+
+### 下一步
+
+1. 把登录密码重置／停用与登录完成的跨进程竞态加入双 standalone 可重复测试；当前事务顺序已由代码审查和单进程 production 回归确认。
+2. 复用 `calculatePlacementWarnings` 的 prepared statements／批量上下文，减少候选搜索和满载 warning 重算仍会重复编译 SQL 的成本；当前 374 班次基线充足，但索引不是最终算法优化。
+3. 建立双进程共享 SQLite 的首次排课、Course Setup、Cycle 和登录并发回归，并明确部署始终保持单应用实例。

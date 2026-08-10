@@ -13,6 +13,8 @@
     "verify:deployment": "node scripts/verify-deployment.mjs",
     "test": "npm run test:integration",
     "test:integration": "npm run build && node scripts/verify-api-crud.mjs",
+    "test:performance": "npm run build && node scripts/verify-api-performance.mjs",
+    "test:release": "npm run build && node scripts/verify-api-crud.mjs && node scripts/verify-api-performance.mjs",
     "lint": "eslint",
     "db:generate": "prisma generate",
     "db:check": "prisma validate && prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script"
