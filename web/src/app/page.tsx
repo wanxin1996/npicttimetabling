@@ -33,6 +33,7 @@ type Course = {
   id: string;
   code: string;
   catalog: string | null;
+  revision: number;
   durationHours: number | null;
   sessionsPerWeek: number;
   primaryYear: number | null;
@@ -1365,29 +1366,60 @@ export default function Home() {
     event.preventDefault();
     if (!editingCourse) return;
     const data = new FormData(event.currentTarget);
-    const response = await fetch(`/api/courses/${editingCourse.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        durationHours: Number(data.get("durationHours")),
-        sessionsPerWeek: Number(data.get("sessionsPerWeek")),
-        primaryYear: data.get("primaryYear") ? Number(data.get("primaryYear")) : null,
-        minimumRoomCapacity: data.get("minimumRoomCapacity") ? Number(data.get("minimumRoomCapacity")) : null,
-        requiresLab: Boolean(data.get("requiresLab")),
-        requiresMultiProjector: Boolean(data.get("requiresMultiProjector")),
-        requiresSmartClassroom: Boolean(data.get("requiresSmartClassroom")),
-        separateSectionsAcrossDays: Boolean(data.get("separateSectionsAcrossDays")),
-        // 起止周都留空表示每周上课；否则必须同时提供，并把开始周和结束周都包含在教学区间内。
-        weekStart: data.get("weekStart") ? Number(data.get("weekStart")) : null,
-        weekEnd: data.get("weekEnd") ? Number(data.get("weekEnd")) : null,
-      }),
-    });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Course setup could not be saved.");
-    await loadData();
-    setShowForm(false);
-    setEditingCourse(null);
-    setNotice(`${editingCourse.code} setup saved. Its generated sections will use these requirements.`);
+    try {
+      const response = await fetch(`/api/courses/${editingCourse.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          // 表单打开时的课程 revision 与全部设置一起提交；另一账号若已先保存，
+          // 服务端会返回稳定 409，而不是让当前旧表单覆盖对方的新内容。
+          revision: editingCourse.revision,
+          durationHours: Number(data.get("durationHours")),
+          sessionsPerWeek: Number(data.get("sessionsPerWeek")),
+          primaryYear: data.get("primaryYear") ? Number(data.get("primaryYear")) : null,
+          minimumRoomCapacity: data.get("minimumRoomCapacity") ? Number(data.get("minimumRoomCapacity")) : null,
+          requiresLab: Boolean(data.get("requiresLab")),
+          requiresMultiProjector: Boolean(data.get("requiresMultiProjector")),
+          requiresSmartClassroom: Boolean(data.get("requiresSmartClassroom")),
+          separateSectionsAcrossDays: Boolean(data.get("separateSectionsAcrossDays")),
+          // 起止周都留空表示每周上课；否则必须同时提供，并把开始周和结束周都包含在教学区间内。
+          weekStart: data.get("weekStart") ? Number(data.get("weekStart")) : null,
+          weekEnd: data.get("weekEnd") ? Number(data.get("weekEnd")) : null,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        if (response.status === 409 && body.code === "COURSE_SETUP_CHANGED") {
+          // 旧表单已经不可信，关闭它并重新载入课程清单；老师再次点 Configure 时
+          // 会看到赢家版本，不会在不知道变化的情况下直接重试覆盖。
+          try {
+            await loadData();
+            setNotice("This course setup was changed by another scheduler. The latest setup has been loaded; reopen Configure to review it.");
+          } catch {
+            setNotice("This course setup was changed by another scheduler, but the latest setup could not be loaded. Refresh before editing it again.");
+          }
+          setShowForm(false);
+          setEditingCourse(null);
+          return;
+        }
+        return setNotice(body.error ?? "Course setup could not be saved.");
+      }
+      try {
+        await loadData();
+      } catch {
+        // PATCH 已经明确返回成功时不能再说“保存失败”。关闭持有旧 revision 的表单，
+        // 并准确说明只有刷新清单失败，避免老师重复提交已经保存的配置。
+        setShowForm(false);
+        setEditingCourse(null);
+        setNotice(`${editingCourse.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`);
+        return;
+      }
+      setShowForm(false);
+      setEditingCourse(null);
+      setNotice(`${editingCourse.code} setup saved. Its generated sections will use these requirements.`);
+    } catch {
+      setNotice("Course setup could not be saved. Check the connection and try again.");
+    }
   }
 
   async function openSections(course: Course) {
@@ -1972,7 +2004,7 @@ export default function Home() {
 
             {showForm && view === "Courses" && editingCourse && (
               /* 课程课时、周次数、主年级和教室要求只保存一次，并统一应用到该课程全部班次。 */
-              <form key={editingCourse.id} onSubmit={saveCourseSetup} className="border-b border-emerald-100 bg-emerald-50/60 p-4">
+              <form key={`${editingCourse.id}-${editingCourse.revision}`} onSubmit={saveCourseSetup} className="border-b border-emerald-100 bg-emerald-50/60 p-4">
                 <p className="mb-1 text-sm font-bold text-emerald-950">Configure {editingCourse.code}</p>
                 <p className="mb-3 text-xs leading-5 text-emerald-800">These requirements are retained when Teaching Members is imported again.</p>
                 <div className="grid gap-3 md:grid-cols-4">

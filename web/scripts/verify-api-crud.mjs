@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -298,6 +298,12 @@ async function verifyAuthentication() {
   assert.match(setCookie, /HttpOnly/i);
   assert.match(setCookie, /Secure/i);
   assert.match(setCookie, /SameSite=Strict/i);
+
+  // 旧数据库使用 ALTER TABLE 时 revision 一定追加在 courses 表尾；全新数据库必须
+  // 保持相同物理列顺序，否则同版本完整 SQLite 备份会因表形状不同而无法恢复。
+  const courseColumns = executeTestDatabase((db) => db.prepare("PRAGMA table_info(courses)").all());
+  assert.equal(courseColumns.at(-1).name, "revision");
+  assert.equal(courseColumns.at(-1).dflt_value, "1");
   report("身份保护、首次管理员和安全 Cookie");
 }
 
@@ -515,6 +521,7 @@ async function verifyTeachingAllocationReimport() {
   await requestApi(`/api/courses/${importedCourse.id}`, {
     method: "PATCH",
     json: {
+      revision: stableCourse.revision,
       durationHours: 2,
       sessionsPerWeek: 1,
       primaryYear: 1,
@@ -608,9 +615,10 @@ async function verifyCrudAndRevisions() {
   });
 
   // 课程必须配置时长、每周课次和主要年级后才能进入排课流程。
-  await requestApi(`/api/courses/${course.id}`, {
+  const configuredCourse = await requestApi(`/api/courses/${course.id}`, {
     method: "PATCH",
     json: {
+      revision: course.revision,
       durationHours: 3,
       sessionsPerWeek: 2,
       primaryYear: 1,
@@ -623,6 +631,8 @@ async function verifyCrudAndRevisions() {
       weekEnd: null,
     },
   });
+  let courseRevision = configuredCourse.body.revision;
+  assert.equal(courseRevision, course.revision + 1);
   let sections = (await requestApi(`/api/courses/${course.id}/sections`)).body;
   assert.equal(sections.length, 2);
 
@@ -820,11 +830,184 @@ async function verifyCrudAndRevisions() {
   assert(!currentLessonOne.warnings.includes("Teacher is inactive"));
   assert(!currentLessonOne.warnings.includes("Room is unavailable"));
 
+  // Course Setup 现在使用课程自己的 revision。先锁定同一份合法表单，验证损坏 JSON、
+  // null 和可被 JavaScript 强制转换的数组／布尔数字都只能返回 400，且不能写入任何资料。
+  const baselineCourseSetup = {
+    revision: courseRevision,
+    durationHours: 3,
+    sessionsPerWeek: 2,
+    primaryYear: 1,
+    minimumRoomCapacity: 20,
+    requiresLab: false,
+    requiresMultiProjector: false,
+    requiresSmartClassroom: false,
+    separateSectionsAcrossDays: true,
+    weekStart: null,
+    weekEnd: null,
+  };
+  const stateBeforeInvalidCourseSetup = readBusinessSnapshot();
+  await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: null, expectedStatus: 400 });
+  await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: "{broken",
+    expectedStatus: 400,
+  });
+  await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, durationHours: [3] }, expectedStatus: 400 });
+  await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, sessionsPerWeek: true }, expectedStatus: 400 });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInvalidCourseSetup);
+
+  // 相同设置重复保存属于真正的 no-op：课程、课次、warning、updated_at 和所有 revision
+  // 都必须逐字段不变，避免老师只是按了一次 Save 就让其他打开中的 Inspector 失效。
+  const noChangeSetup = await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: baselineCourseSetup });
+  assert.deepEqual(noChangeSetup.body, { ok: true, revision: courseRevision, changed: false });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInvalidCourseSetup);
+
+  // occurrence 2 仍在总表时，不能把每周次数降为 1。409 前后完整快照相等，
+  // 证明这类当前状态冲突不会消耗课程或课次 revision。
+  const sessionsConflict = await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { ...baselineCourseSetup, sessionsPerWeek: 1 },
+  });
+  assert.match(sessionsConflict.body.error, /extra weekly sessions/i);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInvalidCourseSetup);
+
+  // 故意让 warning 刷新在最后一条排课记录上失败。Course Setup 的字段、课程 revision、
+  // 两个 occurrence 的冗余时长／revision 和已经写过的 warning 必须作为一个整体回滚。
+  const beforeAtomicCourseSetup = readBusinessSnapshot();
+  const targetSectionIds = new Set(beforeAtomicCourseSetup.sections.filter((row) => row.course_id === course.id).map((row) => row.id));
+  const targetLessonsBeforeSetup = beforeAtomicCourseSetup.lessons.filter((row) => targetSectionIds.has(row.section_id));
+  assert.equal(targetLessonsBeforeSetup.length, 2, "The course setup rollback fixture needs both weekly occurrences.");
+  const warningFailureLesson = beforeAtomicCourseSetup.lessons.at(-1);
+  assert(warningFailureLesson, "The course setup rollback fixture needs a scheduled lesson.");
+  executeTestDatabase((db) => {
+    const lessonIdLiteral = db.prepare("SELECT quote(?) AS value").get(warningFailureLesson.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_course_setup_warning BEFORE UPDATE OF warnings_json ON scheduled_lessons WHEN NEW.id = ${lessonIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced course setup warning failure'); END;`);
+  });
+  const changedCourseSetup = { ...baselineCourseSetup, durationHours: 4, minimumRoomCapacity: 51 };
+  try {
+    const failedCourseSetup = await requestApi(`/api/courses/${course.id}`, {
+      method: "PATCH",
+      expectedStatus: 500,
+      json: changedCourseSetup,
+    });
+    assert.deepEqual(failedCourseSetup.body, { error: "The course setup could not be saved. Try again." });
+    assert(!/forced|sqlite|database|trigger|constraint|table|column|stack/i.test(JSON.stringify(failedCourseSetup.body)));
+    assert.deepEqual(readBusinessSnapshot(), beforeAtomicCourseSetup);
+
+    // trigger 仍存在时读取问题清单必须正常成功且零写入；若 GET 又开始重算 warning，
+    // 这里会立即触发 500，从而防止轮询用旧课时覆盖刚保存结果的回归。
+    const issuesWhileWarningWritesFail = await requestApi("/api/issues");
+    assert(Array.isArray(issuesWhileWarningWritesFail.body));
+    assert.deepEqual(readBusinessSnapshot(), beforeAtomicCourseSetup);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_course_setup_warning"));
+  }
+
+  // 移除 trigger 后用同一 revision 重试必须成功：课程 revision 和两个课次 revision
+  // 各只增加一次，时长同步为 4 小时，容量规则产生可预测的 warning；班次 revision 不变。
+  const savedCourseSetup = await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: changedCourseSetup });
+  assert.deepEqual(savedCourseSetup.body, { ok: true, revision: courseRevision + 1, changed: true });
+  const afterAtomicCourseSetup = readBusinessSnapshot();
+  const courseAfterSetup = afterAtomicCourseSetup.courses.find((row) => row.id === course.id);
+  assert.equal(courseAfterSetup.revision, courseRevision + 1);
+  assert.equal(courseAfterSetup.duration_hours, 4);
+  assert.equal(courseAfterSetup.minimum_room_capacity, 51);
+  const targetLessonsAfterSetup = afterAtomicCourseSetup.lessons.filter((row) => targetSectionIds.has(row.section_id));
+  for (const lessonBefore of targetLessonsBeforeSetup) {
+    const lessonAfter = targetLessonsAfterSetup.find((row) => row.id === lessonBefore.id);
+    assert.equal(lessonAfter.duration_hours, 4);
+    assert.equal(lessonAfter.revision, lessonBefore.revision + 1);
+    assert(JSON.parse(lessonAfter.warnings_json).some((warning) => /Room capacity too small/.test(warning)));
+  }
+  for (const sectionBefore of beforeAtomicCourseSetup.sections.filter((row) => row.course_id === course.id)) {
+    assert.equal(afterAtomicCourseSetup.sections.find((row) => row.id === sectionBefore.id).revision, sectionBefore.revision);
+  }
+  for (const otherLessonBefore of beforeAtomicCourseSetup.lessons.filter((row) => !targetSectionIds.has(row.section_id))) {
+    const otherLessonAfter = afterAtomicCourseSetup.lessons.find((row) => row.id === otherLessonBefore.id);
+    assert.equal(otherLessonAfter.duration_hours, otherLessonBefore.duration_hours);
+    assert.equal(otherLessonAfter.revision, otherLessonBefore.revision);
+  }
+
+  // 依次模拟两个旧页面：旧 Course Configure 表单和课程规则改变前打开的 Inspector。
+  // 两者都必须得到 409，并且赢家设置及所有关系保持不变。
+  const beforeStaleEditors = readBusinessSnapshot();
+  const staleCourseSetup = await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { ...baselineCourseSetup, minimumRoomCapacity: 60 },
+  });
+  assert.equal(staleCourseSetup.body.code, "COURSE_SETUP_CHANGED");
+  assert(!/sqlite|database|constraint/i.test(JSON.stringify(staleCourseSetup.body)));
+  await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: {
+      dayOfWeek: currentLessonOne.dayOfWeek,
+      startHour: currentLessonOne.startHour,
+      roomId: currentLessonOne.roomId,
+      teacherId: currentLessonOne.teacherId,
+      studentGroupIds: currentLessonOne.studentGroupIds,
+      revision: currentLessonOne.revision,
+    },
+  });
+  assert.deepEqual(readBusinessSnapshot(), beforeStaleEditors);
+
+  // 恢复原配置，避免改变后面 CRUD 场景的课程长度；恢复本身也是一次真实变化，
+  // 因此课程及两个课次 revision 再各加 1，并重新载入 timetable 的最新 revision。
+  courseRevision = savedCourseSetup.body.revision;
+  const restoredCourseSetup = await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    json: { ...baselineCourseSetup, revision: courseRevision },
+  });
+  courseRevision = restoredCourseSetup.body.revision;
+  assert.equal(courseRevision, baselineCourseSetup.revision + 2);
+  timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
+  currentLessonOne = timetable.find((lesson) => lesson.id === lessonOne.id);
+  assert.equal(currentLessonOne.durationHours, 3);
+  assert(!currentLessonOne.warnings.some((warning) => /Room capacity too small/.test(warning)));
+
+  // 两个同时送达的旧 Configure 表单使用同一个 revision，只能恰好一个保存成功；
+  // 这项 HTTP 回归不冒充跨进程锁测试，只验证 production API 的课程 CAS 契约。
+  const concurrentCourseSetups = await Promise.all([
+    requestApi(`/api/courses/${course.id}`, {
+      method: "PATCH",
+      expectedStatus: [200, 409],
+      json: { ...baselineCourseSetup, revision: courseRevision, minimumRoomCapacity: 21 },
+    }),
+    requestApi(`/api/courses/${course.id}`, {
+      method: "PATCH",
+      expectedStatus: [200, 409],
+      json: { ...baselineCourseSetup, revision: courseRevision, minimumRoomCapacity: 22 },
+    }),
+  ]);
+  assert.deepEqual(concurrentCourseSetups.map((result) => result.response.status).sort(), [200, 409]);
+  const concurrentCourseWinner = concurrentCourseSetups.find((result) => result.response.status === 200);
+  const concurrentCourseLoser = concurrentCourseSetups.find((result) => result.response.status === 409);
+  assert.equal(concurrentCourseWinner.body.revision, courseRevision + 1);
+  assert.equal(concurrentCourseLoser.body.code, "COURSE_SETUP_CHANGED");
+  assert(!/sqlite|database|constraint/i.test(JSON.stringify(concurrentCourseLoser.body)));
+  const courseAfterConcurrentSetup = (await requestApi("/api/courses")).body.find((item) => item.id === course.id);
+  assert.equal(courseAfterConcurrentSetup.revision, courseRevision + 1);
+  assert([21, 22].includes(courseAfterConcurrentSetup.minimumRoomCapacity));
+
+  // 把并发赢家的容量恢复为原值，并再次刷新 timetable，确保后续 DELETE 使用最新 lesson revision。
+  courseRevision = concurrentCourseWinner.body.revision;
+  const afterConcurrentRestore = await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    json: { ...baselineCourseSetup, revision: courseRevision },
+  });
+  courseRevision = afterConcurrentRestore.body.revision;
+  timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
+  currentLessonOne = timetable.find((lesson) => lesson.id === lessonOne.id);
+
   // 已有排课课程不能清空主要年级，否则会从三张年级总表消失。
   const missingYear = await requestApi(`/api/courses/${course.id}`, {
     method: "PATCH",
     expectedStatus: 409,
     json: {
+      revision: courseRevision,
       durationHours: 3,
       sessionsPerWeek: 2,
       primaryYear: null,
@@ -838,6 +1021,46 @@ async function verifyCrudAndRevisions() {
     },
   });
   assert.match(missingYear.body.error, /primary year/i);
+
+  // 反向入口也必须保护相同不变量：一门尚未选主年级但已设置时长的课程，
+  // 即使旧页面仍握有班次 ID，也不能建立一条从三张总表全部消失的隐藏 lesson。
+  const noYearCourse = (await requestApi("/api/courses", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "AUTO_NO_YEAR", catalog: "Primary year placement guard", sectionCount: 1 },
+  })).body;
+  await requestApi(`/api/courses/${noYearCourse.id}`, {
+    method: "PATCH",
+    json: {
+      revision: noYearCourse.revision,
+      durationHours: 2,
+      sessionsPerWeek: 1,
+      primaryYear: null,
+      minimumRoomCapacity: null,
+      requiresLab: false,
+      requiresMultiProjector: false,
+      requiresSmartClassroom: false,
+      separateSectionsAcrossDays: false,
+      weekStart: null,
+      weekEnd: null,
+    },
+  });
+  const noYearSection = (await requestApi(`/api/courses/${noYearCourse.id}/sections`)).body[0];
+  const beforeRejectedHiddenPlacement = readBusinessSnapshot();
+  const hiddenPlacement = await requestApi("/api/schedule/lessons", {
+    method: "POST",
+    expectedStatus: 400,
+    json: { sectionId: noYearSection.id, occurrence: 1, dayOfWeek: 1, startHour: 9, roomId: null },
+  });
+  assert.match(hiddenPlacement.body.error, /primary year/i);
+  assert.deepEqual(readBusinessSnapshot(), beforeRejectedHiddenPlacement);
+  const hiddenLessonCount = executeTestDatabase((db) => db.prepare(`
+    SELECT COUNT(*) AS count FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    JOIN courses ON courses.id = sections.course_id
+    WHERE courses.primary_year IS NULL
+  `).get().count);
+  assert.equal(hiddenLessonCount, 0);
 
   // occurrence 2 的最新 revision 从重新读取的总表取得；正确 revision 删除后，
   // occurrence 1 和课程班次仍必须保留。
@@ -1055,6 +1278,96 @@ async function verifyAtomicMasterDataWarnings(ids) {
   report("主资料、规则和不可用时段 warning 重算原子回滚及安全 JSON 错误");
 }
 
+async function verifySystemBackupAcrossColumnOrders() {
+  // 先通过真实管理员下载接口取得已脱敏的完整 SQLite 备份。接着只在临时副本中
+  // 把 courses 重建成历史升级库的物理列顺序，模拟“旧库升级后备份 → 全新库恢复”。
+  const downloadResponse = await fetch(new URL("/api/system-backup", baseUrl), {
+    headers: { Cookie: sessionCookie },
+    signal: AbortSignal.timeout(requestTimeoutMilliseconds),
+  });
+  assert.equal(downloadResponse.status, 200);
+  assert.match(downloadResponse.headers.get("content-type") || "", /sqlite/i);
+  const reorderedBackupPath = path.join(temporaryDirectory, "legacy-column-order.sqlite");
+  await writeFile(reorderedBackupPath, Buffer.from(await downloadResponse.arrayBuffer()), { mode: 0o600 });
+
+  const backupDatabase = new Database(reorderedBackupPath);
+  try {
+    const freshColumnOrder = backupDatabase.prepare("PRAGMA table_info(courses)").all().map((column) => column.name);
+    backupDatabase.pragma("foreign_keys = OFF");
+    backupDatabase.pragma("legacy_alter_table = ON");
+    const reorderCourses = backupDatabase.transaction(() => {
+      // foreign_keys 关闭且 legacy_alter_table 开启时，重命名父表不会把子表外键
+      // 改指向临时名称；新 courses 建立后，所有原外键继续引用正确表名。
+      backupDatabase.exec(`
+        ALTER TABLE courses RENAME TO courses_fresh_order;
+        CREATE TABLE courses (
+          id TEXT PRIMARY KEY,
+          code TEXT NOT NULL UNIQUE,
+          catalog TEXT,
+          duration_hours INTEGER,
+          sessions_per_week INTEGER NOT NULL DEFAULT 1 CHECK (sessions_per_week > 0),
+          minimum_room_capacity INTEGER,
+          requires_lab INTEGER NOT NULL DEFAULT 0,
+          requires_multi_projector INTEGER NOT NULL DEFAULT 0,
+          requires_smart_classroom INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          primary_year INTEGER CHECK (primary_year IN (1, 2, 3)),
+          separate_sections_across_days INTEGER NOT NULL DEFAULT 0,
+          week_pattern TEXT NOT NULL DEFAULT 'ALL' CHECK (week_pattern IN ('ALL', 'W1_4', 'W5_8')),
+          week_start INTEGER CHECK (week_start IS NULL OR week_start >= 1),
+          week_end INTEGER CHECK (week_end IS NULL OR week_end >= 1),
+          revision INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO courses (
+          id, code, catalog, duration_hours, sessions_per_week, minimum_room_capacity,
+          requires_lab, requires_multi_projector, requires_smart_classroom, created_at,
+          updated_at, primary_year, separate_sections_across_days, week_pattern,
+          week_start, week_end, revision
+        ) SELECT
+          id, code, catalog, duration_hours, sessions_per_week, minimum_room_capacity,
+          requires_lab, requires_multi_projector, requires_smart_classroom, created_at,
+          updated_at, primary_year, separate_sections_across_days, week_pattern,
+          week_start, week_end, revision
+        FROM courses_fresh_order;
+        DROP TABLE courses_fresh_order;
+      `);
+    });
+    reorderCourses.immediate();
+    backupDatabase.pragma("foreign_keys = ON");
+    const legacyColumnOrder = backupDatabase.prepare("PRAGMA table_info(courses)").all().map((column) => column.name);
+    assert.notDeepEqual(legacyColumnOrder, freshColumnOrder);
+    assert.deepEqual(backupDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(backupDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    backupDatabase.close();
+  }
+
+  // Production 恢复接口必须按列名验证与复制，而不是因 cid 顺序不同拒绝，或用
+  // SELECT * 把某列写进错误字段。恢复完成会按产品设计注销全部旧会话。
+  const stateBeforeRestore = readBusinessSnapshot();
+  const restoreForm = new FormData();
+  restoreForm.append("backupFile", new Blob([await readFile(reorderedBackupPath)], { type: "application/vnd.sqlite3" }), "legacy-column-order.sqlite");
+  restoreForm.append("understandReplace", "on");
+  restoreForm.append("understandSignOut", "on");
+  restoreForm.append("confirmation", "RESTORE FULL BACKUP");
+  const restored = await requestApi("/api/system-backup", { method: "POST", body: restoreForm });
+  assert.equal(restored.body.restored, true);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeRestore);
+  await requestApi("/api/auth/status", { expectedStatus: 200, authenticated: false });
+  await requestApi("/api/teachers", { expectedStatus: 401 });
+
+  // 备份保留同一管理员密码；重新登录后更新全局测试 Cookie，让后续 Cycle 回归继续运行。
+  const login = await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    json: { username: "integration-admin", password: "IntegrationTest123!" },
+  });
+  sessionCookie = (login.response.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert(sessionCookie.includes("="));
+  report("完整系统备份按列名跨 fresh／历史迁移列顺序恢复");
+}
+
 async function verifyAtomicCycleActions(ids) {
   // 新周期功能按产品要求允许所有排课账号使用。先由管理员建立一个普通账号，
   // 后面的 GET、Start 和 Restore 全部使用独立 Cookie 走真实 production proxy。
@@ -1223,6 +1536,25 @@ async function verifyAtomicCycleActions(ids) {
   });
   assert.deepEqual(invalidBackup.body, { error: "The emergency backup is not valid." });
   assert.deepEqual(readBusinessSnapshot(), stateWithInvalidBackup);
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(validBackupJson, backupId));
+
+  // 五个数组齐全仍不代表资料可见。模拟旧版／损坏备份把一条已排课程的主年级
+  // 清空；Restore 必须在删除当前周期前拒绝，不能绕过首次排课入口的新保护。
+  const hiddenLessonSnapshot = JSON.parse(validBackupJson);
+  const hiddenSnapshotLesson = hiddenLessonSnapshot.lessons[0];
+  const hiddenSnapshotSection = hiddenLessonSnapshot.sections.find((section) => section.id === hiddenSnapshotLesson.section_id);
+  const hiddenSnapshotCourse = hiddenLessonSnapshot.courses.find((course) => course.id === hiddenSnapshotSection.course_id);
+  hiddenSnapshotCourse.primary_year = null;
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(JSON.stringify(hiddenLessonSnapshot), backupId));
+  const stateWithHiddenLessonBackup = readBusinessSnapshot();
+  const hiddenLessonBackup = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: started.body.currentToken, backupId },
+  });
+  assert.deepEqual(hiddenLessonBackup.body, { error: "The emergency backup is not valid." });
+  assert.deepEqual(readBusinessSnapshot(), stateWithHiddenLessonBackup);
   executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(validBackupJson, backupId));
 
   // 在空活动区建立两门替换课程；R0 之后新增第二门，旧 R0 Restore 必须保留两门，
@@ -1398,6 +1730,7 @@ async function run() {
   await verifyTeachingAllocationReimport();
   const relationshipIds = await verifyCrudAndRevisions();
   await verifyAtomicMasterDataWarnings(relationshipIds);
+  await verifySystemBackupAcrossColumnOrders();
   await verifyAtomicCycleActions(relationshipIds);
   await verifyLogout();
 

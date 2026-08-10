@@ -108,6 +108,8 @@ model Course {
   weekEnd                    Int?     @map("week_end")
   createdAt                  DateTime @default(now()) @map("created_at")
   updatedAt                  DateTime @default(now()) @updatedAt @map("updated_at")
+  // 放在表尾与旧数据库 ALTER TABLE 的追加位置一致，完整系统备份可在同版本新库间恢复。
+  revision                   Int      @default(1)
 
   allocations TeachingAllocation[]
   sections    CourseSection[]

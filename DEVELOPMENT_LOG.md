@@ -1964,3 +1964,47 @@
 1. 把课程配置、相关课次 revision 和 warning 重算合并为一个 `IMMEDIATE` 事务，并增加中途故障回滚测试。
 2. 把 `/api/issues` 改为纯读取已保存 warning，避免每个账号五秒一次全库写入；同时确认所有资料变更入口都主动刷新必要 warning。
 3. 补齐运行时数据库索引，并用接近实际 374 个班次、多账号轮询的资料量建立性能基准。
+
+## 2026-08-11｜课程 Setup 改为原子保存并防止旧表单覆盖
+
+### 已完成
+
+- 为每门课程新增独立 `revision`，并让 Courses 清单、Configure 表单、PATCH API、Prisma 模型和紧急周期快照／恢复共同读写同一个版本号；旧数据库会自动为既有课程补上 revision 1。
+- Course Configure 保存会提交页面打开时读到的 revision；数据库使用 `UPDATE ... WHERE revision = ?` 比较后更新。另一账号已经先保存时，旧表单得到带 `COURSE_SETUP_CHANGED` 的 409，不再以最后提交者覆盖赢家。
+- 浏览器收到课程版本冲突后会关闭已经过期的表单、重新加载 Courses 清单，并明确要求老师重新打开 Configure 复核最新设置；若刷新失败则要求整页刷新，不会暗示旧表单仍可安全重试。
+- 课程设置的状态检查、课程字段／revision 更新、该课程全部已排课次的冗余时长／revision 更新和全库 warning 重算，全部合并到一个 `IMMEDIATE` SQLite 事务。
+- “已有排课不能清空主年级”“occurrence 2 已排时不能降为每周一次”“晚课会超过 18:00 时不能增加时长”三项检查改到写锁内执行，另一服务进程不能在检查通过后插入一条让新设置失效的课程。
+- 所有课程设置都完全相同时返回成功 no-op，但不修改 `updated_at`、课程 revision、课次 revision 或 warning；老师重复按 Save 不会无意义地让其他打开中的 Inspector 过期。
+- 首次排课入口在自己的 `IMMEDIATE` 事务中反向确认课程仍有主年级；即使旧页面握有班次 ID，也不能在另一老师清空年级后建立一条从 Year 1–3 三张总表全部消失的隐藏课程。
+- Course Setup API 统一处理损坏 JSON、`null`、数组、布尔／数组伪装数字和字段范围；可修正输入为 400、当前排课状态冲突与旧 revision 为 409、SQLite 锁竞争为 503、未知 trigger／数据库故障为固定安全 500。
+- 任何真实课程设置变化都会把该课程全部 occurrence 的 lesson revision 一起增加；课程规则改变前已经打开的 Inspector 随后保存会得到 409，不能在新规则上继续提交旧资料。
+- 完整系统备份恢复不再依赖物理列顺序：结构校验会按列名排序后比较名称、类型、必填、默认值和主键，复制时为每张表显式列出目标／来源列名，不再使用顺序敏感的 `INSERT ... SELECT *`。因此经历多次 `ALTER TABLE` 的旧库备份可以恢复到同版本全新库，同时仍拒绝真正缺列或类型不兼容的文件。
+- 全新数据库仍把课程 revision 建在表尾，与本次 `ALTER TABLE` 追加位置一致；Prisma 模型也使用相同顺序，减少以后人工检查 schema 时的困惑。
+- 紧急周期快照解析会核对 lesson → section → course 的跨数组关系；只要任何已排课程的 `primary_year` 为空，就把快照视为无效并在删除当前周期前返回 409，旧快照不能绕过新的总表可见性规则。
+- `/api/issues` 改为只读取原子写事务已经保存的 `warnings_json`；五秒轮询不再读取旧课时后写回 warning，既防止覆盖刚提交的 Course Setup 结果，也移除每个账号反复进行的全库 SQLite 写入。
+- Configure PATCH 已经成功但随后 Courses 清单刷新失败时，界面会准确提示“设置已保存、最新清单未载入”并关闭旧 revision 表单，不再把刷新失败误报为保存失败。
+- 新增的数据库、API、页面和测试区块均写入面向基础开发人员的中文注释；老师工作树里尚未提交的 UX 脚本、文档和两条 package 命令继续保持不动。
+
+### 本次验证
+
+- `node --check scripts/verify-api-crud.mjs`、`git diff --check`、`npm run lint`、独立 TypeScript 检查、Prisma schema 验证和完整 `npm test` 全部通过；production build 的 24 个页面／API 成功生成。
+- 使用一次性 production 服务和隔离 SQLite，先让 Course Setup 的 warning 重算在最后一条课程上由 trigger 强制失败；接口精确返回 `{error: "The course setup could not be saved. Try again."}`，不含 SQLite、trigger、表名、列名或 stack。
+- 故障请求前后完整业务快照逐字段相同：课程全部设置、课程 revision、两个每周课次的时长／revision／warning、班次 revision、基础资料和其他课程均没有半完成变化；删除 trigger 后用同一个 revision 重试成功。
+- 正常把目标课程从 3 小时改为 4 小时并把最低容量从 20 改为 51：课程 revision 精确加 1，两条 occurrence 的时长同步为 4、lesson revision 各加 1并出现容量 warning；班次 revision 与其他课程 lesson revision 保持不变。
+- 使用修改前的旧 Course Configure revision 再保存得到带稳定 code 的 409；使用课程规则改变前的旧 lesson revision 保存 Inspector 同样得到 409，两次失败后的完整业务快照与赢家版本相同。
+- 两个同时发出的 production HTTP Configure 请求使用同一课程 revision，严格得到一个 200 和一个带 `COURSE_SETUP_CHANGED` 的 409；赢家 revision 只增加 1且容量值来自两个赢家候选之一。此项验证 API 的 CAS 契约，不冒充尚未自动化的跨进程 SQLite 锁测试。
+- 恢复原 3 小时配置后课程和两个课次 revision 再各加 1，容量 warning 消失；后续原有移动、删除、多人首次放置、Cycle Start／Restore 与外键回归继续全部通过。
+- 相同课程设置重复保存返回 `{changed:false}`，课程、课次、warning、`updated_at` 和所有 revision 完全不变；把每周次数从 2 降到 1时因 occurrence 2 已排得到 409且快照零变化。
+- `null`、损坏 JSON、`durationHours:[3]` 和 `sessionsPerWeek:true` 都得到 JSON 400且完整业务快照零变化，证明 API 不会再依赖 JavaScript 宽松的数字强制转换。
+- 另建立已设置 2 小时时长但主年级为空的课程；尝试首次排课得到明确 400，数据库中 `primary_year IS NULL` 的已排课记录数量保持 0。
+- warning 故障 trigger 仍启用时读取 `/api/issues` 继续返回 200 且完整快照零变化；如果问题轮询恢复成写入 warning，这条回归会立即触发 500。
+- 把合法紧急快照中一条已排课程的主年级人工改为 null 后，Restore 得到精确 `The emergency backup is not valid.` 409；当前活动周期和损坏备份本身逐字段不变，随后还原合法 JSON 才允许正常恢复。
+- 通过管理员 production API 下载完整 SQLite 后，只在临时副本中把 `courses` 重建为真实历史升级库的不同物理列顺序；该文件通过完整恢复接口成功覆盖 fresh 测试库，恢复前后全部业务表逐字段相同，旧 Cookie 失效后原管理员能用原密码重新登录。
+- 临时“历史顺序”备份在上传前通过 `integrity_check=ok` 与空 `foreign_key_check`；测试明确确认其列顺序不同于 fresh 库，因而不会用两个实际相同的 schema 产生假阳性。
+- 集成测试仍只使用 `os.tmpdir()` 下自动清理的临时数据库和随机 localhost 端口。正在运行的本地开发应用已为正式数据库 52 门既有课程安全补上 revision 列，初始值全部为 1；`PRAGMA integrity_check` 为 `ok`、`foreign_key_check` 为空。
+
+### 下一步
+
+1. 把 `/api/issues` 改成纯读取已保存 warning，避免每个账号五秒一次全库写入，并确认所有 warning 依赖资料的修改入口都主动刷新。
+2. 补齐 Prisma 中已经声明但 runtime SQLite 尚未建立的索引，并以接近实际 374 个班次、多账号轮询的资料量建立性能基准。
+3. 把 Course Setup 的浏览器级双会话冲突加入可重复 UI 验收；当前 production API 已覆盖旧 Configure／旧 Inspector 两类 revision 保护。

@@ -33,6 +33,7 @@ export type CourseRecord = {
   id: string;
   code: string;
   catalog: string | null;
+  revision: number;
   durationHours: number | null;
   sessionsPerWeek: number;
   primaryYear: number | null;
@@ -48,6 +49,20 @@ export type CourseRecord = {
   configuredSections: number;
   scheduledLessons: number;
   allocationVarianceCount: number;
+};
+
+export type CourseSetupInput = {
+  revision: number;
+  durationHours: number;
+  sessionsPerWeek: number;
+  primaryYear: number | null;
+  minimumRoomCapacity: number | null;
+  requiresLab: boolean;
+  requiresMultiProjector: boolean;
+  requiresSmartClassroom: boolean;
+  separateSectionsAcrossDays: boolean;
+  weekStart: number | null;
+  weekEnd: number | null;
 };
 
 export type AllocationVarianceRecord = {
@@ -163,7 +178,7 @@ export type CycleStatusRecord = {
 
 // 紧急快照只保存当前排课周期的数据，例如课程、班次和已排课记录。
 // 教师、教室等基础资料以及账号数据不会写入快照，因为开始新周期时必须继续保留它们。
-type CourseSnapshotRow = { id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start?: number | null; week_end?: number | null; created_at: string; updated_at: string };
+type CourseSnapshotRow = { id: string; code: string; catalog: string | null; revision?: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start?: number | null; week_end?: number | null; created_at: string; updated_at: string };
 type AllocationSnapshotRow = { id: string; course_id: string; teacher_id: string; assigned_group_count: number };
 type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null; allocation_teacher_id?: string | null; revision?: number };
 type SectionGroupSnapshotRow = { section_id: string; student_group_id: string };
@@ -293,7 +308,8 @@ export class SystemBackupValidationError extends Error {
 }
 
 type TableColumn = { cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number };
-type TableShape = { name: string; columns: TableColumn[] };
+type ComparableTableColumn = Omit<TableColumn, "cid">;
+type TableShape = { name: string; columns: ComparableTableColumn[] };
 
 function quoteIdentifier(value: string) {
   // 表名虽然来自 SQLite 自己的元数据，仍然要进行安全引用。
@@ -302,18 +318,23 @@ function quoteIdentifier(value: string) {
 }
 
 function tableShapes(db: DatabaseInstance) {
-  // 恢复功能只接受与当前应用具有完全相同业务表、列名和列顺序的数据库。
-  // SQLite 自己维护的 sqlite_* 内部表不会参与比较，也不会被复制。
+  // 恢复功能只接受与当前应用具有完全相同业务表和列定义的数据库。
+  // SQLite 自己维护的 sqlite_* 内部表不会参与比较，也不会被复制。历史升级库通过
+  // ALTER TABLE 把新列追加在表尾，因此这里只比较排序后的列定义，不把物理 cid 顺序
+  // 当成不兼容；真正复制时也会显式写出列名，绝不使用顺序敏感的 SELECT *。
   const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
   return tables.map<TableShape>(({ name }) => ({
     name,
-    columns: db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as TableColumn[],
+    columns: (db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as TableColumn[])
+      .map(({ name: columnName, type, notnull, dflt_value, pk }) => ({ name: columnName, type, notnull, dflt_value, pk }))
+      .sort((left, right) => left.name.localeCompare(right.name)),
   }));
 }
 
 function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseInstance) {
   // 在修改任何现有记录之前，先检查上传文件的结构和外键关系。
   // 表结构完全一致也能证明该文件来自兼容的应用版本，而不是任意 SQLite 文件。
+  // 列顺序可以不同，但名称、类型、必填、默认值与主键定义必须全部相同。
   assertDatabaseIntegrity(source, "Uploaded backup");
   const sourceShapes = tableShapes(source);
   const liveShapes = tableShapes(live);
@@ -383,7 +404,15 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
     try {
       const restoreAllTables = liveDatabase.transaction(() => {
         for (const tableName of tableNames) liveDatabase.prepare(`DELETE FROM main.${quoteIdentifier(tableName)}`).run();
-        for (const tableName of tableNames) liveDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} SELECT * FROM restore_source.${quoteIdentifier(tableName)}`).run();
+        for (const tableName of tableNames) {
+          // 全新库和经过多次 ALTER TABLE 的旧库可能拥有不同物理列顺序；两边已经按
+          // 排序后的列定义通过安全检查，因此这里使用 live 表的真实列名明确映射。
+          const columns = (liveDatabase.prepare(`PRAGMA main.table_info(${quoteIdentifier(tableName)})`).all() as TableColumn[])
+            .sort((left, right) => left.cid - right.cid)
+            .map((column) => quoteIdentifier(column.name));
+          const columnList = columns.join(", ");
+          liveDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} (${columnList}) SELECT ${columnList} FROM restore_source.${quoteIdentifier(tableName)}`).run();
+        }
 
         // 当前数据库和上传数据库中的登录会话都不能在完整恢复后继续有效。
         // 外键检查也放在事务内执行，一旦失败，前面复制的所有表都会一起回滚。
@@ -464,7 +493,8 @@ function initializeTables(db: DatabaseInstance) {
       week_start INTEGER CHECK (week_start IS NULL OR week_start >= 1),
       week_end INTEGER CHECK (week_end IS NULL OR week_end >= 1),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revision INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS teaching_allocations (
       id TEXT PRIMARY KEY,
@@ -560,6 +590,11 @@ function initializeTables(db: DatabaseInstance) {
   }
   if (!courseColumns.some((column) => column.name === "week_end")) {
     db.exec("ALTER TABLE courses ADD COLUMN week_end INTEGER CHECK (week_end IS NULL OR week_end >= 1)");
+  }
+  if (!courseColumns.some((column) => column.name === "revision")) {
+    // 旧数据库中的每门课程从 revision 1 开始；之后 Setup 保存使用比较后更新，
+    // 防止两个账号打开同一表单后由最后提交者静默覆盖前一位老师。
+    db.exec("ALTER TABLE courses ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
   }
   // 只为旧版“前半学期/后半学期”选项补填一次数字周次范围。
   // 自定义范围在保留的旧字段中使用 ALL，因此不会被这里的兼容逻辑误覆盖。
@@ -990,7 +1025,7 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
   // 明确列出周期表，让备份范围可以被代码审查：只有“开始新周期”会清空的数据进入快照，
   // 账号以及需要跨周期保留的基础资料永远不在其中。
   return {
-    courses: db.prepare("SELECT id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at FROM courses ORDER BY id").all() as CourseSnapshotRow[],
+    courses: db.prepare("SELECT id, code, catalog, revision, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at FROM courses ORDER BY id").all() as CourseSnapshotRow[],
     allocations: db.prepare("SELECT id, course_id, teacher_id, assigned_group_count FROM teaching_allocations ORDER BY id").all() as AllocationSnapshotRow[],
     sections: db.prepare("SELECT id, course_id, sequence, teacher_id, allocation_teacher_id, revision FROM course_sections ORDER BY id").all() as SectionSnapshotRow[],
     sectionGroups: db.prepare("SELECT section_id, student_group_id FROM section_student_groups ORDER BY section_id, student_group_id").all() as SectionGroupSnapshotRow[],
@@ -1006,7 +1041,20 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const candidate = parsed as Partial<Record<keyof CycleSnapshot, unknown>>;
     if (![candidate.courses, candidate.allocations, candidate.sections, candidate.sectionGroups, candidate.lessons].every(Array.isArray)) return null;
-    return candidate as CycleSnapshot;
+    const snapshot = candidate as CycleSnapshot;
+
+    // 老版本或人工损坏的 JSON 可能在结构上仍有五个数组，却让已排课程引用一个
+    // primary_year 为空的课程。恢复后这类 lesson 会从三张年级总表全部消失，
+    // 因此必须在删除当前周期之前验证跨数组关系，而不能只依赖外键。
+    const primaryYearByCourse = new Map(snapshot.courses.map((course) => [course.id, course.primary_year]));
+    const courseBySection = new Map(snapshot.sections.map((section) => [section.id, section.course_id]));
+    const everyLessonHasVisibleYear = snapshot.lessons.every((lesson) => {
+      const courseId = courseBySection.get(lesson.section_id);
+      if (!courseId) return false;
+      return [1, 2, 3].includes(primaryYearByCourse.get(courseId) ?? 0);
+    });
+    if (!everyLessonHasVisibleYear) return null;
+    return snapshot;
   } catch {
     return null;
   }
@@ -1138,13 +1186,13 @@ export function restoreLastCycleBackup(expectedBackupId: string, expectedCurrent
     // 按父表到子表的顺序恢复，确保每一步外键都有效。清空、重建和 warning 重算
     // 都在同一个事务中；如果基础资料已经不存在或任一步失败，当前周期完整回滚。
     db.prepare("DELETE FROM courses").run();
-    const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, revision, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const row of snapshot.courses) {
       // 旧备份只包含 week_pattern；在升级后的结构中恢复时，
       // 根据旧值推导数字形式的开始周和结束周以保持兼容。
       const weekStart = row.week_start ?? (row.week_pattern === "W1_4" ? 1 : row.week_pattern === "W5_8" ? 5 : null);
       const weekEnd = row.week_end ?? (row.week_pattern === "W1_4" ? 4 : row.week_pattern === "W5_8" ? 8 : null);
-      insertCourse.run(row.id, row.code, row.catalog, row.duration_hours, row.sessions_per_week, row.primary_year, row.minimum_room_capacity, row.requires_lab, row.requires_multi_projector, row.requires_smart_classroom, row.separate_sections_across_days, row.week_pattern, weekStart, weekEnd, row.created_at, row.updated_at);
+      insertCourse.run(row.id, row.code, row.catalog, row.revision ?? 1, row.duration_hours, row.sessions_per_week, row.primary_year, row.minimum_room_capacity, row.requires_lab, row.requires_multi_projector, row.requires_smart_classroom, row.separate_sections_across_days, row.week_pattern, weekStart, weekEnd, row.created_at, row.updated_at);
     }
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
     for (const row of snapshot.allocations) insertAllocation.run(row.id, row.course_id, row.teacher_id, row.assigned_group_count);
@@ -1188,7 +1236,7 @@ export function listCourses(): CourseRecord[] {
   // 班次数量和教师分配总数分别使用独立子查询，避免一门课同时有多位教师和多个班次时，
   // 连接结果互相相乘而造成统计数字虚高。
   const rows = database().prepare(`
-    SELECT courses.id, courses.code, courses.catalog, courses.duration_hours, courses.sessions_per_week,
+    SELECT courses.id, courses.code, courses.catalog, courses.revision, courses.duration_hours, courses.sessions_per_week,
       courses.primary_year, courses.minimum_room_capacity, courses.requires_lab,
       courses.requires_multi_projector, courses.requires_smart_classroom,
       courses.separate_sections_across_days, courses.week_pattern, courses.week_start, courses.week_end,
@@ -1199,11 +1247,12 @@ export function listCourses(): CourseRecord[] {
       (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
     FROM courses
     ORDER BY courses.code ASC
-  `).all() as Array<{ id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; scheduled_lessons: number; allocated_sections: number }>;
+  `).all() as Array<{ id: string; code: string; catalog: string | null; revision: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; scheduled_lessons: number; allocated_sections: number }>;
   return rows.map((row) => ({
     id: row.id,
     code: row.code,
     catalog: row.catalog,
+    revision: row.revision,
     durationHours: row.duration_hours,
     sessionsPerWeek: row.sessions_per_week,
     primaryYear: row.primary_year,
@@ -1283,51 +1332,131 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
   return resize.immediate();
 }
 
-export function updateCourseSetup(id: string, input: Omit<CourseRecord, "id" | "code" | "catalog" | "durationHours" | "weekPattern" | "allocatedSections" | "configuredSections" | "scheduledLessons" | "allocationVarianceCount"> & { durationHours: number }) {
+export class CourseSetupInputError extends Error {
+  // 字段范围错误可以安全地原样显示给老师；数据库或 trigger 错误绝不能使用这个类型。
+  constructor(message: string) {
+    super(message);
+    this.name = "CourseSetupInputError";
+  }
+}
+
+export class CourseSetupStateConflictError extends Error {
+  // 已排课次与新设置互相矛盾时返回 409，提醒老师先处理总表上的课程。
+  constructor(message: string) {
+    super(message);
+    this.name = "CourseSetupStateConflictError";
+  }
+}
+
+export class CourseSetupRevisionConflictError extends Error {
+  // 浏览器提交的 revision 不是最新版本，说明另一账号已经先保存。
+  constructor() {
+    super("This course setup was changed by another scheduler. Reload the latest setup before editing it again.");
+    this.name = "CourseSetupRevisionConflictError";
+  }
+}
+
+export class CourseSetupBusyError extends Error {
+  // SQLite 正由另一服务进程写入时提供可重试提示，不向浏览器暴露锁或数据库路径。
+  constructor() {
+    super("Another scheduler is updating course data. Try again in a moment.");
+    this.name = "CourseSetupBusyError";
+  }
+}
+
+function courseSetupDatabase() {
+  // database() 本身会执行幂等结构升级，可能在正式事务开始前遇到 SQLite 写锁；
+  // 这里把初始化阶段和后面的 IMMEDIATE 事务统一映射为安全的 503 业务错误。
+  try {
+    return database();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new CourseSetupBusyError();
+    throw error;
+  }
+}
+
+export function updateCourseSetup(id: string, input: CourseSetupInput): { revision: number; changed: boolean } | null {
   // 课程要求适用于该课生成的每个班次，因此只保存在课程层级；
   // 像 LEAD 有 18 个班次时无需重复存储 18 份相同设置。
-  const db = database();
-  // 业务规则不仅放在 API 层，也在数据库写入边界再次执行，
-  // 因为未来维护脚本可能绕过 API，直接调用这个共享函数。
-  if (!Number.isInteger(input.durationHours) || input.durationHours < 2 || input.durationHours > 4) {
-    throw new Error("Course duration must be 2 to 4 whole hours.");
+  // 业务规则也必须在共用数据库入口验证，因为维护脚本可能绕过网页 API。
+  if (!Number.isSafeInteger(input.revision) || input.revision < 1) throw new CourseSetupInputError("Course revision must be a positive whole number.");
+  if (!Number.isInteger(input.durationHours) || input.durationHours < 2 || input.durationHours > 4) throw new CourseSetupInputError("Course duration must be 2 to 4 whole hours.");
+  if (![1, 2].includes(input.sessionsPerWeek)) throw new CourseSetupInputError("Weekly sessions must be 1 or 2.");
+  if (input.primaryYear !== null && ![1, 2, 3].includes(input.primaryYear)) throw new CourseSetupInputError("Primary year must be Year 1, Year 2, Year 3 or blank.");
+  if (input.minimumRoomCapacity !== null && (!Number.isSafeInteger(input.minimumRoomCapacity) || input.minimumRoomCapacity < 1)) throw new CourseSetupInputError("Minimum room capacity must be a positive whole number or blank.");
+  if (![input.requiresLab, input.requiresMultiProjector, input.requiresSmartClassroom, input.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) throw new CourseSetupInputError("Course requirement switches must be true or false.");
+  if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isSafeInteger(input.weekStart) || !Number.isSafeInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd < input.weekStart))) {
+    throw new CourseSetupInputError("Teaching weeks must be blank for all weeks or a valid positive start and end range.");
   }
-  if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isInteger(input.weekStart) || !Number.isInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd < input.weekStart))) {
-    throw new Error("Teaching weeks must be blank for all weeks or a valid positive start and end range.");
-  }
-  // 年级总表只按课程的主要年级读取资料。若已有排课时把主要年级清空，课程仍留在数据库，
-  // 却会从 Year 1–3 总表和问题清单全部消失；因此在共用数据库边界阻止这种隐藏资料的状态。
-  const hasScheduledLesson = db.prepare(`
-    SELECT 1
-    FROM scheduled_lessons lessons
-    JOIN course_sections sections ON sections.id = lessons.section_id
-    WHERE sections.course_id = ?
-    LIMIT 1
-  `).get(id);
-  if (input.primaryYear === null && hasScheduledLesson) {
-    throw new Error("Choose a primary year before saving a course that already has scheduled lessons.");
-  }
-  // 如果第二次每周课次已经排入时间表，不允许静默把它隐藏或删除。
-  const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ?`).get(id, input.sessionsPerWeek);
-  if (scheduledExtra) throw new Error("Return the extra weekly sessions to the tray before reducing sessions per week.");
-  const outsideGrid = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.start_hour + ? > 18 LIMIT 1`).get(id, input.durationHours);
-  if (outsideGrid) throw new Error("Move late lessons earlier before increasing this course duration.");
+
+  const db = courseSetupDatabase();
   const save = db.transaction(() => {
+    // 取得写锁后才读取课程和所有排课状态。这样另一位老师不能在检查完成后、
+    // UPDATE 执行前插入 occurrence 2、晚课或第一条排课记录。
+    const current = db.prepare(`
+      SELECT revision, duration_hours, sessions_per_week, primary_year, minimum_room_capacity,
+        requires_lab, requires_multi_projector, requires_smart_classroom,
+        separate_sections_across_days, week_start, week_end
+      FROM courses WHERE id = ?
+    `).get(id) as { revision: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_start: number | null; week_end: number | null } | undefined;
+    if (!current) return null;
+    if (current.revision !== input.revision) throw new CourseSetupRevisionConflictError();
+
+    // 完全相同的表单不应消耗 revision 或让打开中的 Inspector 失效。
+    const changed = current.duration_hours !== input.durationHours
+      || current.sessions_per_week !== input.sessionsPerWeek
+      || current.primary_year !== input.primaryYear
+      || current.minimum_room_capacity !== input.minimumRoomCapacity
+      || Boolean(current.requires_lab) !== input.requiresLab
+      || Boolean(current.requires_multi_projector) !== input.requiresMultiProjector
+      || Boolean(current.requires_smart_classroom) !== input.requiresSmartClassroom
+      || Boolean(current.separate_sections_across_days) !== input.separateSectionsAcrossDays
+      || current.week_start !== input.weekStart
+      || current.week_end !== input.weekEnd;
+    // 年级总表只按课程的主要年级读取资料。已有排课时清空年级会留下数据库记录，
+    // 但它不会出现在三张总表，因此必须在同一写锁中阻止。
+    const hasScheduledLesson = db.prepare(`
+      SELECT 1 FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      WHERE sections.course_id = ? LIMIT 1
+    `).get(id);
+    if (input.primaryYear === null && hasScheduledLesson) throw new CourseSetupStateConflictError("Choose a primary year before saving a course that already has scheduled lessons.");
+
+    // 已排的额外课次和晚课不能被新设置变成超出课程规则的隐藏资料。
+    const scheduledExtra = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.occurrence > ? LIMIT 1`).get(id, input.sessionsPerWeek);
+    if (scheduledExtra) throw new CourseSetupStateConflictError("Return the extra weekly sessions to the tray before reducing sessions per week.");
+    const outsideGrid = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? AND lessons.start_hour + ? > 18 LIMIT 1`).get(id, input.durationHours);
+    if (outsideGrid) throw new CourseSetupStateConflictError("Move late lessons earlier before increasing this course duration.");
+
+    // 即使表单没有字段变化，也先完成上面的不变量检查；这样旧版本遗留的隐藏课程
+    // 不会被一次 no-op Save 误报为健康成功。合法 no-op 仍不会执行任何 UPDATE。
+    if (!changed) return { revision: current.revision, changed: false };
+
+    // WHERE revision = ? 是最终比较后更新保护。即使未来事务结构改变，也不能让旧表单覆盖新设置。
     const result = db.prepare(`
       UPDATE courses SET duration_hours = ?, sessions_per_week = ?, primary_year = ?,
         minimum_room_capacity = ?, requires_lab = ?, requires_multi_projector = ?,
         requires_smart_classroom = ?, separate_sections_across_days = ?, week_pattern = ?,
-        week_start = ?, week_end = ?,
-        updated_at = CURRENT_TIMESTAMP WHERE id = ?
-    `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, legacyWeekPattern(input.weekStart, input.weekEnd), input.weekStart, input.weekEnd, id);
-    // 已排课记录冗余保存时长，以便时间表快速渲染；课程统一时长变化时，
-    // 必须同步更新这个冗余值，避免卡片高度与真实设置不一致。
-    if (result.changes > 0) db.prepare("UPDATE scheduled_lessons SET duration_hours = ?, revision = revision + 1 WHERE section_id IN (SELECT id FROM course_sections WHERE course_id = ?)").run(input.durationHours, id);
-    return result.changes > 0;
+        week_start = ?, week_end = ?, revision = revision + 1,
+        updated_at = CURRENT_TIMESTAMP WHERE id = ? AND revision = ?
+    `).run(input.durationHours, input.sessionsPerWeek, input.primaryYear, input.minimumRoomCapacity, input.requiresLab ? 1 : 0, input.requiresMultiProjector ? 1 : 0, input.requiresSmartClassroom ? 1 : 0, input.separateSectionsAcrossDays ? 1 : 0, legacyWeekPattern(input.weekStart, input.weekEnd), input.weekStart, input.weekEnd, id, input.revision);
+    if (result.changes !== 1) throw new CourseSetupRevisionConflictError();
+
+    // 每条已排课程冗余保存时长；任何课程设置变化也会改变规则语义，因此全部课次
+    // revision 一起增加，阻止仍开着的旧 Inspector 在新规则上继续静默保存。
+    db.prepare("UPDATE scheduled_lessons SET duration_hours = ?, revision = revision + 1 WHERE section_id IN (SELECT id FROM course_sections WHERE course_id = ?)").run(input.durationHours, id);
+    // warning 重算属于同一次事务。若 trigger、磁盘或规则计算失败，课程、课次和 warning 全部回滚。
+    refreshAllScheduleWarnings(db);
+    return { revision: input.revision + 1, changed: true };
   });
-  const changed = save();
-  if (changed) refreshAllScheduleWarnings(db);
-  return changed;
+
+  try {
+    return save.immediate();
+  } catch (error) {
+    if (error instanceof CourseSetupInputError || error instanceof CourseSetupStateConflictError || error instanceof CourseSetupRevisionConflictError || error instanceof CourseSetupBusyError) throw error;
+    if (isSqliteBusyError(error)) throw new CourseSetupBusyError();
+    throw error;
+  }
 }
 
 export function listCourseSections(courseId: string): CourseSectionRecord[] {
@@ -1776,15 +1905,13 @@ function highestIssueSeverity(messages: string[]): "High" | "Warning" | "Advisor
 }
 
 export function listScheduleIssues(): ScheduleIssueRecord[] {
-  // 先重新计算每条排课记录，再把保存的多条警告展开为可排序的问题记录，
-  // 供全局问题清单和年级检查面板共同使用。
+  // 把写入操作已经保存的多条 warning 展开为可排序的问题记录，
+  // 供全局问题清单和年级检查面板共同使用。GET 必须保持纯读取：如果先读旧课程
+  // 再晚于另一个写事务回写 warning，反而可能覆盖刚提交的新规则结果。
   const db = database();
-  // 打开问题页面时重新计算所有已排课程。即使某节课没有再次打开编辑器，
-  // 当不可用时段或相邻课程变化后，问题清单仍能立即反映最新状态。
-  const warningsByLesson = refreshAllScheduleWarnings(db);
   const rows = db.prepare(`
     SELECT lessons.id, lessons.section_id, lessons.day_of_week, lessons.start_hour,
-      lessons.duration_hours, lessons.room_id, lessons.occurrence,
+      lessons.duration_hours, lessons.room_id, lessons.occurrence, lessons.warnings_json,
       sections.teacher_id, sections.sequence, courses.code, courses.primary_year,
       courses.sessions_per_week, courses.week_start, courses.week_end, teachers.name AS teacher_name,
       rooms.code AS room_code,
@@ -1799,11 +1926,12 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
     LEFT JOIN rooms ON rooms.id = lessons.room_id
     WHERE courses.primary_year IS NOT NULL
     ORDER BY courses.primary_year, lessons.day_of_week, lessons.start_hour, courses.code, sections.sequence
-  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; occurrence: number; teacher_id: string | null; sequence: number; code: string; primary_year: number; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
+  `).all() as Array<{ id: string; section_id: string; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; occurrence: number; warnings_json: string; teacher_id: string | null; sequence: number; code: string; primary_year: number; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_name: string | null; room_code: string | null; student_groups: string | null }>;
 
   const issues: ScheduleIssueRecord[] = [];
   for (const row of rows) {
-    const warnings = warningsByLesson.get(row.id) ?? [];
+    // warnings_json 只由受控事务写入；读取时仍按 JSON 解析成一条条业务说明。
+    const warnings = JSON.parse(row.warnings_json) as string[];
     // 把一节课的多条警告展开成独立问题行，使每条规则都能单独筛选和查看。
     warnings.forEach((message, index) => {
       const description = describeIssue(message);
@@ -1950,8 +2078,11 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   // 新课程、关联警告和返回资料放在同一个事务中，任一步失败都不会留下半完成排课。
   const db = database();
   const placementTransaction = db.transaction(() => {
-    const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
+    const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.primary_year, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
     if (!section || !section.duration_hours) throw new ScheduledLessonPlacementInputError("Section must have a course duration before placement.");
+    // 三张年级总表只读取 primary_year；旧页面即使在课程年级被另一位老师清空后继续提交，
+    // 也不能建立一条在总表中完全看不见的排课记录。
+    if (section.primary_year === null) throw new ScheduledLessonPlacementInputError("Choose a primary year before placing this course.");
     if (!Number.isInteger(input.occurrence) || input.occurrence < 1 || input.occurrence > section.sessions_per_week) throw new ScheduledLessonPlacementInputError("Choose a valid weekly session before placement.");
     if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + section.duration_hours > 18) throw new ScheduledLessonPlacementInputError("Lessons must be placed Monday to Friday between 08:00 and 18:00.");
 
