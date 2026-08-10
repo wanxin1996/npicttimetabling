@@ -349,6 +349,33 @@ function readRetainedSnapshot() {
   }
 }
 
+function readFullBusinessSnapshot() {
+  // Candidate 失败属于纯读取。14 张业务表在同一个 DEFERRED 快照中逐字段读取，
+  // 能发现 revision、warning、会话或备份的任何隐藏写入，而不只是比较行数。
+  const db = new Database(testDatabasePath, { readonly: true });
+  try {
+    const snapshot = db.transaction(() => ({
+      courses: db.prepare("SELECT * FROM courses ORDER BY id").all(),
+      allocations: db.prepare("SELECT * FROM teaching_allocations ORDER BY id").all(),
+      sections: db.prepare("SELECT * FROM course_sections ORDER BY id").all(),
+      sectionGroups: db.prepare("SELECT * FROM section_student_groups ORDER BY section_id, student_group_id").all(),
+      lessons: db.prepare("SELECT * FROM scheduled_lessons ORDER BY id").all(),
+      teachers: db.prepare("SELECT * FROM teachers ORDER BY id").all(),
+      studentGroups: db.prepare("SELECT * FROM student_groups ORDER BY id").all(),
+      rooms: db.prepare("SELECT * FROM rooms ORDER BY id").all(),
+      teacherWindows: db.prepare("SELECT * FROM teacher_unavailable_windows ORDER BY id").all(),
+      yearWindows: db.prepare("SELECT * FROM year_blocked_windows ORDER BY id").all(),
+      rules: db.prepare("SELECT * FROM rule_settings ORDER BY rule_key").all(),
+      users: db.prepare("SELECT * FROM app_users ORDER BY id").all(),
+      sessions: db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all(),
+      backups: db.prepare("SELECT * FROM schedule_backups ORDER BY id").all(),
+    }));
+    return snapshot.deferred();
+  } finally {
+    db.close();
+  }
+}
+
 function readDatabaseValue(sql, ...parameters) {
   // 简短精确断言使用独立只读连接；调用结束立即关闭，不与后续写入争抢资源。
   const db = new Database(testDatabasePath, { readonly: true });
@@ -513,6 +540,135 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
     await Promise.all(Object.values(files).map((filename) => rm(filename, { force: true }).catch(() => undefined)));
   }
   report("候选建议在跨进程教室更新期间保持单一 SQLite 读快照");
+}
+
+async function armCandidateEntryFault(fixture, fault) {
+  // entry arm 绑定随机 nonce、目标 section 和故障类型；先完整写临时文件再原子改名，
+  // A 的 preload 不会读到半截控制内容，也不会误拦截其他 Candidate 请求。
+  const nonce = randomBytes(16).toString("hex");
+  const control = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce,
+    sectionId: fixture.candidateSectionId,
+    fault,
+  };
+  const files = {
+    arm: path.join(authRaceControlDirectory, "candidate-entry-arm-A.json"),
+    temporary: path.join(authRaceControlDirectory, `candidate-entry-arm-A-${nonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `candidate-entry-ready-A-${nonce}.json`),
+    release: path.join(authRaceControlDirectory, `candidate-entry-release-${nonce}.txt`),
+  };
+  await writeFile(files.temporary, JSON.stringify(control), { flag: "wx", mode: 0o600 });
+  await rename(files.temporary, files.arm);
+  return { control, files };
+}
+
+async function removeRaceFiles(files) {
+  // 每个 arm、临时文件、ready 和 release 都位于本轮唯一 control 目录；
+  // force 删除让成功路径和 finally 清理可以安全重复调用。
+  await Promise.all(Object.values(files).map((filename) => rm(filename, { force: true }).catch(() => undefined)));
+}
+
+async function verifyCandidateFailureBoundaries(serverA, fixture) {
+  const candidatePath = `/api/course-sections/${fixture.candidateSectionId}/candidates?occurrence=1`;
+  const baseline = await requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie });
+  assertCandidateSnapshot(baseline.body, fixture, 40);
+  const expectedDatabase = readFullBusinessSnapshot();
+  const observer = new Database(testDatabasePath, { readonly: true });
+  const initialDataVersion = observer.pragma("data_version", { simple: true });
+
+  try {
+    // 第一组故障由 test-only preload 在 Candidate 首条 SELECT 前抛出带敏感哨兵的普通 Error。
+    // 路由只能回固定500；ready control 证明响应确实来自本次注入，而不是其他偶然错误。
+    const internalFault = await armCandidateEntryFault(fixture, "internal");
+    try {
+      const internalResponse = await requestApi(serverA, candidatePath, {
+        cookie: fixture.schedulerACookie,
+        expectedStatus: 500,
+      });
+      assert.deepEqual(
+        JSON.parse(await readFile(internalFault.files.ready, "utf8")),
+        internalFault.control,
+      );
+      assert.deepEqual(internalResponse.body, {
+        error: "Candidate slots could not be calculated. Try again.",
+      });
+      assert.equal(internalResponse.response.headers.get("retry-after"), null);
+      assert(!/secret|sqlite|select|rooms|private|table|column|stack|path/i.test(JSON.stringify(internalResponse.body)));
+    } finally {
+      await removeRaceFiles(internalFault.files);
+    }
+    assert.deepEqual(readFullBusinessSnapshot(), expectedDatabase);
+    assert.equal(observer.pragma("data_version", { simple: true }), initialDataVersion);
+    assert.deepEqual(
+      (await requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie })).body,
+      baseline.body,
+    );
+
+    // 第二组在认证完成、Candidate DEFERRED 已开始但尚未首读时暂停 A。
+    // 第三连接随后取得真实 EXCLUSIVE 锁，并一直持有到 A 用 SQLite 默认 timeout 返回503。
+    const busyFault = await armCandidateEntryFault(fixture, "busy");
+    activeRaceReleases.set(busyFault.files.release, busyFault.control.nonce);
+    let busyRequestSettled = false;
+    const pendingBusyRequest = requestApi(serverA, candidatePath, {
+      cookie: fixture.schedulerACookie,
+      expectedStatus: 503,
+    });
+    pendingBusyRequest.then(
+      () => { busyRequestSettled = true; },
+      () => { busyRequestSettled = true; },
+    );
+    const blocker = new Database(testDatabasePath);
+    let holdsExclusiveLock = false;
+    try {
+      await waitForRaceReady(
+        serverA,
+        busyFault.files.ready,
+        busyFault.control,
+        () => busyRequestSettled,
+        "Candidate BUSY boundary",
+        "the pre-SELECT Candidate entry",
+      );
+      assert.equal(blocker.pragma("journal_mode", { simple: true }), "delete");
+      assert.equal(blocker.pragma("locking_mode", { simple: true }), "normal");
+      assert.equal(blocker.pragma("busy_timeout", { simple: true }), 5_000);
+      blocker.exec("BEGIN EXCLUSIVE");
+      holdsExclusiveLock = true;
+      const releasedAt = Date.now();
+      await releaseRaceBarrier(busyFault.files.release, busyFault.control.nonce);
+      const busyResponse = await pendingBusyRequest;
+      const busyWaitMilliseconds = Date.now() - releasedAt;
+      assert(busyWaitMilliseconds >= 4_000 && busyWaitMilliseconds < 15_000,
+        `Candidate BUSY response used an unexpected wait of ${busyWaitMilliseconds} ms.`);
+      assert.deepEqual(busyResponse.body, {
+        error: "Another scheduler is updating timetable data. Try finding clear options again in a moment.",
+      });
+      assert.equal(busyResponse.response.headers.get("retry-after"), "1");
+      assert(!/sqlite|\bbusy\b|\blocked\b|constraint|\bselect\b|\btable\b|\bcolumn\b|\bstack\b|\/private\/|path/i
+        .test(JSON.stringify(busyResponse.body)));
+    } finally {
+      // 先释放真实 EXCLUSIVE 锁，再清理 arm；即使断言失败，后续 API 和两个服务也能继续退出。
+      if (holdsExclusiveLock) {
+        try { blocker.exec("ROLLBACK"); } catch { /* 连接关闭会执行最终锁清理。 */ }
+      }
+      blocker.close();
+      await releaseRaceBarrier(busyFault.files.release, busyFault.control.nonce).catch(() => undefined);
+      activeRaceReleases.delete(busyFault.files.release);
+      await pendingBusyRequest.catch(() => undefined);
+      await removeRaceFiles(busyFault.files);
+    }
+    assert.deepEqual(readFullBusinessSnapshot(), expectedDatabase);
+    assert.equal(observer.pragma("data_version", { simple: true }), initialDataVersion);
+    assert.deepEqual(
+      (await requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie })).body,
+      baseline.body,
+    );
+  } finally {
+    observer.close();
+  }
+  report("Candidate 的真实 BUSY 503 与内部故障500均固定、安全且零写入");
 }
 
 async function verifyConcurrentFirstPlacement(serverA, serverB, fixture) {
@@ -1049,6 +1205,7 @@ async function run() {
   const fixture = await initializeFixtureAfterAdministrator(serverA, serverB);
 
   await verifyCandidateSnapshotConsistency(serverA, serverB, fixture);
+  await verifyCandidateFailureBoundaries(serverA, fixture);
   await verifyConcurrentFirstPlacement(serverA, serverB, fixture);
   await verifyConcurrentCourseSetup(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);

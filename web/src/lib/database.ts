@@ -2111,6 +2111,7 @@ function calculateCandidateSlotsFromSnapshot(db: DatabaseInstance, sectionId: st
   // 候选搜索读取班次已保存的教师、学生班级、时长及教室要求。
   // 资料不完整时不返回可能误导用户的候选结果。
   const section = db.prepare(`
+    /* timetabling:candidate-entry */
     SELECT sections.id, sections.sequence, sections.teacher_id, courses.code,
       courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end
     FROM course_sections sections

@@ -2159,3 +2159,29 @@
 1. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务一次性加载完整资料 + 事务外纯内存计算”，缩短 rollback journal 下对其他老师 COMMIT 的等待；当前完整读事务已先保证正确性。
 2. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
 3. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项；正式部署仍维持单实例。
+
+## 2026-08-11｜为 Candidate 503／500 建立真实故障回归
+
+### 已完成
+
+- 在 Candidate 的第一条班次查询加入 SQLite 会忽略的内部 marker；正常 production 行为不变，只有双进程测试显式加载的隔离 preload 会识别它。
+- Candidate BUSY 测试不伪造异常：A 已完成 Cookie 验证并进入 `DEFERRED`、但尚未执行首条 SELECT 时暂停；第三条 SQLite 连接确认 `journal_mode=delete` 后取得真实 `BEGIN EXCLUSIVE`。
+- A 释放后保持 EXCLUSIVE 锁直到默认约5秒 busy timeout 完成，接口必须返回固定 503、`Retry-After: 1` 和安全业务文案；收到响应后才 ROLLBACK，证明错误来自 Candidate 的真实锁竞争而非认证代理或测试替身。
+- 内部故障测试在相同 entry marker 注入普通 Error，错误刻意包含 `SECRET`、SQL、表名、列名、stack 和私有路径哨兵；浏览器只能收到固定 `{error: "Candidate slots could not be calculated. Try again."}` 500，且没有 `Retry-After`。
+- 两类故障的 arm 都绑定随机 run token、A 标签、随机 nonce、目标 section ID 和故障类型；ready 文件原样保存 control，测试会逐字段核对，不能由偶然的其他 500／503产生假阳性。
+- 故障前后在同一个只读事务中逐字段比较14张业务表，包括账号 session 与紧急备份；同一 observer 的 `PRAGMA data_version` 也保持不变，证明 Candidate 失败没有隐藏写入。
+- 清除故障和锁后再次从 production API 请求 Candidate，响应必须与故障前基线逐字段相同；连接、事务和 prepared statements 都能继续正常使用。
+- 普通完成、断言失败、Ctrl-C 和 SIGTERM 继续共用幂等清理：先写匹配 nonce 的 release，再等待请求、停止 A／B，并删除本轮唯一临时数据库和 control 目录。
+
+### 本次验证
+
+- `node --check`、`git diff --check`、独立 TypeScript 检查、ESLint、production build 和 `npm run test:concurrency` 全部通过。
+- 最终 `npm run test:release` 完整通过；CRUD／Excel／Cycle、Candidate 快照与故障、首次排课／Course Setup／周期／登录竞态、外键和满载性能均成功。
+- 最新满载基线为 Issues p95 `17.0 ms`、Year timetable p95 `13.8 ms`、30间教室候选中位 `148.5 ms`、六账号30请求轮询整轮 `57.6 ms`／请求 p95 `54.0 ms`、360条 warning 重算 `61.4 ms`、一个写入加十个读取 `95.6 ms`。
+- 正式 `web/data/timetabling.db` 仍保持 `2026-08-11 04:45:51`、544,768 bytes；本任务自动化只使用 `os.tmpdir()` 临时库，结束后没有残留 `timetabling-api-*` 目录。
+
+### 下一步
+
+1. 修复数据库首次初始化失败时的新连接清理：只关闭尚未挂入 global 的局部连接，避免持续锁竞争累积文件描述符。
+2. 在不复制两套规则语义的前提下，把 Candidate 改成“短事务加载完整快照 + 事务外纯内存计算”，进一步缩短 rollback journal 下其他老师 COMMIT 的等待。
+3. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，并继续统一首次排课、班次编辑等剩余写入口的安全 503 语义。

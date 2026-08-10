@@ -41,6 +41,7 @@ if (testMode !== exactTestMode || !/^[AB]$/.test(processLabel) || !tokenHasExpec
 const armFile = path.join(controlDirectory, "arm.json");
 const originalTimingSafeEqual = crypto.timingSafeEqual;
 const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+const candidateEntrySqlMarker = "/* timetabling:candidate-entry */";
 const candidateSnapshotSqlMarker = "/* timetabling:candidate-snapshot */";
 const candidateRoomUpdateSqlMarker = "/* timetabling:candidate-race-room-update */";
 
@@ -77,6 +78,33 @@ function consumeCandidateSnapshotArm(rooms) {
     waitForRaceRelease(releaseFile, control.nonce, "candidate snapshot");
   } catch (error) {
     // arm 不存在表示普通候选请求；已经被同一请求消费也可直接继续。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeCandidateEntryArm(sectionId) {
+  // Candidate 路由已经完成 Cookie 验证并进入 DEFERRED 事务，但第一条业务 SELECT
+  // 尚未执行。测试可在这里安全建立 EXCLUSIVE 锁，确保 BUSY 真正来自 Candidate 路径。
+  if (processLabel !== "A") return;
+  const entryArmFile = path.join(controlDirectory, "candidate-entry-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(entryArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.sectionId !== sectionId) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (!["busy", "internal"].includes(control.fault)) return;
+    const readyFile = path.join(controlDirectory, `candidate-entry-ready-A-${control.nonce}.json`);
+    fs.renameSync(entryArmFile, readyFile);
+
+    if (control.fault === "internal") {
+      // 故意包含不应出现在 HTTP 响应中的敏感诊断文字，验证路由只返回固定通用500。
+      throw new Error("SECRET candidate fault: SELECT rooms from /private/tmp/private.sqlite table column stack");
+    }
+    const releaseFile = path.join(controlDirectory, `candidate-entry-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "candidate entry");
+  } catch (error) {
+    // arm 不存在表示普通候选请求；其余错误必须继续交给真实路由错误边界处理。
     if (error && error.code === "ENOENT") return;
     throw error;
   }
@@ -127,11 +155,19 @@ function patchBetterSqlite3(Database) {
   const originalPrepare = Database.prototype.prepare;
   Object.defineProperty(Database.prototype, "__timetablingRacePatched", { value: true });
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装两个内部 marker：候选 Active rooms 读取，以及本回归使用的教室 UPDATE。
+    // 只包装三个内部 marker：Candidate 首条读取、Active rooms 读取，以及本回归使用的教室 UPDATE。
     // 其他 SQL 和 Statement 方法完全透明。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;
+    if (sql.includes(candidateEntrySqlMarker)) {
+      const originalGet = statement.get;
+      statement.get = function candidateEntryAwareGet(...getArguments) {
+        // 屏障在真实 `.get()` 之前触发，此时 DEFERRED 尚未取得 SHARED 读锁。
+        consumeCandidateEntryArm(getArguments[0]);
+        return Reflect.apply(originalGet, this, getArguments);
+      };
+    }
     if (sql.includes(candidateSnapshotSqlMarker)) {
       const originalAll = statement.all;
       statement.all = function candidateSnapshotAwareAll(...allArguments) {
