@@ -85,6 +85,8 @@ function lessonIssueClasses(severity: ScheduledLesson["warningSeverity"]) {
 }
 
 function noticeTone(message: string) {
+  // Convert human-readable operation messages into the matching success, warning,
+  // error or neutral colour used by the fixed status notice.
   const normalized = message.toLowerCase();
   if (["could not", "unable", "failed", "error", "interrupted", "expired"].some((word) => normalized.includes(word))) return "border-red-200 bg-red-50 text-red-900";
   // Successful candidate placement says "no warnings". Recognise that explicit
@@ -96,6 +98,8 @@ function noticeTone(message: string) {
 }
 
 function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[] {
+  // Turn saved day/time records into visual lanes so deliberate overlaps remain
+  // readable instead of drawing multiple course cards on top of one another.
   const positioned: PositionedLesson[] = [];
 
   for (let dayOfWeek = 1; dayOfWeek <= timetableDays.length; dayOfWeek += 1) {
@@ -146,6 +150,8 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
   focusLesson?: { id: string; requestNumber: number } | null;
 }) {
+  // This shared grid renders both editable year timetables and read-only personal
+  // timetables, while optional callbacks add drag-and-drop only where appropriate.
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
   // A day with deliberately saved conflicts needs extra horizontal room for its
@@ -512,6 +518,8 @@ export default function Home() {
   }
 
   async function placeSectionWithoutDrag(event: FormEvent<HTMLFormElement>) {
+    // Keyboard and mouse users can submit the inspector form instead of dragging;
+    // the save request and conflict feedback remain identical to drag placement.
     event.preventDefault();
     if (!placingSection) return;
     const data = new FormData(event.currentTarget);
@@ -630,6 +638,8 @@ export default function Home() {
   }, [loadData]);
 
   useEffect(() => {
+    // While a scheduler is viewing live data, refresh the active screen every five
+    // seconds so edits made by another account become visible without manual reload.
     if (authScreen !== "ready") return;
     let active = true;
 
@@ -686,6 +696,8 @@ export default function Home() {
   }
 
   async function openAccounts() {
+    // Account details are fetched only when an administrator opens this restricted
+    // view, keeping usernames out of normal scheduling screen requests.
     const response = await fetch("/api/auth/accounts");
     if (!response.ok) return setNotice("Only the administrator can manage accounts.");
     setAccounts(await response.json());
@@ -718,6 +730,8 @@ export default function Home() {
   }
 
   async function changeAccountStatus(account: AppUser) {
+    // Deactivation preserves the account record but prevents future logins; the
+    // refreshed list immediately shows the administrator the new state.
     const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive }) });
     if (!response.ok) return setNotice("Account status could not be changed.");
     await openAccounts();
@@ -725,6 +739,8 @@ export default function Home() {
   }
 
   async function resetAccountPassword(event: FormEvent<HTMLFormElement>) {
+    // Administrators can replace a forgotten password without learning the old one;
+    // the server also revokes that user's existing sessions after the reset.
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });

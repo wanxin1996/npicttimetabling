@@ -607,6 +607,8 @@ function hashPassword(password: string) {
 }
 
 function passwordMatches(password: string, stored: string) {
+  // Recreate the saved scrypt value with its original salt, then use a timing-safe
+  // comparison so password checks do not reveal which characters matched.
   const [salt, expectedHex] = stored.split(":");
   if (!salt || !expectedHex) return false;
   const actual = scryptSync(password, salt, 64);
@@ -621,6 +623,8 @@ function sessionHash(token: string) {
 }
 
 function createSession(db: DatabaseInstance, userId: string) {
+  // Give the browser a random token but store only its hash in SQLite, limiting the
+  // usefulness of a copied session table to anyone without the original cookie.
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   db.prepare("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)").run(sessionHash(token), userId, expiresAt);
@@ -628,12 +632,16 @@ function createSession(db: DatabaseInstance, userId: string) {
 }
 
 export function authenticationStatus(token?: string): { setupRequired: boolean; user: AppUserRecord | null } {
+  // The login screen needs to know whether first-time setup is required and whether
+  // a supplied session token still identifies an active user.
   const db = database();
   const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
   return { setupRequired: count.count === 0, user: token ? validateSession(token) : null };
 }
 
 export function validateSession(token: string): AppUserRecord | null {
+  // Session validation joins the active account and checks expiry in one query so
+  // disabled users and expired cookies lose access immediately.
   const db = database();
   db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(new Date().toISOString());
   const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
@@ -641,6 +649,8 @@ export function validateSession(token: string): AppUserRecord | null {
 }
 
 export function createInitialAdmin(username: string, password: string) {
+  // First-run setup is allowed only while the account table is empty; creating the
+  // administrator and its first session in one transaction avoids a half-setup state.
   const db = database();
   // The first-user check and insert share one transaction so two simultaneous setup
   // requests cannot both become separate bootstrap administrators.
@@ -654,6 +664,8 @@ export function createInitialAdmin(username: string, password: string) {
 }
 
 export function loginUser(username: string, password: string) {
+  // Login accepts only active accounts with a matching password and returns a fresh
+  // server-side session for the secure browser cookie.
   const db = database();
   const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
   if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
@@ -661,21 +673,27 @@ export function loginUser(username: string, password: string) {
 }
 
 export function logoutSession(token: string) {
+  // Logging out deletes only the hashed form of this browser's session token.
   return database().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(sessionHash(token)).changes > 0;
 }
 
 export function listAppUsers(): AppUserRecord[] {
+  // Administrators see account identity and status, never password hashes or sessions.
   const rows = database().prepare("SELECT id, username, is_admin, is_active FROM app_users ORDER BY username").all() as Array<{ id: string; username: string; is_admin: number; is_active: number }>;
   return rows.map((row) => ({ id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) }));
 }
 
 export function createAppUser(username: string, password: string): AppUserRecord {
+  // New team members are scheduler accounts by default; only the initial account is
+  // an administrator who can later create, disable or reset other accounts.
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 0)").run(id, username, hashPassword(password));
   return { id, username, isAdmin: false, isActive: true };
 }
 
 export function changeOwnPassword(userId: string, currentPassword: string, newPassword: string) {
+  // A signed-in user must prove the current password before replacing its hash, and
+  // every session is revoked so the new password becomes the sole credential.
   const db = database();
   const user = db.prepare("SELECT password_hash FROM app_users WHERE id = ? AND is_active = 1").get(userId) as { password_hash: string } | undefined;
   if (!user || !passwordMatches(currentPassword, user.password_hash)) return false;
@@ -688,6 +706,8 @@ export function changeOwnPassword(userId: string, currentPassword: string, newPa
 }
 
 export function setAppUserStatus(userId: string, isActive: boolean) {
+  // Account deactivation is reversible and removes existing sessions without
+  // deleting the username or historical ownership context.
   const db = database();
   // Deactivation revokes active sessions immediately; reactivation does not create one.
   return db.transaction(() => {
@@ -698,6 +718,8 @@ export function setAppUserStatus(userId: string, isActive: boolean) {
 }
 
 export function resetAppUserPassword(userId: string, newPassword: string) {
+  // Administrator reset replaces the stored hash and signs out every browser using
+  // that account, forcing the owner to authenticate with the new password.
   const db = database();
   return db.transaction(() => {
     const changed = db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ? AND is_admin = 0").run(hashPassword(newPassword), userId).changes > 0;
@@ -750,6 +772,8 @@ export function listStudentGroups(): StudentGroupRecord[] {
 }
 
 export function createStudentGroup(code: string, year: number, program: string): StudentGroupRecord {
+  // Student groups are stable conflict-check identities; year and programme remain
+  // editable attributes while the generated database id protects existing links.
   const id = crypto.randomUUID();
   database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
   return { id, code, year, program };
@@ -782,6 +806,8 @@ export function listRooms(): RoomRecord[] {
 }
 
 export function createRoom(input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }): RoomRecord {
+  // Save room capacity and all facility flags together; Smart Classroom also implies
+  // Multi Projector so later requirement checks see a consistent feature set.
   const id = crypto.randomUUID();
   // Room codes follow Block-Level-Room, so the first segment supports travel warnings later.
   const block = input.code.split("-")[0] || null;
@@ -808,6 +834,8 @@ export function updateRoom(id: string, input: { code: string; capacity: number; 
 }
 
 export function setRoomStatus(id: string, isActive: boolean) {
+  // Rooms are deactivated rather than deleted so existing timetable cards keep a
+  // valid historical room reference while new candidate searches exclude them.
   const db = database();
   const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
   if (result.changes > 0) refreshAllScheduleWarnings(db);
@@ -881,10 +909,13 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
 }
 
 function backupSummary(id: string, createdAt: string, snapshot: CycleSnapshot) {
+  // The cycle screen shows only counts and time, not the large JSON snapshot itself.
   return { id, createdAt, courses: snapshot.courses.length, sections: snapshot.sections.length, lessons: snapshot.lessons.length };
 }
 
 export function cycleStatus(): CycleStatusRecord {
+  // Report current working totals and the newest emergency backup available for the
+  // one supported undo operation after starting a new cycle.
   const db = database();
   // Only the newest emergency backup is exposed; this is not a browsable version
   // history and therefore stays aligned with the agreed first-release scope.
@@ -900,6 +931,8 @@ export function cycleStatus(): CycleStatusRecord {
 }
 
 export function startNewCycle(): CycleStatusRecord {
+  // Snapshot the current course work, then clear lessons, generated sections and
+  // courses in one transaction while retaining people, rooms, rules and accounts.
   const db = database();
   const snapshot = readCycleSnapshot(db);
   if (snapshot.courses.length === 0) throw new Error("There is no current course cycle to clear.");
@@ -918,6 +951,8 @@ export function startNewCycle(): CycleStatusRecord {
 }
 
 export function restoreLastCycleBackup(): CycleStatusRecord {
+  // Replace current cycle work from the newest emergency JSON snapshot in a single
+  // transaction, then recalculate warnings against retained rules and restrictions.
   const db = database();
   const backup = db.prepare("SELECT snapshot_json FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { snapshot_json: string } | undefined;
   if (!backup) throw new Error("No emergency cycle backup is available.");
@@ -992,6 +1027,8 @@ export function listCourses(): CourseRecord[] {
 }
 
 export function createManualCourse(input: { code: string; catalog: string | null; sectionCount: number }): CourseRecord {
+  // Manual creation covers modules omitted from Excel; generated sections begin
+  // unassigned so staff can choose teachers and student groups explicitly.
   const db = database();
   // A manual course covers a missing Excel row without inventing a teaching
   // allocation. Its sections start unassigned so staff can choose teachers explicitly.
@@ -1013,6 +1050,8 @@ export function createManualCourse(input: { code: string; catalog: string | null
 }
 
 export function resizeCourseSections(courseId: string, sectionCount: number) {
+  // Increasing adds the next numbered sections; decreasing removes only the highest
+  // unscheduled sections so saved timetable work is never silently discarded.
   const db = database();
   // Resize only at the highest sequence numbers, preserving stable labels and all
   // assignments on LEAD_01 ... LEAD_N that remain within the requested count.
@@ -1108,6 +1147,8 @@ export function listCourseSections(courseId: string): CourseSectionRecord[] {
 }
 
 export function listCourseAllocationVariances(courseId: string): AllocationVarianceRecord[] {
+  // Compare imported teacher group counts with the current section assignments so
+  // manual substitutions remain allowed but visible to the scheduler.
   const db = database();
   // Manual courses have no Teaching Members baseline, so their freely assigned
   // teachers must not be reported as a mismatch against a non-existent allocation.
@@ -1131,6 +1172,8 @@ export function listCourseAllocationVariances(courseId: string): AllocationVaria
 }
 
 export function updateCourseSection(id: string, teacherId: string | null, studentGroupIds: string[]) {
+  // Save one teacher and all linked student groups together, then invalidate any
+  // open lesson editors and refresh warnings affected by the assignment change.
   const db = database();
   // Replacing the join records in one transaction makes an edited cross-level class
   // immediately consistent for future conflict checks.
@@ -1184,6 +1227,8 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
 }
 
 export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
+  // Personal views query the same lesson records across all three primary years;
+  // no duplicate timetable copy is created for a teacher, group or room.
   const db = database();
   // Teacher and room schedules span all three master years. Student-group schedules
   // use the link table so a cross-level course appears for every participating class.
@@ -1461,6 +1506,8 @@ function highestIssueSeverity(messages: string[]): "High" | "Warning" | "Advisor
 }
 
 export function listScheduleIssues(): ScheduleIssueRecord[] {
+  // Recalculate every lesson first, then expand its saved warning messages into the
+  // sortable issue records used by both the global list and year inspector.
   const db = database();
   // Recalculate every saved lesson when the issue screen opens. This keeps the list
   // current after restrictions or neighbouring lessons change, even when the lesson
@@ -1511,6 +1558,8 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
 }
 
 export function listCandidateSlots(sectionId: string, occurrence: number): { sectionLabel: string; occurrence: number; sessionsPerWeek: number; slots: CandidateSlotRecord[] } {
+  // Candidate search is deliberately advisory: evaluate every valid room and hour,
+  // returning only combinations that produce zero enabled-rule messages.
   const db = database();
   // Candidate search uses the section's saved teacher, student groups, duration and
   // course requirements. Incomplete sections therefore return no misleading options.
@@ -1555,6 +1604,8 @@ export function listCandidateSlots(sectionId: string, occurrence: number): { sec
 }
 
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
+  // Create the requested whole-hour lesson even when warnings exist, store those
+  // warnings, and return the complete card data for immediate browser feedback.
   const db = database();
   const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
   if (!section || !section.duration_hours) throw new Error("Section must have a course duration before placement.");
@@ -1572,6 +1623,8 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
 }
 
 export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; revision: number }): ScheduledLessonRecord {
+  // Revision checking prevents silent overwrites; teacher and placement changes are
+  // saved together so recalculated conflicts always match the displayed card.
   const db = database();
   // The editor updates the section teacher and lesson placement together so the card
   // never briefly shows a teacher that differs from the conflict-check input.
@@ -1604,6 +1657,8 @@ export function removeScheduledLesson(id: string, revision: number) {
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
+  // Convert the validated worksheet rows into one teacher list, course list and
+  // allocation map before applying the full import transaction.
   const db = database();
   // Maps remove duplicates from the spreadsheet while preserving one record per
   // teacher, course, and course-teacher allocation pair.

@@ -8,6 +8,8 @@ export function GET() {
 }
 
 export async function POST(request: Request) {
+  // One endpoint handles the two related high-risk actions; the action name and
+  // exact confirmation phrase decide which database transaction may run.
   const body = await request.json();
   try {
     if (body.action === "start") {

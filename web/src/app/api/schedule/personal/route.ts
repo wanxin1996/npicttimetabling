@@ -5,6 +5,8 @@ import { listPersonalScheduledLessons } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
+  // Read the chosen owner type and id before projecting the shared timetable across
+  // all three master years.
   const parameters = new URL(request.url).searchParams;
   const kind = parameters.get("kind");
   const ownerId = parameters.get("ownerId") ?? "";

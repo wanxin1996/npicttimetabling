@@ -38,6 +38,7 @@ function keysFor(request: NextRequest, username: string) {
 }
 
 function recentFailures(entry: AttemptWindow, now: number) {
+  // Ignore attempts older than the rolling protection window before making a lock decision.
   return entry.failures.filter((failedAt) => now - failedAt < WINDOW_MS);
 }
 
@@ -57,6 +58,8 @@ function pruneExpiredEntries(now: number) {
 }
 
 export function loginRateLimitStatus(request: NextRequest, username: string) {
+  // Check both the network address and username so repeated guessing cannot simply
+  // rotate one of those values to avoid the short login lockout.
   const now = Date.now();
   pruneExpiredEntries(now);
   // If either the source or account is blocked, return the longest remaining wait so
@@ -69,6 +72,8 @@ export function loginRateLimitStatus(request: NextRequest, username: string) {
 }
 
 export function recordFailedLogin(request: NextRequest, username: string) {
+  // Record the same failure in both protection buckets and return the stricter
+  // resulting status for the login API's response.
   const now = Date.now();
   // The fifth recent failure finishes normally with a generic 401; the following
   // request receives 429 until the short cooling-off period expires.

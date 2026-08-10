@@ -4,6 +4,8 @@ import { listScheduledLessons, placeScheduledLesson } from "@/lib/database";
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
+  // A master-table read returns only the selected primary year while conflict
+  // calculations still consider lessons from all years.
   const year = Number(new URL(request.url).searchParams.get("year") ?? 1);
   if (![1, 2, 3].includes(year)) return Response.json({ error: "Year must be 1, 2 or 3." }, { status: 400 });
   return Response.json(listScheduledLessons(year));

@@ -3,6 +3,8 @@ import { databaseHealth } from "@/lib/database";
 export const runtime = "nodejs";
 
 export function GET() {
+  // Hosting health checks receive only a simple status while the database query
+  // stays server-side and exposes no department counts or file paths.
   try {
     // Keep the public response deliberately small. A 200 means both the Next.js
     // process and configured SQLite volume accepted a real query.

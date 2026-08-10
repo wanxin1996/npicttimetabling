@@ -4,6 +4,7 @@ import { createUnavailableWindow, deleteUnavailableWindow, listUnavailableWindow
 export const runtime = "nodejs";
 
 export function GET() {
+  // Return teacher and year blocked windows together for the shared rule screen.
   return Response.json(listUnavailableWindows());
 }
 
