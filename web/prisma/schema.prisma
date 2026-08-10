@@ -45,9 +45,10 @@ model Teacher {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
-  allocations TeachingAllocation[]
-  sections    CourseSection[]
-  unavailable TeacherUnavailableWindow[]
+  allocations        TeachingAllocation[]
+  sections           CourseSection[] @relation("AssignedSectionTeacher")
+  allocationSections CourseSection[] @relation("ImportedAllocationTeacher")
+  unavailable        TeacherUnavailableWindow[]
 
   @@index([staffType, isActive])
   @@map("teachers")
@@ -133,10 +134,12 @@ model CourseSection {
   id       String @id @default(uuid())
   sequence Int
 
-  courseId  String   @map("course_id")
-  teacherId String?  @map("teacher_id")
-  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
-  teacher   Teacher? @relation(fields: [teacherId], references: [id], onDelete: SetNull)
+  courseId            String   @map("course_id")
+  teacherId           String?  @map("teacher_id")
+  allocationTeacherId String?  @map("allocation_teacher_id")
+  course              Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  teacher             Teacher? @relation("AssignedSectionTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  allocationTeacher   Teacher? @relation("ImportedAllocationTeacher", fields: [allocationTeacherId], references: [id], onDelete: SetNull)
 
   studentGroups SectionStudentGroup[]
   lessons       ScheduledLesson[]

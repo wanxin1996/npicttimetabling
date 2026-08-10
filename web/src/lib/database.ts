@@ -162,7 +162,7 @@ export type CycleStatusRecord = {
 // 教师、教室等基础资料以及账号数据不会写入快照，因为开始新周期时必须继续保留它们。
 type CourseSnapshotRow = { id: string; code: string; catalog: string | null; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start?: number | null; week_end?: number | null; created_at: string; updated_at: string };
 type AllocationSnapshotRow = { id: string; course_id: string; teacher_id: string; assigned_group_count: number };
-type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null };
+type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null; allocation_teacher_id?: string | null };
 type SectionGroupSnapshotRow = { section_id: string; student_group_id: string };
 type LessonSnapshotRow = { id: string; section_id: string; occurrence: number; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; revision: number };
 type CycleSnapshot = { courses: CourseSnapshotRow[]; allocations: AllocationSnapshotRow[]; sections: SectionSnapshotRow[]; sectionGroups: SectionGroupSnapshotRow[]; lessons: LessonSnapshotRow[] };
@@ -475,6 +475,7 @@ function initializeTables(db: DatabaseInstance) {
       course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
       sequence INTEGER NOT NULL CHECK (sequence > 0),
       teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
+      allocation_teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
       UNIQUE(course_id, sequence)
     );
     CREATE TABLE IF NOT EXISTS section_student_groups (
@@ -566,6 +567,12 @@ function initializeTables(db: DatabaseInstance) {
   }
   if (!lessonColumns.some((column) => column.name === "revision")) {
     db.exec("ALTER TABLE scheduled_lessons ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+  }
+  const sectionColumns = db.prepare("PRAGMA table_info(course_sections)").all() as Array<{ name: string }>;
+  if (!sectionColumns.some((column) => column.name === "allocation_teacher_id")) {
+    // 旧数据库无法可靠判断某个教师来自 Excel 还是老师手工修改，因此新列保持 NULL，
+    // 把既有分配视为需要保护的手工资料；只有后续新导入生成的班次才由 Excel 自动维护。
+    db.exec("ALTER TABLE course_sections ADD COLUMN allocation_teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL");
   }
 }
 
@@ -901,7 +908,7 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
   return {
     courses: db.prepare("SELECT id, code, catalog, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at FROM courses ORDER BY id").all() as CourseSnapshotRow[],
     allocations: db.prepare("SELECT id, course_id, teacher_id, assigned_group_count FROM teaching_allocations ORDER BY id").all() as AllocationSnapshotRow[],
-    sections: db.prepare("SELECT id, course_id, sequence, teacher_id FROM course_sections ORDER BY id").all() as SectionSnapshotRow[],
+    sections: db.prepare("SELECT id, course_id, sequence, teacher_id, allocation_teacher_id FROM course_sections ORDER BY id").all() as SectionSnapshotRow[],
     sectionGroups: db.prepare("SELECT section_id, student_group_id FROM section_student_groups ORDER BY section_id, student_group_id").all() as SectionGroupSnapshotRow[],
     lessons: db.prepare("SELECT id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision FROM scheduled_lessons ORDER BY id").all() as LessonSnapshotRow[],
   };
@@ -975,8 +982,12 @@ export function restoreLastCycleBackup(): CycleStatusRecord {
     }
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
     for (const row of snapshot.allocations) insertAllocation.run(row.id, row.course_id, row.teacher_id, row.assigned_group_count);
-    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, ?)");
-    for (const row of snapshot.sections) insertSection.run(row.id, row.course_id, row.sequence, row.teacher_id);
+    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id, allocation_teacher_id) VALUES (?, ?, ?, ?, ?)");
+    for (const row of snapshot.sections) {
+      // 旧版紧急快照没有 Excel 来源教师字段；恢复时按受保护的手工分配处理，
+      // 防止下一次导入误把历史教师覆盖。
+      insertSection.run(row.id, row.course_id, row.sequence, row.teacher_id, row.allocation_teacher_id ?? null);
+    }
     const insertSectionGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const row of snapshot.sectionGroups) insertSectionGroup.run(row.section_id, row.student_group_id);
     const insertLesson = db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -1191,13 +1202,17 @@ export function updateCourseSection(id: string, teacherId: string | null, studen
   // 在一个事务中整体替换学生班级关联，使跨年级课程修改完成后，
   // 后续冲突检查立即读取到一致、完整的班级集合。
   const transaction = db.transaction(() => {
-    const section = db.prepare("SELECT id, course_id FROM course_sections WHERE id = ?").get(id) as { id: string; course_id: string } | undefined;
+    const section = db.prepare("SELECT id, course_id, teacher_id FROM course_sections WHERE id = ?").get(id) as { id: string; course_id: string; teacher_id: string | null } | undefined;
     if (!section) return null;
     if (teacherId) {
       const teacher = db.prepare("SELECT id FROM teachers WHERE id = ? AND is_active = 1").get(teacherId);
       if (!teacher) throw new Error("Teacher not found");
     }
-    db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(teacherId, id);
+    // 只有教师真的改变时才把它标记为手工覆盖；若老师只修改学生班级，
+    // 仍应允许以后 Excel 自动更新原本由导入器维护的任课教师。
+    if (teacherId !== section.teacher_id) {
+      db.prepare("UPDATE course_sections SET teacher_id = ?, allocation_teacher_id = NULL WHERE id = ?").run(teacherId, id);
+    }
     db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(id);
     const addGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const groupId of [...new Set(studentGroupIds)]) addGroup.run(id, groupId);
@@ -1658,7 +1673,7 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   // 确保重新计算的冲突始终与界面显示的卡片资料一致。
   const db = database();
   // 先读取课程班次和当前修订号；学生班级属于班次而非单次课程，所以后面还要同步更新同班次的其他每周课次。
-  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
+  const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, courses.code, sections.sequence, sections.teacher_id AS section_teacher_id, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; code: string; sequence: number; section_teacher_id: string | null; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
   if (!lesson) throw new Error("Scheduled lesson not found.");
   if (lesson.revision !== input.revision) throw new Error("This lesson was changed by another scheduler. Review the latest timetable and try again.");
   if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) throw new Error("Lessons must remain Monday to Friday between 08:00 and 18:00.");
@@ -1675,7 +1690,11 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
 
   // 教师、班级关联和当前课次位置必须在同一个事务中完成；任何一步失败都会整体回滚，不会留下只更新一半的排课资料。
   db.transaction(() => {
-    db.prepare("UPDATE course_sections SET teacher_id = ? WHERE id = ?").run(input.teacherId, lesson.section_id);
+    // 拖动课程也会把未改变的教师原样提交，所以只有教师 ID 真的变化时才清除 Excel 来源标记；
+    // 纯粹移动时间、改教室或改学生班级不能被误判成手工教师覆盖。
+    if (input.teacherId !== lesson.section_teacher_id) {
+      db.prepare("UPDATE course_sections SET teacher_id = ?, allocation_teacher_id = NULL WHERE id = ?").run(input.teacherId, lesson.section_id);
+    }
     db.prepare("DELETE FROM section_student_groups WHERE section_id = ?").run(lesson.section_id);
     const addStudentGroup = db.prepare("INSERT INTO section_student_groups (section_id, student_group_id) VALUES (?, ?)");
     for (const studentGroupId of studentGroupIds) addStudentGroup.run(lesson.section_id, studentGroupId);
@@ -1702,6 +1721,15 @@ export function removeScheduledLesson(id: string, revision: number) {
   const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
   if (removed) refreshAllScheduleWarnings(db);
   return removed;
+}
+
+export class TeachingAllocationImportConflictError extends Error {
+  // 这种错误表示工作簿格式正确，但当前手工资料或排课状态不允许安全套用变化。
+  // 独立类型让 API 返回 409，同时避免靠英文句子内容猜测错误类别。
+  constructor(message: string) {
+    super(message);
+    this.name = "TeachingAllocationImportConflictError";
+  }
 }
 
 export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
@@ -1757,35 +1785,75 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       courseIds.set(course.code, id);
     }
 
-    // 只重建本工作簿中出现的课程分配；老师因 Excel 遗漏而手动新增的其他课程会继续保留。
+    // 只更新本工作簿中出现的课程；老师因 Excel 遗漏而手动新增的其他课程会继续保留。
     const importedCourseIds = [...courseIds.values()];
     const findScheduledCourse = db.prepare(`SELECT 1 FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id WHERE sections.course_id = ? LIMIT 1`);
     for (const courseId of importedCourseIds) {
-      // 已开始排课后重新生成班次会级联删除时间表工作，因此此时拒绝自动重建，
-      // 要求老师改用手动更正，避免真实排课被意外清除。
-      if (findScheduledCourse.get(courseId)) throw new Error("Teaching allocation cannot be re-imported after one of its courses has been scheduled. Use the manual course and section corrections, or start a new cycle first.");
+      // 已开始排课后导入可能改变班次数和教师，因此仍然要求先进入新周期或手工修正，
+      // 避免工作簿在老师不知情时改变已经发布到总表的安排。
+      if (findScheduledCourse.get(courseId)) throw new TeachingAllocationImportConflictError("Teaching allocation cannot be re-imported after one of its courses has been scheduled. Use the manual course and section corrections, or start a new cycle first.");
     }
-    const deleteCourseSections = db.prepare("DELETE FROM course_sections WHERE course_id = ?");
+
+    // 工作簿中的 teaching_allocations 是最新的“期望数量”，可以整体替换；课程班次则包含
+    // 手工教师和学生班级，必须保留稳定 ID，并按 sequence 做差异化更新。
     const deleteCourseAllocations = db.prepare("DELETE FROM teaching_allocations WHERE course_id = ?");
-    for (const courseId of importedCourseIds) {
-      deleteCourseSections.run(courseId);
-      deleteCourseAllocations.run(courseId);
-    }
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
-    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, ?)");
-    const sequenceByCourse = new Map<string, number>();
+    for (const courseId of importedCourseIds) deleteCourseAllocations.run(courseId);
+
+    // 每门课程建立按 Excel 顺序展开的教师清单，例如 A 教 2 班、B 教 1 班会得到 [A, A, B]。
+    // 它只自动维护仍带 allocation_teacher_id 的班次；老师手工改过的班次来源标记已被清空。
+    const desiredTeachersByCourse = new Map<string, string[]>();
     for (const allocation of allocations.values()) {
       const courseId = courseIds.get(allocation.mod);
       const teacherId = teacherIds.get(allocation.lecturer);
       if (!courseId || !teacherId) continue;
       insertAllocation.run(crypto.randomUUID(), courseId, teacherId, allocation.groupCount);
-      // 每门课程的班次从 01 开始连续编号，例如 LEAD_01、LEAD_02，依此类推。
-      let sequence = sequenceByCourse.get(allocation.mod) ?? 0;
+      const desiredTeachers = desiredTeachersByCourse.get(courseId) ?? [];
       for (let group = 0; group < allocation.groupCount; group += 1) {
-        sequence += 1;
-        insertSection.run(crypto.randomUUID(), courseId, sequence, teacherId);
+        desiredTeachers.push(teacherId);
       }
-      sequenceByCourse.set(allocation.mod, sequence);
+      desiredTeachersByCourse.set(courseId, desiredTeachers);
+    }
+
+    const listExistingSections = db.prepare(`
+      SELECT sections.id, sections.sequence, sections.teacher_id, sections.allocation_teacher_id,
+        EXISTS(SELECT 1 FROM section_student_groups groups WHERE groups.section_id = sections.id) AS has_student_groups
+      FROM course_sections sections
+      WHERE sections.course_id = ?
+      ORDER BY sections.sequence ASC
+    `);
+    const updateImportedSection = db.prepare("UPDATE course_sections SET teacher_id = ?, allocation_teacher_id = ? WHERE id = ?");
+    const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id, allocation_teacher_id) VALUES (?, ?, ?, ?, ?)");
+    const deleteSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
+
+    for (const [courseCode, courseId] of [...courseIds.entries()]) {
+      const desiredTeachers = desiredTeachersByCourse.get(courseId) ?? [];
+      const existingSections = listExistingSections.all(courseId) as Array<{ id: string; sequence: number; teacher_id: string | null; allocation_teacher_id: string | null; has_student_groups: number }>;
+      const existingBySequence = new Map(existingSections.map((section) => [section.sequence, section]));
+
+      // 保留 01 至目标数量内的稳定班次 ID 和学生班级。只有由新版导入器建立、仍带 Excel 来源教师的班次才自动更新教师；
+      // 旧数据库和老师手工修改过的班次保持原样，差异会继续显示在 allocation variance 中供人工复核。
+      for (let sequence = 1; sequence <= desiredTeachers.length; sequence += 1) {
+        const desiredTeacherId = desiredTeachers[sequence - 1];
+        const existingSection = existingBySequence.get(sequence);
+        if (!existingSection) {
+          insertSection.run(crypto.randomUUID(), courseId, sequence, desiredTeacherId, desiredTeacherId);
+        } else if (existingSection.allocation_teacher_id !== null) {
+          updateImportedSection.run(desiredTeacherId, desiredTeacherId, existingSection.id);
+        }
+      }
+
+      // 课程数量减少时只处理目标范围以外的高编号班次。含学生班级或受保护教师的班次绝不删除，
+      // 老师必须先在 Sections 页面明确清空这些资料，避免一次上传静默毁掉手工作业。
+      const extraSections = existingSections.filter((section) => section.sequence > desiredTeachers.length).sort((left, right) => right.sequence - left.sequence);
+      for (const section of extraSections) {
+        const hasProtectedTeacher = section.teacher_id !== null && section.allocation_teacher_id === null;
+        if (section.has_student_groups || hasProtectedTeacher) {
+          const label = `${courseCode}_${String(section.sequence).padStart(2, "0")}`;
+          throw new TeachingAllocationImportConflictError(`Teaching allocation cannot reduce ${courseCode} because ${label} has a manually maintained teacher or student group. Clear that section first, then import again.`);
+        }
+        deleteSection.run(section.id);
+      }
     }
   });
   transaction();

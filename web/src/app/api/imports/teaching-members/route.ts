@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import * as XLSX from "xlsx";
-import { importTeachingMembers, type TeachingMembersImportRow } from "@/lib/database";
+import { importTeachingMembers, TeachingAllocationImportConflictError, type TeachingMembersImportRow } from "@/lib/database";
 
 // SheetJS 和本地 SQLite 驱动都依赖 Node.js，因此导入必须在服务器运行环境执行。
 export const runtime = "nodejs";
@@ -77,12 +77,14 @@ export async function POST(request: Request) {
 
     return NextResponse.json(importTeachingMembers(rows, ignoredZeroRows));
   } catch (error) {
-    // 详细技术信息保留在服务器控制台，浏览器只收到排课老师能够处理的安全说明。
-    // 已知的排课安全错误本身就是用户提示，因此保留原文，不要用笼统消息隐藏原因。
+    // 已知的资料保护冲突本身就是用户提示，因此保留原文并返回 409；
+    // 它属于正常业务结果，不写错误堆栈，避免重复导入时污染服务器日志。
+    if (error instanceof TeachingAllocationImportConflictError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
+    // 未预期的解析或数据库错误只记录在服务器；浏览器收到安全的通用说明，
+    // 不会暴露文件内容或 SQLite 内部细节。
     console.error("Teaching Members import failed", error);
-    const message = error instanceof Error && error.message.startsWith("Teaching allocation cannot be re-imported")
-      ? error.message
-      : "The file could not be read. Please use the Teaching Members export format.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return NextResponse.json({ error: "The file could not be read. Please use the Teaching Members export format." }, { status: 400 });
   }
 }
