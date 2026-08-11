@@ -1456,18 +1456,65 @@ export class AppUserUniqueConflictError extends Error {
   }
 }
 
-export function changeOwnPassword(userId: string, currentPassword: string, newPassword: string) {
+export class PasswordChangedError extends Error {
+  readonly code = "PASSWORD_CHANGED";
+
+  // 请求进入路由时会话仍有效，但在密码读取或真正保存前，另一项管理员操作
+  // 已经撤销会话、替换密码或停用账号。专门类型让 API 返回可恢复的 409，
+  // 而不是误称旧密码错误，或把正常并发冲突伪装成服务器 500。
+  constructor() {
+    super("Your password or account access changed while this request was being processed. Sign in again before changing your password.");
+    this.name = "PasswordChangedError";
+  }
+}
+
+export function changeOwnPassword(userId: string, sessionToken: string, currentPassword: string, newPassword: string) {
   // 已登录用户修改密码前必须再次证明当前密码正确。更新哈希后撤销该账号的全部会话，
   // 确保旧密码或遗留浏览器不能继续访问。
-  const db = database();
-  const user = db.prepare("SELECT password_hash FROM app_users WHERE id = ? AND is_active = 1").get(userId) as { password_hash: string } | undefined;
-  if (!user || !passwordMatches(currentPassword, user.password_hash)) return false;
-  // 密码修改会撤销该账号所有现有登录，包括用户可能已经忘记的其他浏览器。
-  db.transaction(() => {
-    db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ?").run(hashPassword(newPassword), userId);
-    db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
-  })();
-  return true;
+  try {
+    const db = database();
+    const requestSessionHash = sessionHash(sessionToken);
+    // 路由验证会话与这里读取账号之间仍可能夹入管理员 reset／deactivate。首读必须再次
+    // 绑定同一原始 Cookie，而不能只按 userId 找账号；否则已撤销请求会被误报成普通400，
+    // 页面也不会按 PASSWORD_CHANGED 清掉上一账号的缓存资料。
+    const user = db.prepare(`/* timetabling:own-password-pre-read */
+      SELECT users.password_hash
+      FROM app_users users
+      JOIN auth_sessions sessions ON sessions.user_id = users.id
+      WHERE users.id = ? AND users.is_active = 1
+        AND sessions.token_hash = ? AND sessions.expires_at > ?`)
+      .get(userId, requestSessionHash, new Date().toISOString()) as { password_hash: string } | undefined;
+    if (!user) throw new PasswordChangedError();
+    // 只有账号与原始会话仍有效时，密码不匹配才是真正可由用户修正的 400。
+    if (!passwordMatches(currentPassword, user.password_hash)) return false;
+
+    // 两次 Scrypt（上面的旧密码验证和这里的新哈希生成）都刻意放在写锁外。
+    // 密码计算本来就昂贵，不能在这段时间阻止其他老师保存课表或管理员撤销账号。
+    const newPasswordHash = hashPassword(newPassword);
+    const savePassword = db.transaction(() => {
+      // 旧哈希、Active 状态和发起请求的原始服务端会话共同组成 compare-and-swap。
+      // 会话条件很重要：管理员可能在 Scrypt 期间停用后再启用账号，或完整恢复恰好
+      // 放回相同哈希；此时仅检查哈希和 Active 会让已经被撤销的在途请求重新生效。
+      const changed = db.prepare(`UPDATE app_users SET password_hash = ?
+        WHERE id = ? AND is_active = 1 AND password_hash = ?
+          AND EXISTS (
+            SELECT 1 FROM auth_sessions
+            WHERE token_hash = ? AND user_id = app_users.id AND expires_at > ?
+          )`)
+        .run(newPasswordHash, userId, user.password_hash, requestSessionHash, new Date().toISOString()).changes;
+      if (changed !== 1) throw new PasswordChangedError();
+
+      // 只有 CAS 成功才撤销全部会话；DELETE 与哈希更新同属一个事务，任一步失败
+      // 都会完整回滚，不会留下“密码已变但旧浏览器仍登录”或相反的半完成状态。
+      db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    });
+    savePassword.immediate();
+    return true;
+  } catch (error) {
+    if (error instanceof PasswordChangedError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function setAppUserStatus(userId: string, isActive: boolean) {
@@ -1484,12 +1531,21 @@ export function setAppUserStatus(userId: string, isActive: boolean) {
 export function resetAppUserPassword(userId: string, newPassword: string) {
   // 管理员重置密码时会替换已存哈希，并让该账号在所有浏览器中退出登录，
   // 账号持有人必须使用新密码重新验证身份。
-  const db = database();
-  return db.transaction(() => {
-    const changed = db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ? AND is_admin = 0").run(hashPassword(newPassword), userId).changes > 0;
-    if (changed) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
-    return changed;
-  })();
+  try {
+    const db = database();
+    // Scrypt 在取得 IMMEDIATE 写锁前完成；管理员生成临时密码时不应长时间占住
+    // 整个 SQLite writer。之后更新哈希与撤销会话仍保持一个原子事务。
+    const newPasswordHash = hashPassword(newPassword);
+    const resetPassword = db.transaction(() => {
+      const changed = db.prepare("UPDATE app_users SET password_hash = ? WHERE id = ? AND is_admin = 0").run(newPasswordHash, userId).changes > 0;
+      if (changed) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+      return changed;
+    });
+    return resetPassword.immediate();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function listTeachers(): TeacherRecord[] {

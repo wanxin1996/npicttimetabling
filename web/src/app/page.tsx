@@ -2009,8 +2009,16 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     try {
       const response = await fetch("/api/auth/password", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currentPassword: String(data.get("currentPassword") ?? ""), newPassword: String(data.get("newPassword") ?? "") }) });
-      const body = await response.json().catch(() => ({})) as { error?: string };
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
+        // 401 表示会话已在请求到达前失效；PASSWORD_CHANGED 则表示旧密码校验后
+        // 管理员重置／停用先提交。两者都不能继续展示上一账号缓存的课表和 Accounts 资料。
+        if (response.status === 401 || (response.status === 409 && body.code === "PASSWORD_CHANGED")) {
+          clearSessionBoundWorkspace();
+          setAuthScreen("login");
+          setNotice(body.error ?? "Your account access changed. Sign in again before changing your password.", "error");
+          return;
+        }
         setNotice(body.error ?? "Password could not be changed.", "error");
         return;
       }

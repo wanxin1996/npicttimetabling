@@ -252,6 +252,15 @@ function readBusinessSnapshot() {
   return readBusinessSnapshotFrom(testDatabasePath);
 }
 
+function readPasswordAccountState(accountId) {
+  // 密码回归不能只看 HTTP 状态：哈希更新和会话撤销必须一起提交或一起回滚。
+  // 每次通过独立短连接取得账号与全部会话，避免复用或改变正式应用连接的事务状态。
+  return executeTestDatabase((db) => ({
+    account: db.prepare("SELECT password_hash, is_active FROM app_users WHERE id = ?").get(accountId),
+    sessions: db.prepare("SELECT * FROM auth_sessions WHERE user_id = ? ORDER BY token_hash").all(accountId),
+  }));
+}
+
 function fullRestoreForm(contents, filename, expectedCurrentToken) {
   // 所有完整恢复回归都走真实 multipart、双确认和精确短语，不能绕过 Route Handler。
   const form = new FormData();
@@ -538,6 +547,138 @@ async function verifyPostSetupRestartWithoutToken(databasePath) {
   sessionCookie = (login.response.headers.get("set-cookie") || "").split(";", 1)[0];
   assert(sessionCookie.includes("="));
   report("首位管理员建立后移除一次性 setup token，重启仍保持 health 与登录可用");
+}
+
+async function verifyOwnPasswordLifecycleAndFailures() {
+  // 使用普通 scheduler 而不是全局管理员验证自改密码，避免成功案例撤销后续回归
+  // 仍要使用的管理员 Cookie。两个独立登录会话还能证明成功修改会撤销所有浏览器。
+  const username = "password-cas-scheduler";
+  const originalPassword = "PasswordCasOriginal123!";
+  const changedPassword = "PasswordCasChanged456!";
+  const account = (await requestApi("/api/auth/accounts", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { username, password: originalPassword },
+  })).body;
+
+  async function loginPasswordAccount(password, expectedStatus = 200) {
+    const result = await requestApi("/api/auth/login", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus,
+      json: { username, password },
+    });
+    const cookie = result.response.status === 200
+      ? (result.response.headers.get("set-cookie") || "").split(";", 1)[0]
+      : "";
+    if (result.response.status === 200) assert(cookie.includes("="), "Password-test login did not return a usable Cookie.");
+    return { ...result, cookie };
+  }
+
+  const firstLogin = await loginPasswordAccount(originalPassword);
+  const secondLogin = await loginPasswordAccount(originalPassword);
+  assert.notEqual(firstLogin.cookie, secondLogin.cookie);
+  const initialState = readPasswordAccountState(account.id);
+  assert.equal(initialState.account.is_active, 1);
+  assert.equal(initialState.sessions.length, 2);
+
+  // 新密码边界和错误旧密码都属于可修正的 400；它们不能重写哈希、撤销 Cookie，
+  // 或因为输入错误触发通用 500。
+  const invalidLength = await requestApi("/api/auth/password", {
+    method: "PATCH",
+    cookie: firstLogin.cookie,
+    expectedStatus: 400,
+    json: { currentPassword: originalPassword, newPassword: "too-short" },
+  });
+  assert.deepEqual(invalidLength.body, { error: "Password must use 10 to 256 characters." });
+  assert.equal(invalidLength.response.headers.get("set-cookie"), null);
+  assert.deepEqual(readPasswordAccountState(account.id), initialState);
+
+  const incorrectCurrent = await requestApi("/api/auth/password", {
+    method: "PATCH",
+    cookie: firstLogin.cookie,
+    expectedStatus: 400,
+    json: { currentPassword: "IncorrectCurrent123!", newPassword: changedPassword },
+  });
+  assert.deepEqual(incorrectCurrent.body, { error: "Current password is incorrect." });
+  assert.equal(incorrectCurrent.response.headers.get("set-cookie"), null);
+  assert.deepEqual(readPasswordAccountState(account.id), initialState);
+
+  // 故障 trigger 在 CAS UPDATE 已经成功后、撤销第一条会话时抛出带敏感哨兵的错误。
+  // 500 必须使用固定安全文字，事务则要把新哈希和任何会话删除完整回滚。
+  executeTestDatabase((db) => {
+    const accountIdLiteral = db.prepare("SELECT quote(?) AS value").get(account.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_own_password_session_revoke
+      BEFORE DELETE ON auth_sessions WHEN OLD.user_id = ${accountIdLiteral}
+      BEGIN SELECT RAISE(ABORT, 'SECRET auth_sessions SQL /private/tmp/password.sqlite'); END;`);
+  });
+  let internalFailure;
+  try {
+    internalFailure = await requestApi("/api/auth/password", {
+      method: "PATCH",
+      cookie: firstLogin.cookie,
+      expectedStatus: 500,
+      json: { currentPassword: originalPassword, newPassword: changedPassword },
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_own_password_session_revoke"));
+  }
+  assert.deepEqual(internalFailure.body, { error: "The password could not be changed. Try again." });
+  assert.equal(internalFailure.response.headers.get("set-cookie"), null);
+  assert(!/secret|auth_sessions|sqlite|sql|\/private\/tmp|trigger|stack/i.test(JSON.stringify(internalFailure.body)));
+  assert.deepEqual(readPasswordAccountState(account.id), initialState);
+
+  // RESERVED writer 不阻止 proxy 和旧密码 SELECT，但会让目标 BEGIN IMMEDIATE 在
+  // 真实五秒 busy timeout 后失败，因而确定性证明 503 来自密码写入路径而非认证代理。
+  const blocker = new Database(testDatabasePath);
+  let holdsWriteLock = false;
+  let busyFailure;
+  try {
+    assert.equal(blocker.pragma("journal_mode", { simple: true }), "delete");
+    blocker.exec("BEGIN IMMEDIATE");
+    holdsWriteLock = true;
+    const startedAt = Date.now();
+    busyFailure = await requestApi("/api/auth/password", {
+      method: "PATCH",
+      cookie: firstLogin.cookie,
+      expectedStatus: 503,
+      json: { currentPassword: originalPassword, newPassword: changedPassword },
+    });
+    const waitedMilliseconds = Date.now() - startedAt;
+    assert(waitedMilliseconds >= 4_000 && waitedMilliseconds < 15_000,
+      `Own-password BUSY response used an unexpected wait of ${waitedMilliseconds} ms.`);
+  } finally {
+    if (holdsWriteLock && blocker.inTransaction) blocker.exec("ROLLBACK");
+    blocker.close();
+  }
+  assert.deepEqual(busyFailure.body, { error: "Another scheduler is updating timetable data. Try again in a moment." });
+  assert.equal(busyFailure.response.headers.get("retry-after"), "1");
+  assert.equal(busyFailure.response.headers.get("set-cookie"), null);
+  assert.deepEqual(readPasswordAccountState(account.id), initialState);
+
+  // 成功路径必须让随机盐产生不同哈希、原子删除两个旧会话并让响应 Cookie 过期。
+  const changed = await requestApi("/api/auth/password", {
+    method: "PATCH",
+    cookie: firstLogin.cookie,
+    json: { currentPassword: originalPassword, newPassword: changedPassword },
+  });
+  assert.deepEqual(changed.body, { ok: true });
+  const clearedCookie = changed.response.headers.get("set-cookie") || "";
+  assert.match(clearedCookie, /timetable_session=;/i);
+  assert.match(clearedCookie, /expires=Thu, 01 Jan 1970 00:00:00 GMT/i);
+  const changedState = readPasswordAccountState(account.id);
+  assert.notEqual(changedState.account.password_hash, initialState.account.password_hash);
+  assert.equal(changedState.account.is_active, 1);
+  assert.deepEqual(changedState.sessions, []);
+
+  const staleStatus = await requestApi("/api/auth/status", { cookie: secondLogin.cookie });
+  assert.equal(staleStatus.body.user, null);
+  await requestApi("/api/teachers", { cookie: secondLogin.cookie, expectedStatus: 401 });
+  const oldLogin = await loginPasswordAccount(originalPassword, 401);
+  assert.deepEqual(oldLogin.body, { error: "Username or password is incorrect." });
+  const newLogin = await loginPasswordAccount(changedPassword);
+  await requestApi("/api/auth/logout", { method: "POST", cookie: newLogin.cookie });
+  report("自改密码 400／500／BUSY 503 原子回滚及成功后的全会话撤销");
 }
 
 async function verifyWorkbookBoundaries() {
@@ -3452,6 +3593,7 @@ async function run() {
   await startServer(databasePath);
   await verifyAuthentication();
   await verifyPostSetupRestartWithoutToken(databasePath);
+  await verifyOwnPasswordLifecycleAndFailures();
   await verifyWorkbookBoundaries();
   await verifyTeachingGroupCountBoundaries();
   await verifyTeachingExplicitZeroAndNoOp();

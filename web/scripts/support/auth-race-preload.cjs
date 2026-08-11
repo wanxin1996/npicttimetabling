@@ -50,6 +50,7 @@ const dataWorkspaceTeachersSqlMarker = "/* timetabling:data-workspace-teachers *
 const dataWorkspaceImportSqlMarker = "/* timetabling:data-workspace-import-write */";
 const courseWorkspaceSectionsSqlMarker = "/* timetabling:course-workspace-sections */";
 const courseWorkspaceSectionWriteSqlMarker = "/* timetabling:course-workspace-section-write */";
+const ownPasswordPreReadSqlMarker = "/* timetabling:own-password-pre-read */";
 const databaseInitializationSqlMarker = "/* timetabling:database-initialization */";
 let pendingInitializationClose;
 
@@ -341,6 +342,35 @@ function consumeCandidateEntryArm(sectionId) {
   }
 }
 
+function consumeOwnPasswordPreReadArm(accountId) {
+  // 目标请求已经通过 proxy 与 route 的会话校验，但 production 的首条密码查询尚未执行。
+  // 在真实 `.get()` 前暂停，主测试便能确定性让另一进程先 reset／deactivate 并提交。
+  const preReadArmFile = path.join(controlDirectory, `own-password-pre-read-arm-${processLabel}.json`);
+  try {
+    const control = JSON.parse(fs.readFileSync(preReadArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.accountId !== accountId) return;
+    if (typeof control.accountId !== "string" || control.accountId.length === 0) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+
+    // 同目录 rename 原子地证明正确账号已到达首读前；release 内容仍须精确匹配 nonce。
+    const readyFile = path.join(
+      controlDirectory,
+      `own-password-pre-read-ready-${processLabel}-${control.nonce}.json`,
+    );
+    fs.renameSync(preReadArmFile, readyFile);
+    const releaseFile = path.join(
+      controlDirectory,
+      `own-password-pre-read-release-${processLabel}-${control.nonce}.txt`,
+    );
+    waitForRaceRelease(releaseFile, control.nonce, "own-password pre-read");
+  } catch (error) {
+    // 没有 arm 的普通密码修改完全透明；损坏或不一致的测试控制资料必须显式失败。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
 function consumeCandidateRoomUpdateArm(roomId, changes) {
   // B 的真实 UPDATE 已经在 IMMEDIATE 事务内改到目标教室后才建立 ready。
   // 主测试还会等待 HTTP 200，分别证明 UPDATE 已发生和整笔事务已经成功 COMMIT。
@@ -404,8 +434,8 @@ function patchBetterSqlite3(Database) {
     return result;
   };
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装带显式 production marker 的目标语句：Candidate、Year workspace 与两套
-    // 管理聚合的读写屏障。其余 SQL 保持透明，普通生产构建也不会加载本 preload。
+    // 只包装带显式 production marker 的目标语句：Candidate、Year workspace、两套
+    // 管理聚合与自改密码首读。其余 SQL 保持透明，普通生产构建也不会加载本 preload。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;
@@ -414,6 +444,14 @@ function patchBetterSqlite3(Database) {
       statement.get = function candidateEntryAwareGet(...getArguments) {
         // 屏障在真实 `.get()` 之前触发，此时 DEFERRED 尚未取得 SHARED 读锁。
         consumeCandidateEntryArm(getArguments[0]);
+        return Reflect.apply(originalGet, this, getArguments);
+      };
+    }
+    if (sql.includes(ownPasswordPreReadSqlMarker)) {
+      const originalGet = statement.get;
+      statement.get = function ownPasswordPreReadAwareGet(...getArguments) {
+        // accountId 是 production 查询第一个参数；屏障发生在 SQLite 真正取得读快照前。
+        consumeOwnPasswordPreReadArm(getArguments[0]);
         return Reflect.apply(originalGet, this, getArguments);
       };
     }

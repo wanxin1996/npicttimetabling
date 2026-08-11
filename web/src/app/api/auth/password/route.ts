@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { clearSessionCookie, sessionToken } from "@/lib/auth";
-import { changeOwnPassword, validateSession } from "@/lib/database";
+import { changeOwnPassword, PasswordChangedError, validateSession } from "@/lib/database";
 import { passwordHasValidLength, PASSWORD_MAX_LENGTH } from "@/lib/auth-input";
 import { safeDatabaseFailureResponse } from "@/lib/database-response";
 import { readJsonObject } from "@/lib/request-json";
@@ -21,11 +21,18 @@ export async function PATCH(request: NextRequest) {
       || typeof body.newPassword !== "string" || !passwordHasValidLength(body.newPassword)) {
       return NextResponse.json({ error: "Password must use 10 to 256 characters." }, { status: 400 });
     }
-    if (!changeOwnPassword(user.id, body.currentPassword, body.newPassword)) return NextResponse.json({ error: "Current password is incorrect." }, { status: 400 });
+    if (!changeOwnPassword(user.id, token, body.currentPassword, body.newPassword)) return NextResponse.json({ error: "Current password is incorrect." }, { status: 400 });
     const response = NextResponse.json({ ok: true });
     clearSessionCookie(response);
     return response;
   } catch (error) {
+    if (error instanceof PasswordChangedError) {
+      // 另一项密码重置／停用已经撤销了这个浏览器的服务端会话。
+      // 409 让页面区分正常并发冲突；同时清 Cookie，避免浏览器继续携带失效令牌。
+      const response = NextResponse.json({ code: error.code, error: error.message }, { status: 409 });
+      clearSessionCookie(response);
+      return response;
+    }
     return safeDatabaseFailureResponse(error, "Own password change failed", "The password could not be changed. Try again.");
   }
 }

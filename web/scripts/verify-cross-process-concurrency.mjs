@@ -1926,11 +1926,12 @@ async function verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture) {
 }
 
 async function waitForAuthRaceReady(server, readyFile, expectedControl) {
-  // ready 文件只会在 B 已经用真实 Scrypt 和 timingSafeEqual 验证旧密码后建立。
+  // ready 文件只会在目标 standalone 已经用真实 Scrypt 和 timingSafeEqual
+  // 验证旧密码后建立；登录与自改密码可以共用同一个确定性停点。
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (server.child.exitCode !== null || server.child.signalCode !== null) {
-      throw new Error("Server B exited before reaching the authentication race barrier.");
+      throw new Error(`Server ${server.label} exited before reaching the authentication race barrier.`);
     }
     try {
       await access(readyFile);
@@ -1953,6 +1954,52 @@ function storedPasswordFingerprint(accountId) {
   return createHash("sha256").update(Buffer.from(expectedHex, "hex")).digest("hex");
 }
 
+async function armPasswordVerificationRace(server, accountId) {
+  // Preload 只接受当前临时数据库里真实存储的 64-byte Scrypt 摘要指纹。
+  // 每轮使用新的 nonce，并先完整写临时文件再原子 rename，目标进程不会读到半份控制资料。
+  const nonce = randomBytes(16).toString("hex");
+  const control = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: server.label,
+    nonce,
+    expectedFingerprint: storedPasswordFingerprint(accountId),
+  };
+  const files = {
+    arm: path.join(authRaceControlDirectory, "arm.json"),
+    temporaryArm: path.join(authRaceControlDirectory, `arm-${nonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `ready-${nonce}.json`),
+    release: path.join(authRaceControlDirectory, `release-${nonce}.txt`),
+  };
+  await writeFile(files.temporaryArm, JSON.stringify(control), { flag: "wx", mode: 0o600 });
+  await rename(files.temporaryArm, files.arm);
+  activeRaceReleases.set(files.release, nonce);
+  return { control, files };
+}
+
+async function armOwnPasswordPreReadRace(server, accountId) {
+  // 这一屏障与 timingSafeEqual 屏障分开命名：它证明请求已通过 proxy 和 route，
+  // 但 production 首条“账号 + 原始会话”查询还没有真正 `.get()`，不会靠固定 sleep 猜时序。
+  const nonce = randomBytes(16).toString("hex");
+  const control = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: server.label,
+    nonce,
+    accountId,
+  };
+  const files = {
+    arm: path.join(authRaceControlDirectory, `own-password-pre-read-arm-${server.label}.json`),
+    temporaryArm: path.join(authRaceControlDirectory, `own-password-pre-read-arm-${server.label}-${nonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `own-password-pre-read-ready-${server.label}-${nonce}.json`),
+    release: path.join(authRaceControlDirectory, `own-password-pre-read-release-${server.label}-${nonce}.txt`),
+  };
+  await writeFile(files.temporaryArm, JSON.stringify(control), { flag: "wx", mode: 0o600 });
+  await rename(files.temporaryArm, files.arm);
+  activeRaceReleases.set(files.release, nonce);
+  return { control, files };
+}
+
 async function releaseRaceBarrier(releaseFile, nonce) {
   // release 内容必须精确等于本次 nonce；EEXIST 表示正常路径已经释放，不应追加第二份内容。
   try {
@@ -1970,22 +2017,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
     accountId,
   );
   assert.equal(accountBeforeAction.is_active, 1);
-  const nonce = randomBytes(16).toString("hex");
-  const expectedControl = {
-    version: 1,
-    runToken: authRaceRunToken,
-    label: "B",
-    nonce,
-    expectedFingerprint: storedPasswordFingerprint(accountId),
-  };
-  const armFile = path.join(authRaceControlDirectory, "arm.json");
-  const temporaryArmFile = path.join(authRaceControlDirectory, `arm-${nonce}.tmp`);
-  const readyFile = path.join(authRaceControlDirectory, `ready-${nonce}.json`);
-  const releaseFile = path.join(authRaceControlDirectory, `release-${nonce}.txt`);
-  activeRaceReleases.set(releaseFile, nonce);
-  // 先完整写好临时文件再原子改名，B 不会读到半截 JSON。
-  await writeFile(temporaryArmFile, JSON.stringify(expectedControl), { flag: "wx", mode: 0o600 });
-  await rename(temporaryArmFile, armFile);
+  const barrier = await armPasswordVerificationRace(serverB, accountId);
 
   // B 开始登录后会在旧密码已经确认正确、但 IMMEDIATE 会话事务尚未开始时暂停。
   // A 必须先完成 reset/deactivate，主测试才写 release 让 B 继续。
@@ -1996,7 +2028,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
     () => { loginSettled = true; },
   );
   try {
-    await waitForAuthRaceReady(serverB, readyFile, expectedControl);
+    await waitForAuthRaceReady(serverB, barrier.files.ready, barrier.control);
     assert.equal(loginSettled, false, `${description} login completed before the administrator action.`);
     await requestApi(serverA, "/api/auth/accounts", {
       method: "PATCH",
@@ -2019,7 +2051,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
       readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
       0,
     );
-    await releaseRaceBarrier(releaseFile, nonce);
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce);
     const rejectedLogin = await pendingLogin;
     assert.deepEqual(rejectedLogin.body, { error: "Username or password is incorrect." });
     assert.equal(rejectedLogin.response.headers.get("set-cookie"), null);
@@ -2029,9 +2061,9 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
     );
   } finally {
     // 任一断言失败也必须释放 B；否则同步 preload 会一直等到自己的超时上限。
-    await releaseRaceBarrier(releaseFile, nonce).catch(() => undefined);
-    activeRaceReleases.delete(releaseFile);
-    await rm(armFile, { force: true }).catch(() => undefined);
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce).catch(() => undefined);
+    activeRaceReleases.delete(barrier.files.release);
+    await rm(barrier.files.arm, { force: true }).catch(() => undefined);
     await pendingLogin.catch(() => undefined);
   }
 
@@ -2039,6 +2071,260 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
   const sequentialOldLogin = await login(serverB, username, oldPassword, 401);
   assert.deepEqual(sequentialOldLogin.body, { error: "Username or password is incorrect." });
   assert.equal(sequentialOldLogin.response.headers.get("set-cookie"), null);
+  report(description);
+}
+
+async function verifyOwnPasswordRevocationRace(serverA, serverB, options) {
+  const { username, oldPassword, proposedPassword, accountId, administratorAction, description } = options;
+  const accountBeforeAction = readDatabaseValue(
+    "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+    accountId,
+  );
+  assert.equal(accountBeforeAction.is_active, 1);
+
+  // 必须先登录取得自改请求 Cookie，再建立 timingSafeEqual arm；反过来会让这次登录
+  // 自己消费屏障，测试便没有停在真正的 `/api/auth/password` 旧密码验证之后。
+  const schedulerLogin = await login(serverB, username, oldPassword);
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    1,
+  );
+  const barrier = await armPasswordVerificationRace(serverB, accountId);
+
+  let passwordChangeSettled = false;
+  const pendingPasswordChange = requestApi(serverB, "/api/auth/password", {
+    method: "PATCH",
+    cookie: schedulerLogin.cookie,
+    expectedStatus: 409,
+    json: { currentPassword: oldPassword, newPassword: proposedPassword },
+  });
+  pendingPasswordChange.then(
+    () => { passwordChangeSettled = true; },
+    () => { passwordChangeSettled = true; },
+  );
+
+  let administratorWinningState;
+  try {
+    await waitForAuthRaceReady(serverB, barrier.files.ready, barrier.control);
+    assert.equal(passwordChangeSettled, false, `${description} completed before the administrator action.`);
+
+    await requestApi(serverA, "/api/auth/accounts", {
+      method: "PATCH",
+      cookie: administratorCookie,
+      json: { userId: accountId, ...administratorAction },
+    });
+    const revokedState = readDatabaseValue(
+      "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+      accountId,
+    );
+    if (administratorAction.action === "resetPassword") {
+      assert.notEqual(revokedState.password_hash, accountBeforeAction.password_hash);
+      assert.equal(revokedState.is_active, 1);
+    } else {
+      assert.equal(revokedState.password_hash, accountBeforeAction.password_hash);
+      assert.equal(revokedState.is_active, 0);
+    }
+    assert.equal(
+      readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+      0,
+    );
+
+    if (administratorAction.action === "status") {
+      // 在放行旧请求前立即重新启用，专门防止只检查 `active + old hash` 的假修复。
+      // 账号表面资料已经恢复原值，但被管理员删除的原始会话绝不能随之复活。
+      await requestApi(serverA, "/api/auth/accounts", {
+        method: "PATCH",
+        cookie: administratorCookie,
+        json: { userId: accountId, action: "status", isActive: true },
+      });
+    }
+    administratorWinningState = readDatabaseValue(
+      "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+      accountId,
+    );
+    assert.equal(administratorWinningState.is_active, 1);
+    assert.equal(
+      readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+      0,
+    );
+
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce);
+    const conflict = await pendingPasswordChange;
+    assert.deepEqual(conflict.body, {
+      code: "PASSWORD_CHANGED",
+      error: "Your password or account access changed while this request was being processed. Sign in again before changing your password.",
+    });
+    const clearedCookie = conflict.response.headers.get("set-cookie") || "";
+    assert.match(clearedCookie, /timetable_session=;/i);
+    assert.match(clearedCookie, /expires=Thu, 01 Jan 1970 00:00:00 GMT/i);
+  } finally {
+    // 主断言失败也先释放同步等待并收集 HTTP Promise，避免把 B 或共享 SQLite 锁留给下一组。
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce).catch(() => undefined);
+    activeRaceReleases.delete(barrier.files.release);
+    await rm(barrier.files.arm, { force: true }).catch(() => undefined);
+    await pendingPasswordChange.catch(() => undefined);
+  }
+
+  assert.deepEqual(
+    readDatabaseValue("SELECT password_hash, is_active FROM app_users WHERE id = ?", accountId),
+    administratorWinningState,
+  );
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    0,
+  );
+
+  // 自改请求提议的密码绝不能生效。Reset 组只接受管理员新密码；停用再启用组
+  // 则继续接受原密码，直接证明失效会话没有趁 Active 恢复后改写账号。
+  const proposedLogin = await login(serverB, username, proposedPassword, 401);
+  assert.deepEqual(proposedLogin.body, { error: "Username or password is incorrect." });
+  if (administratorAction.action === "resetPassword") {
+    const oldLogin = await login(serverB, username, oldPassword, 401);
+    assert.deepEqual(oldLogin.body, { error: "Username or password is incorrect." });
+    const winningLogin = await login(serverB, username, administratorAction.password);
+    await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: winningLogin.cookie });
+  } else {
+    const winningLogin = await login(serverB, username, oldPassword);
+    await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: winningLogin.cookie });
+  }
+  const finalAccountState = readDatabaseValue(
+    "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+    accountId,
+  );
+  if (administratorAction.action === "resetPassword") {
+    assert.deepEqual(finalAccountState, administratorWinningState);
+  } else {
+    assert.deepEqual(finalAccountState, { password_hash: accountBeforeAction.password_hash, is_active: 1 });
+  }
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    0,
+  );
+  report(description);
+}
+
+async function verifyOwnPasswordPreReadRevocationRace(serverA, serverB, options) {
+  const { username, oldPassword, proposedPassword, accountId, administratorAction, description } = options;
+  const accountBeforeAction = readDatabaseValue(
+    "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+    accountId,
+  );
+  assert.equal(accountBeforeAction.is_active, 1);
+
+  // 和旧密码校验后竞态一样，必须先取得 Cookie 再 arm；本轮 arm 只允许带 marker 的
+  // 首条密码 SELECT 消费，普通 login 和 route 的 validateSession 查询都不会碰到它。
+  const schedulerLogin = await login(serverB, username, oldPassword);
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    1,
+  );
+  const barrier = await armOwnPasswordPreReadRace(serverB, accountId);
+
+  let passwordChangeSettled = false;
+  const pendingPasswordChange = requestApi(serverB, "/api/auth/password", {
+    method: "PATCH",
+    cookie: schedulerLogin.cookie,
+    expectedStatus: 409,
+    json: { currentPassword: oldPassword, newPassword: proposedPassword },
+  });
+  pendingPasswordChange.then(
+    () => { passwordChangeSettled = true; },
+    () => { passwordChangeSettled = true; },
+  );
+
+  let administratorWinningState;
+  try {
+    await waitForRaceReady(
+      serverB,
+      barrier.files.ready,
+      barrier.control,
+      () => passwordChangeSettled,
+      description,
+      "the own-password pre-read marker",
+    );
+
+    // A 必须在 B 的真实 `.get()` 前完成提交；之后 B 首读看不到原始有效会话，
+    // 应直接抛 PASSWORD_CHANGED，绝不能继续 Scrypt 后误报 Current password 400。
+    await requestApi(serverA, "/api/auth/accounts", {
+      method: "PATCH",
+      cookie: administratorCookie,
+      json: { userId: accountId, ...administratorAction },
+    });
+    administratorWinningState = readDatabaseValue(
+      "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+      accountId,
+    );
+    if (administratorAction.action === "resetPassword") {
+      assert.notEqual(administratorWinningState.password_hash, accountBeforeAction.password_hash);
+      assert.equal(administratorWinningState.is_active, 1);
+    } else {
+      assert.equal(administratorWinningState.password_hash, accountBeforeAction.password_hash);
+      assert.equal(administratorWinningState.is_active, 0);
+    }
+    assert.equal(
+      readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+      0,
+    );
+
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce);
+    const conflict = await pendingPasswordChange;
+    assert.deepEqual(conflict.body, {
+      code: "PASSWORD_CHANGED",
+      error: "Your password or account access changed while this request was being processed. Sign in again before changing your password.",
+    });
+    const clearedCookie = conflict.response.headers.get("set-cookie") || "";
+    assert.match(clearedCookie, /timetable_session=;/i);
+    assert.match(clearedCookie, /expires=Thu, 01 Jan 1970 00:00:00 GMT/i);
+  } finally {
+    // 即使断言失败，也必须释放同步 `.get()` 并等待 HTTP 收口，再交给下一组复用 B。
+    await releaseRaceBarrier(barrier.files.release, barrier.control.nonce).catch(() => undefined);
+    activeRaceReleases.delete(barrier.files.release);
+    await rm(barrier.files.arm, { force: true }).catch(() => undefined);
+    await pendingPasswordChange.catch(() => undefined);
+  }
+
+  assert.deepEqual(
+    readDatabaseValue("SELECT password_hash, is_active FROM app_users WHERE id = ?", accountId),
+    administratorWinningState,
+  );
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    0,
+  );
+
+  if (administratorAction.action === "resetPassword") {
+    const proposedLogin = await login(serverB, username, proposedPassword, 401);
+    assert.deepEqual(proposedLogin.body, { error: "Username or password is incorrect." });
+    const oldLogin = await login(serverB, username, oldPassword, 401);
+    assert.deepEqual(oldLogin.body, { error: "Username or password is incorrect." });
+    const winningLogin = await login(serverB, username, administratorAction.password);
+    await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: winningLogin.cookie });
+  } else {
+    // 停用提交后的 409 先保持 Inactive 终态；重新启用后再比较两套密码，才能证明
+    // proposedPassword 没有在停用期间悄悄写入、旧密码仍是唯一有效凭证。
+    await requestApi(serverA, "/api/auth/accounts", {
+      method: "PATCH",
+      cookie: administratorCookie,
+      json: { userId: accountId, action: "status", isActive: true },
+    });
+    const proposedLogin = await login(serverB, username, proposedPassword, 401);
+    assert.deepEqual(proposedLogin.body, { error: "Username or password is incorrect." });
+    const winningLogin = await login(serverB, username, oldPassword);
+    await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: winningLogin.cookie });
+  }
+  const finalAccountState = readDatabaseValue(
+    "SELECT password_hash, is_active FROM app_users WHERE id = ?",
+    accountId,
+  );
+  if (administratorAction.action === "resetPassword") {
+    assert.deepEqual(finalAccountState, administratorWinningState);
+  } else {
+    assert.deepEqual(finalAccountState, { password_hash: accountBeforeAction.password_hash, is_active: 1 });
+  }
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", accountId).count,
+    0,
+  );
   report(description);
 }
 
@@ -2078,6 +2364,46 @@ async function verifyAuthenticationRaces(serverA, serverB, fixture) {
   });
   const reenabledLogin = await login(serverB, "cross-disable-race", disabledAccount.password);
   await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: reenabledLogin.cookie });
+
+  const preReadResetAccount = fixture.accounts.get("cross-own-preread-reset");
+  await verifyOwnPasswordPreReadRevocationRace(serverA, serverB, {
+    username: "cross-own-preread-reset",
+    oldPassword: preReadResetAccount.password,
+    proposedPassword: "PreReadResetProposed456!",
+    accountId: preReadResetAccount.id,
+    administratorAction: { action: "resetPassword", password: "PreReadResetAdmin789!" },
+    description: "自改首读前管理员重置返回 PASSWORD_CHANGED 而非错误密码400",
+  });
+
+  const preReadDisableAccount = fixture.accounts.get("cross-own-preread-disable");
+  await verifyOwnPasswordPreReadRevocationRace(serverA, serverB, {
+    username: "cross-own-preread-disable",
+    oldPassword: preReadDisableAccount.password,
+    proposedPassword: "PreReadDisableProposed456!",
+    accountId: preReadDisableAccount.id,
+    administratorAction: { action: "status", isActive: false },
+    description: "自改首读前管理员停用返回 PASSWORD_CHANGED 并保持旧密码",
+  });
+
+  const ownResetAccount = fixture.accounts.get("cross-own-reset-race");
+  await verifyOwnPasswordRevocationRace(serverA, serverB, {
+    username: "cross-own-reset-race",
+    oldPassword: ownResetAccount.password,
+    proposedPassword: "OwnResetProposed456!",
+    accountId: ownResetAccount.id,
+    administratorAction: { action: "resetPassword", password: "OwnResetAdmin789!" },
+    description: "自改旧密码验证后管理员重置严格胜出并返回 PASSWORD_CHANGED",
+  });
+
+  const ownDisableAccount = fixture.accounts.get("cross-own-disable-race");
+  await verifyOwnPasswordRevocationRace(serverA, serverB, {
+    username: "cross-own-disable-race",
+    oldPassword: ownDisableAccount.password,
+    proposedPassword: "OwnDisableProposed456!",
+    accountId: ownDisableAccount.id,
+    administratorAction: { action: "status", isActive: false },
+    description: "自改旧密码验证后停用再启用仍因会话撤销返回 PASSWORD_CHANGED",
+  });
 }
 
 function fullRestoreForm(contents, expectedCurrentToken) {
@@ -2545,6 +2871,10 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
     ["cross-scheduler-b", "CrossSchedulerB123!"],
     ["cross-reset-race", "ResetRaceOld123!"],
     ["cross-disable-race", "DisableRaceOld123!"],
+    ["cross-own-reset-race", "OwnResetOld123!"],
+    ["cross-own-disable-race", "OwnDisableOld123!"],
+    ["cross-own-preread-reset", "PreReadResetOld123!"],
+    ["cross-own-preread-disable", "PreReadDisableOld123!"],
   ];
   const accounts = new Map();
   for (const [username, password] of accountDefinitions) {
