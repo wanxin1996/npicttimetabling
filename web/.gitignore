@@ -30,8 +30,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# 默认忽略可能包含真实密钥的环境文件；只提交不含秘密值的说明模板。
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -42,6 +43,5 @@ next-env.d.ts
 
 /generated/prisma
 /data/*.db
-# Full-restore safety copies contain accounts and business data; keep every generated
-# directory local just like the primary SQLite database.
+# 完整恢复安全副本包含账号和业务资料；和主 SQLite 一样只能保留在本地或持久卷，不能提交。
 /data/*-restore-safety/

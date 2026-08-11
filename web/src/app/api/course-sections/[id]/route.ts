@@ -1,7 +1,6 @@
 import {
   CourseSectionInputError,
   CourseSectionRevisionConflictError,
-  listCourseAllocationVariances,
   updateCourseSection,
 } from "@/lib/database";
 
@@ -27,8 +26,9 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   try {
     const result = updateCourseSection(id, { teacherId: input.teacherId as string | null, studentGroupIds: input.studentGroupIds as string[], revision: Number(input.revision) });
     if (!result) return Response.json({ error: "Section not found." }, { status: 404 });
-    // 保存后重新读取所属课程，使响应能够立即告诉老师当前任课教师是否偏离导入分配。
-    return Response.json({ ok: true, revision: result.revision, allocationVariances: listCourseAllocationVariances(result.courseId) });
+    // revision 和 allocation variance 都由同一个数据库事务返回；接口不会在成功提交后
+    // 再执行一个可能失败的读取，从而避免“资料已保存但响应说失败”。
+    return Response.json({ ok: true, revision: result.revision, allocationVariances: result.allocationVariances });
   } catch (error) {
     if (error instanceof CourseSectionRevisionConflictError) return Response.json({ error: error.message }, { status: 409 });
     if (error instanceof CourseSectionInputError) return Response.json({ error: error.message }, { status: 400 });

@@ -19,6 +19,7 @@ let temporaryDirectory;
 let testDatabasePath;
 let authRaceControlDirectory;
 let authRaceRunToken;
+let administratorSetupToken;
 let administratorCookie = "";
 let cleanupPromise;
 const serverHandles = [];
@@ -119,6 +120,7 @@ async function startServer(label) {
       "RAILWAY_SERVICE_ID",
       "RAILWAY_VOLUME_MOUNT_PATH",
       "TIMETABLING_DATABASE_PATH",
+      "TIMETABLING_SETUP_TOKEN",
       "TIMETABLING_AUTH_RACE_TEST_MODE",
       "TIMETABLING_AUTH_RACE_RUN_TOKEN",
       "TIMETABLING_AUTH_RACE_CONTROL_DIR",
@@ -133,6 +135,7 @@ async function startServer(label) {
       HOSTNAME: "127.0.0.1",
       PORT: String(port),
       TIMETABLING_DATABASE_PATH: testDatabasePath,
+      TIMETABLING_SETUP_TOKEN: administratorSetupToken,
     });
     Object.assign(environment, {
       TIMETABLING_AUTH_RACE_TEST_MODE: "timetabling-cross-process-race-v1",
@@ -902,6 +905,72 @@ async function verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture)
   report("年级聚合工作区跨进程只返回完整旧版或完整新版，不会混合总表与待排区");
 }
 
+async function verifyYearWorkspaceBusyContract(serverA, serverB, fixture) {
+  // 使用第三条真实 SQLite 连接取得 EXCLUSIVE 锁。请求会先经过 production proxy 的
+  // 会话读取，再进入 workspace；无论 BUSY 出现在认证读取还是五表快照，HTTP 契约都
+  // 必须保持相同的 503、Retry-After 和安全固定文字。
+  const before = readFullBusinessSnapshot();
+  const blocker = new Database(testDatabasePath);
+  let holdsExclusiveLock = false;
+  try {
+    assert.equal(blocker.pragma("journal_mode", { simple: true }), "delete");
+    blocker.exec("BEGIN EXCLUSIVE");
+    holdsExclusiveLock = true;
+    const startedAt = Date.now();
+    // A 的受保护 workspace 会在 proxy 会话读取处遇锁；B 的公开 login 不经过 proxy，
+    // 因而能确定性走到 loginUser 自身的 BUSY 转换。两台 standalone 并行等待同一把锁，
+    // 不会把测试耗时无谓叠加到十秒。
+    const [busy, busyLogin] = await Promise.all([
+      requestApi(serverA, "/api/schedule/workspace?year=1", {
+        cookie: fixture.schedulerACookie,
+        expectedStatus: 503,
+      }),
+      requestApi(serverB, "/api/auth/login", {
+        method: "POST",
+        authenticated: false,
+        expectedStatus: 503,
+        json: {
+          username: "cross-scheduler-b",
+          password: fixture.accounts.get("cross-scheduler-b").password,
+        },
+      }),
+    ]);
+    const waitedMilliseconds = Date.now() - startedAt;
+    assert(waitedMilliseconds >= 4_000 && waitedMilliseconds < 15_000,
+      `Workspace BUSY response used an unexpected wait of ${waitedMilliseconds} ms.`);
+    assert.equal(busy.response.headers.get("retry-after"), "1");
+    assert.deepEqual(busy.body, {
+      error: "Another scheduler is updating timetable data. Try again in a moment.",
+    });
+    assert.equal(busyLogin.response.headers.get("retry-after"), "1");
+    assert.deepEqual(busyLogin.body, busy.body);
+    assert(!/sqlite|database|\bbusy\b|\blocked\b|constraint|select |\btable\b|column|stack|\/private\//i
+      .test(JSON.stringify(busy.body)));
+  } finally {
+    if (holdsExclusiveLock) {
+      try { blocker.exec("ROLLBACK"); } catch { /* close 仍会释放测试锁。 */ }
+    }
+    blocker.close();
+  }
+  assert.deepEqual(readFullBusinessSnapshot(), before);
+  const recovered = await requestApi(serverA, "/api/schedule/workspace?year=1", {
+    cookie: fixture.schedulerACookie,
+  });
+  assert(Array.isArray(recovered.body.lessons));
+  assert(Array.isArray(recovered.body.unscheduledSections));
+  const recoveredLogin = await login(
+    serverB,
+    "cross-scheduler-b",
+    fixture.accounts.get("cross-scheduler-b").password,
+  );
+  await requestApi(serverB, "/api/auth/logout", {
+    method: "POST",
+    cookie: recoveredLogin.cookie,
+  });
+  assert.deepEqual(readFullBusinessSnapshot(), before);
+  report("Year workspace proxy 与公开 login 在真实 EXCLUSIVE 锁下返回安全503并在释放后恢复");
+}
+
 async function verifyConcurrentFirstPlacement(serverA, serverB, fixture) {
   // 两个进程为同一个班次、同一个 weekly occurrence 选择不同位置；数据库唯一键
   // 和 IMMEDIATE 顺序必须产生一个明确赢家，而不是两条记录或通用 500。
@@ -1555,6 +1624,7 @@ async function run() {
   testDatabasePath = path.join(temporaryDirectory, "shared.sqlite");
   authRaceControlDirectory = path.join(temporaryDirectory, "auth-race-control");
   authRaceRunToken = randomBytes(32).toString("hex");
+  administratorSetupToken = randomBytes(32).toString("hex");
   assert.equal(path.dirname(testDatabasePath), temporaryDirectory);
   await mkdir(authRaceControlDirectory, { mode: 0o700 });
   await writeFile(path.join(authRaceControlDirectory, "run-token.marker"), `${authRaceRunToken}\n`, {
@@ -1568,16 +1638,40 @@ async function run() {
   const serverA = await startServer("A");
   await verifyDatabaseInitializationRecovery(serverA, initializationFault);
 
-  // A 完成空库初始化和管理员 setup 后，B 才加载同一个数据库及测试专用 preload。
-  // B 必须在管理员 setup 之后启动，避免空库初始化本身成为本测试的竞争对象。
-  const setup = await requestApi(serverA, "/api/auth/setup", {
+  // B 在空库 setup 前启动，才能让两个真实 standalone 同时竞争首位管理员。错误 token
+  // 必须先被拒绝且零写入；正确 token 的两次并发请求则只能一胜一冲突。
+  const serverB = await startServer("B");
+  await requestApi(serverA, "/api/auth/setup", {
     method: "POST",
     authenticated: false,
-    expectedStatus: 201,
-    json: { username: "cross-admin", password: "CrossProcessAdmin123!" },
+    expectedStatus: 403,
+    json: { username: "wrong-token-admin", password: "CrossProcessAdmin123!", setupToken: "x".repeat(64) },
   });
-  administratorCookie = cookieFrom(setup.response, "Initial administrator setup");
-  const serverB = await startServer("B");
+  const concurrentSetups = await Promise.all([
+    requestApi(serverA, "/api/auth/setup", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: [201, 409],
+      json: { username: "cross-admin-a", password: "CrossProcessAdmin123!", setupToken: administratorSetupToken },
+    }),
+    requestApi(serverB, "/api/auth/setup", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: [201, 409],
+      json: { username: "cross-admin-b", password: "CrossProcessAdmin123!", setupToken: administratorSetupToken },
+    }),
+  ]);
+  assert.deepEqual(concurrentSetups.map((result) => result.response.status).sort(), [201, 409]);
+  const setupWinner = concurrentSetups.find((result) => result.response.status === 201);
+  administratorCookie = cookieFrom(setupWinner.response, "Concurrent initial administrator setup");
+  assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM app_users").count, 1);
+  await requestApi(serverA, "/api/auth/setup", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 409,
+    json: { username: "cross-admin-repeat", password: "CrossProcessAdmin123!", setupToken: administratorSetupToken },
+  });
+  report("production setup token 拒绝未授权请求，且跨进程并发只建立一位管理员");
 
   // 管理员已提前建立；接下来创建账号、独立会话和课程 fixture。
   const fixture = await initializeFixtureAfterAdministrator(serverA, serverB);
@@ -1585,6 +1679,7 @@ async function run() {
   await verifyCandidateSnapshotConsistency(serverA, serverB, fixture);
   await verifyCandidateFailureBoundaries(serverA, fixture);
   await verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture);
+  await verifyYearWorkspaceBusyContract(serverA, serverB, fixture);
   await verifyConcurrentFirstPlacement(serverA, serverB, fixture);
   await verifyConcurrentCourseSetup(serverA, serverB, fixture);
   await verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture);

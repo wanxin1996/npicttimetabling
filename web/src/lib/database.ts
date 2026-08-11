@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { administratorSetupConfigurationAvailable } from "./auth-input";
 
 // 下面这些类型描述数据库发送给浏览器的简化数据结构。
 // 字段名刻意使用业务人员容易理解的名称，避免前端代码直接依赖 SQLite 的底层列名。
@@ -279,8 +280,12 @@ function database() {
 export function databaseHealth() {
   // 用固定查询确认数据库文件能够打开并执行 SQL，同时不向健康检查接口泄露
   // 排课数量、账号资料或服务器上的真实文件路径。
-  const row = database().prepare("SELECT 1 AS healthy").get() as { healthy: number };
-  return row.healthy === 1;
+  const db = database();
+  const row = db.prepare("SELECT 1 AS healthy").get() as { healthy: number };
+  const userCount = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
+  // 已经建立管理员的数据库不再依赖一次性 token；空库则必须确认 production 配置可用。
+  // 因此 Railway 不会把“进程在线但管理员永远无法 setup”的部署误判成健康实例。
+  return row.healthy === 1 && (userCount.count > 0 || administratorSetupConfigurationAvailable());
 }
 
 function assertDatabaseIntegrity(db: DatabaseInstance, stage: string) {
@@ -766,12 +771,43 @@ export function authenticationStatus(token?: string): { setupRequired: boolean; 
   return { setupRequired: count.count === 0, user: token ? validateSession(token) : null };
 }
 
+export class DatabaseBusyError extends Error {
+  // 会话校验和工作区轮询都可能在另一进程短暂提交时碰到 SQLite BUSY/LOCKED。
+  // 对外只暴露这个稳定类型；API 不应把数据库错误代码、SQL 或文件路径返回浏览器。
+  constructor() {
+    super("Another scheduler is updating timetable data. Try again in a moment.");
+    this.name = "DatabaseBusyError";
+  }
+}
+
+export function isDatabaseBusyFailure(error: unknown) {
+  // API 路由可能收到 database 层已经转换的稳定错误，也可能在初始化／其他旧函数中
+  // 直接收到 better-sqlite3 的 BUSY/LOCKED。统一判定后，所有认证端点都能返回相同503。
+  // name 检查额外覆盖 Next 将 proxy 和 route 打进不同 bundle 后 instanceof 不共享原型的情况。
+  return error instanceof DatabaseBusyError
+    || (error instanceof Error && error.name === "DatabaseBusyError")
+    || isSqliteBusyError(error);
+}
+
 export function validateSession(token: string): AppUserRecord | null {
   // 会话校验在一次查询中同时关联启用账号并检查过期时间，
   // 让被停用的用户或已过期的 Cookie 立即失去访问权限。
-  const db = database();
-  const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
-  return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) } : null;
+  try {
+    const db = database();
+    const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
+    return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) } : null;
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
+}
+
+export class InitialAdministratorAlreadyExistsError extends Error {
+  // 首位管理员只能建立一次；稳定类型让 setup 路由只把真实状态冲突映射为 409。
+  constructor() {
+    super("Initial administrator has already been created.");
+    this.name = "InitialAdministratorAlreadyExistsError";
+  }
 }
 
 export function createInitialAdmin(username: string, password: string) {
@@ -780,31 +816,41 @@ export function createInitialAdmin(username: string, password: string) {
   const db = database();
   // 检查首位用户和插入账号使用同一个事务，防止两个同时到达的初始化请求
   // 各自创建一个初始管理员。
-  return db.transaction(() => {
+  const createAdministrator = db.transaction(() => {
     const count = db.prepare("SELECT COUNT(*) AS count FROM app_users").get() as { count: number };
-    if (count.count > 0) throw new Error("Initial administrator has already been created.");
+    if (count.count > 0) throw new InitialAdministratorAlreadyExistsError();
     const id = crypto.randomUUID();
     db.prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(id, username, hashPassword(password));
     return { user: { id, username, isAdmin: true, isActive: true }, session: createSession(db, id) };
-  })();
+  });
+  // IMMEDIATE 在读取空表前先取得写入保留锁。两个 standalone 同时 setup 时，后到者
+  // 会等待前者提交，再看到已有管理员并得到稳定 409，而不是都读到 0 或冒出 BUSY 500。
+  return createAdministrator.immediate();
 }
 
 export function loginUser(username: string, password: string) {
   // 登录只接受启用状态且密码匹配的账号；验证成功后生成新的服务器端会话，
   // 再由浏览器通过安全 Cookie 保存原始会话令牌。
-  const db = database();
-  const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
-  if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
+  try {
+    const db = database();
+    const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
+    if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
 
-  // Scrypt 故意在写锁外运行，避免一次登录长时间挡住排课保存；但密码验证完成后，
-  // 管理员可能恰好重置密码或停用账号。因此建立会话前在 IMMEDIATE 事务内再次确认
-  // Active 状态和密码哈希仍是刚才验证的版本，旧请求不能在撤销之后补回新会话。
-  const finishLogin = db.transaction(() => {
-    const current = db.prepare("SELECT password_hash, is_active FROM app_users WHERE id = ?").get(row.id) as { password_hash: string; is_active: number } | undefined;
-    if (!current || current.is_active !== 1 || current.password_hash !== row.password_hash) return null;
-    return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
-  });
-  return finishLogin.immediate();
+    // Scrypt 故意在写锁外运行，避免一次登录长时间挡住排课保存；但密码验证完成后，
+    // 管理员可能恰好重置密码或停用账号。因此建立会话前在 IMMEDIATE 事务内再次确认
+    // Active 状态和密码哈希仍是刚才验证的版本，旧请求不能在撤销之后补回新会话。
+    const finishLogin = db.transaction(() => {
+      const current = db.prepare("SELECT password_hash, is_active FROM app_users WHERE id = ?").get(row.id) as { password_hash: string; is_active: number } | undefined;
+      if (!current || current.is_active !== 1 || current.password_hash !== row.password_hash) return null;
+      return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
+    });
+    return finishLogin.immediate();
+  } catch (error) {
+    // 登录路由公开可达，也可能在另一进程提交恢复或排课资料时遇到短暂锁。
+    // 把初始化、读取和最终 IMMEDIATE 三个阶段的 BUSY 都转换成同一个安全重试类型。
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function logoutSession(token: string) {
@@ -822,8 +868,21 @@ export function createAppUser(username: string, password: string): AppUserRecord
   // 后续新增成员默认都是普通排课账号；只有首次初始化账号是管理员，
   // 由它负责创建、停用或重置其他账号。
   const id = crypto.randomUUID();
-  database().prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 0)").run(id, username, hashPassword(password));
+  try {
+    database().prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 0)").run(id, username, hashPassword(password));
+  } catch (error) {
+    if (isSqliteUniqueConstraintError(error)) throw new AppUserUniqueConflictError();
+    throw error;
+  }
   return { id, username, isAdmin: false, isActive: true };
+}
+
+export class AppUserUniqueConflictError extends Error {
+  // 只有 SQLite 的用户名唯一键冲突可以显示为“账号已存在”；磁盘和 trigger 故障仍走 500。
+  constructor() {
+    super("That username already exists.");
+    this.name = "AppUserUniqueConflictError";
+  }
 }
 
 export function changeOwnPassword(userId: string, currentPassword: string, newPassword: string) {
@@ -879,7 +938,12 @@ export function listTeachers(): TeacherRecord[] {
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
   // 使用 UUID 生成稳定主键，使本地新增资料不必依赖数据库自增序号。
   const id = crypto.randomUUID();
-  database().prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
+  try {
+    database().prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
+  } catch (error) {
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A teacher with this name already exists.");
+    throw error;
+  }
   return { id, name, staffType, status: "Active", sections: 0 };
 }
 
@@ -1368,14 +1432,52 @@ export function createManualCourse(input: { code: string; catalog: string | null
     for (let sequence = 1; sequence <= input.sectionCount; sequence += 1) {
       insertSection.run(crypto.randomUUID(), id, sequence);
     }
-    return id;
+    // 新课程的全部默认值都由同一张表定义，而且此事务刚建立了精确 sectionCount 个班次。
+    // 在提交前构造标准 CourseRecord，避免事务已提交后再次 listCourses 失败而向用户误报保存失败。
+    return {
+      id,
+      code: input.code,
+      catalog: input.catalog,
+      revision: 1,
+      durationHours: null,
+      sessionsPerWeek: 1,
+      primaryYear: null,
+      minimumRoomCapacity: null,
+      requiresLab: false,
+      requiresMultiProjector: false,
+      requiresSmartClassroom: false,
+      separateSectionsAcrossDays: false,
+      weekPattern: "ALL" as const,
+      weekStart: null,
+      weekEnd: null,
+      allocatedSections: 0,
+      configuredSections: input.sectionCount,
+      scheduledLessons: 0,
+      allocationVarianceCount: 0,
+    };
   });
-  const id = create();
-  // 复用标准查询结果，让手动课程和表格导入课程始终返回完全相同的 API 结构，
-  // 后续界面与业务逻辑无需区分资料来源。
-  const course = listCourses().find((item) => item.id === id);
-  if (!course) throw new Error("The course was created but could not be read.");
-  return course;
+  try {
+    return create.immediate();
+  } catch (error) {
+    if (isSqliteUniqueConstraintError(error)) throw new ManualCourseUniqueConflictError();
+    throw error;
+  }
+}
+
+export class ManualCourseUniqueConflictError extends Error {
+  // 手动课程编号重复是唯一可安全返回的创建冲突；其他数据库故障不得伪装成重复编号。
+  constructor() {
+    super("A course with this code already exists.");
+    this.name = "ManualCourseUniqueConflictError";
+  }
+}
+
+export class CourseSectionResizeConflictError extends Error {
+  // 缩减会删除已分配资料时属于可由老师处理的业务冲突，允许 API 安全显示具体班次序号。
+  constructor(message: string) {
+    super(message);
+    this.name = "CourseSectionResizeConflictError";
+  }
 }
 
 export function resizeCourseSections(courseId: string, sectionCount: number) {
@@ -1403,9 +1505,9 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
       for (const section of removable) {
         // 若要删除的班次已经排课、分配教师或关联学生班级，用户必须先明确清除资料，
         // 防止修正数量时无提示地删除真实工作。即使班次尚未排入总表，教师也是人工决定。
-        if (hasScheduledLesson.get(section.id)) throw new Error(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
-        if (section.teacher_id) throw new Error(`${section.sequence} has a teacher. Clear its assignments before reducing the count.`);
-        if (hasStudentGroup.get(section.id)) throw new Error(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
+        if (hasScheduledLesson.get(section.id)) throw new CourseSectionResizeConflictError(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
+        if (section.teacher_id) throw new CourseSectionResizeConflictError(`${section.sequence} has a teacher. Clear its assignments before reducing the count.`);
+        if (hasStudentGroup.get(section.id)) throw new CourseSectionResizeConflictError(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
       }
       const removeSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
       for (const section of removable) removeSection.run(section.id);
@@ -1657,7 +1759,10 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
       db.prepare("UPDATE scheduled_lessons SET revision = revision + 1 WHERE section_id = ?").run(id);
       refreshAllScheduleWarnings(db);
     }
-    return { courseId: section.course_id, revision: section.revision + 1 };
+    // 分配差异是保存响应的一部分，因此必须在提交前、同一连接和同一事务快照内读取。
+    // 若查询因 schema、磁盘或其他故障失败，上面的 section/revision/warning 写入会全部回滚。
+    const allocationVariances = listCourseAllocationVariances(section.course_id);
+    return { courseId: section.course_id, revision: section.revision + 1, allocationVariances };
   });
   // IMMEDIATE 先取得写入次序，避免另一进程恰好在验证 Active 状态与保存教师之间插入停用操作。
   return transaction.immediate();
@@ -2099,15 +2204,22 @@ export function listYearTimetableWorkspace(year: number): YearTimetableWorkspace
   // 多个接口，另一账号可能恰好在两次读取之间 Return／重新排课，令同一课次短暂
   // 同时出现在总表与待排区，或两边都没有。单个 DEFERRED 事务让五份结果共享
   // 第一条 SELECT 固定的 SQLite 已提交快照，前端才能可靠判断课程的最新去向。
-  const db = database();
-  const readWorkspace = db.transaction(() => ({
-    lessons: listScheduledLessons(year),
-    unscheduledSections: listUnscheduledSections(year),
-    issues: listScheduleIssues(),
-    teachers: listTeachers(),
-    rooms: listRooms(),
-  }));
-  return readWorkspace.deferred();
+  try {
+    // database() 初始化和 DEFERRED 内第一条 SELECT 都可能在另一进程持有独占锁时失败，
+    // 因此两者必须落在同一个 BUSY 转换边界内。
+    const db = database();
+    const readWorkspace = db.transaction(() => ({
+      lessons: listScheduledLessons(year),
+      unscheduledSections: listUnscheduledSections(year),
+      issues: listScheduleIssues(),
+      teachers: listTeachers(),
+      rooms: listRooms(),
+    }));
+    return readWorkspace.deferred();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export class CandidateSlotsInputError extends Error {

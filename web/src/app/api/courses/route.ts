@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { createManualCourse, listCourses } from "@/lib/database";
+import { createManualCourse, listCourses, ManualCourseUniqueConflictError } from "@/lib/database";
+import { readJsonObject } from "@/lib/request-json";
 
 export const runtime = "nodejs";
 
@@ -10,7 +11,9 @@ export function GET() {
 
 export async function POST(request: Request) {
   // 教学分配工作簿遗漏课程时可手动补录；系统会建立未分配班次，但不会虚构教师分配数量。
-  const body = await request.json();
+  const parsed = await readJsonObject(request, "Use a course code and a section count from 1 to 999.");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const code = String(body.code ?? "").trim().toUpperCase();
   const catalog = String(body.catalog ?? "").trim() || null;
   const sectionCount = Number(body.sectionCount);
@@ -20,7 +23,9 @@ export async function POST(request: Request) {
 
   try {
     return NextResponse.json(createManualCourse({ code, catalog, sectionCount }), { status: 201 });
-  } catch {
-    return NextResponse.json({ error: "A course with this code already exists." }, { status: 409 });
+  } catch (error) {
+    if (error instanceof ManualCourseUniqueConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
+    console.error("Manual course creation failed", error);
+    return NextResponse.json({ error: "The course could not be created. Try again." }, { status: 500 });
   }
 }

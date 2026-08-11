@@ -10,6 +10,8 @@ const BLOCK_MS = 15 * 60 * 1000;
 const MAX_PAIR_FAILURES = 5;
 const MAX_ADDRESS_FAILURES = 25;
 const MAX_TRACKED_KEYS = 2_000;
+const MAX_ADDRESS_KEY_LENGTH = 128;
+const MAX_USERNAME_KEY_LENGTH = 64;
 
 // 开发热重载和不同路由代码包可能多次执行这个模块。
 // 把失败记录保存在进程级共享 Map 中，避免攻击者利用模块重新加载绕过限制。
@@ -23,14 +25,19 @@ function clientAddress(request: NextRequest) {
   // 托管代理通常把原始客户端地址放在列表第一位；下方独立的地址级计数器
   // 还能识别同一来源不断更换候选用户名的尝试。
   const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return forwarded || request.headers.get("x-real-ip")?.trim() || "unknown";
+  const rawAddress = forwarded || request.headers.get("x-real-ip")?.trim() || "unknown";
+  // 即使上游代理错误地传入很长或包含控制字符的地址，也只保留固定长度、可打印的 key。
+  // 这不是 IP 真实性判断；部署平台仍必须覆盖客户端自行伪造的转发头。
+  return rawAddress.replace(/[^0-9a-zA-Z:._%-]/g, "_").slice(0, MAX_ADDRESS_KEY_LENGTH) || "unknown";
 }
 
 function keysFor(request: NextRequest, username: string) {
   // 同一来源与账号组合失败五次后短暂封锁；更高的地址级上限用于阻止轮换用户名，
   // 同时避免共享办公室中某人输错五次就影响所有用户。
   const address = clientAddress(request);
-  const normalizedUsername = username.trim().toLocaleLowerCase("en-US");
+  // 登录路由会在调用限流器前拒绝超过 64 字符的用户名；这里仍做第二层截断，
+  // 防止未来其他调用方跳过 API 校验后重新引入无界 Map key。
+  const normalizedUsername = username.trim().toLocaleLowerCase("en-US").slice(0, MAX_USERNAME_KEY_LENGTH);
   return [
     { key: `pair:${address}:${normalizedUsername}`, maximumFailures: MAX_PAIR_FAILURES },
     { key: `address:${address}`, maximumFailures: MAX_ADDRESS_FAILURES },
@@ -50,7 +57,7 @@ function pruneExpiredEntries(now: number) {
     if (failures.length === 0 && entry.blockedUntil <= now) attempts.delete(key);
     else entry.failures = failures;
   }
-  while (attempts.size >= MAX_TRACKED_KEYS) {
+  while (attempts.size > MAX_TRACKED_KEYS) {
     const oldestKey = attempts.keys().next().value;
     if (typeof oldestKey !== "string") break;
     attempts.delete(oldestKey);
@@ -81,9 +88,22 @@ export function recordFailedLogin(request: NextRequest, username: string) {
     attempts.delete(limit.key);
     attempts.set(limit.key, current);
   }
+  // 一次失败会同时加入 pair 与 address 两个 key，所以只在请求前清理仍可能暂时超过上限。
+  // 写入两个桶后再执行一次硬上限，保证函数返回时 Map 永远不超过 2,000 项。
+  pruneExpiredEntries(now);
 }
 
 export function clearLoginFailures(request: NextRequest, username: string) {
   // 登录验证成功后清除两个计数器，避免旧输入错误影响同一老师或共享办公室网络的下次正常登录。
   for (const limit of keysFor(request, username)) attempts.delete(limit.key);
+}
+
+export function loginRateLimitVerificationSnapshot() {
+  // 仅供本地发布验证脚本直接导入模块检查内存不变量；这个函数没有对应 HTTP 路由，
+  // 不会向远程用户暴露登录失败数量或限流 key 内容。
+  return {
+    trackedKeys: attempts.size,
+    maximumTrackedKeys: MAX_TRACKED_KEYS,
+    longestKeyLength: [...attempts.keys()].reduce((longest, key) => Math.max(longest, key.length), 0),
+  };
 }

@@ -114,9 +114,16 @@ function loadDatabaseSource(TrackingDatabase) {
   const loadedModule = new Module(databaseSourcePath);
   loadedModule.filename = databaseSourcePath;
   loadedModule.paths = Module._nodeModulePaths(path.dirname(databaseSourcePath));
-  loadedModule.require = (request) => (
-    request === "better-sqlite3" ? TrackingDatabase : nativeRequire(request)
-  );
+  loadedModule.require = (request) => {
+    if (request === "better-sqlite3") return TrackingDatabase;
+    // 本脚本只审计 database.ts 的连接发布与事务初始化，不测试部署 token。源码新增的
+    // 健康配置依赖在这里提供最小开发态替身，避免 CommonJS 单文件转译器错误地从
+    // scripts 目录解析相对 TypeScript 模块；真实 token 行为由 standalone CRUD 覆盖。
+    if (request === "./auth-input") {
+      return { administratorSetupConfigurationAvailable: () => true };
+    }
+    return nativeRequire(request);
+  };
   loadedModule._compile(transpiled.outputText, databaseSourcePath);
   return loadedModule.exports;
 }

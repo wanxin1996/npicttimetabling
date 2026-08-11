@@ -20,11 +20,12 @@
 
 ## 3. 首次上线
 
-1. 生成 Railway 公网域名并确认 `GET /api/health` 返回 `{"status":"ok"}`。
-2. 首页应显示首次管理员设置，不应出现示例教师、班级、教室或内置密码。
-3. 由项目负责人建立真实管理员账号，再导入 Teaching Members Excel。
-4. 手工建立真实学生班级与教室；本机开发数据库不会自动上传到公网。
-5. 建立第二个 scheduler 账号，用两个浏览器验证 5 秒同步和 revision 冲突提示。
+1. 在密码管理器生成至少 32 bytes 的随机一次性值（例如 64 位十六进制），并把它作为 Railway Secret Variable `TIMETABLING_SETUP_TOKEN`；不要写进 Git、构建日志或截图。
+2. 部署服务、生成 Railway 公网域名，并确认 `GET /api/health` 返回 `{"status":"ok"}`。production 空库若缺少有效 setup token 会刻意返回 503，必须先修正变量，不能关闭这项保护。
+3. 首页应显示首次管理员设置，不应出现示例教师、班级、教室或内置密码。项目负责人输入与 Railway 完全相同的 setup token，建立真实管理员账号。
+4. 管理员建立成功后可以删除或轮换 `TIMETABLING_SETUP_TOKEN`；已有管理员的数据库不再依赖该令牌。重新部署并确认 health 仍为 200、管理员仍可正常登录。
+5. 导入 Teaching Members Excel，并手工建立真实学生班级与教室；本机开发数据库不会自动上传到公网。
+6. 建立第二个 scheduler 账号，用两个浏览器验证 5 秒同步和 revision 冲突提示。
 
 ## 4. 备份与恢复
 
@@ -52,7 +53,7 @@ TIMETABLING_SMOKE_PASSWORD=验收密码 \
 npm run verify:deployment -- https://你的Railway域名
 ```
 
-自动脚本覆盖下列基础门槛，其余多人协作和平台备份仍需在 Railway 与两个浏览器中实际操作：
+自动脚本只验证 HTTP 健康、安全响应头、公开认证边界，以及可选验收账号的登录／退出。下列项目必须在 Railway 控制台和两个真实浏览器中人工核对，不能把脚本通过当成这些步骤已经完成：
 
 - Railway deployment 状态为 Active，健康检查为 HTTP 200。
 - 服务只有一个实例，数据库实际位于挂载卷。

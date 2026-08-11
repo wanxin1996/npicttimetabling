@@ -537,6 +537,10 @@ export default function Home() {
   const [currentCycle, setCurrentCycle] = useState<CycleStatus | null>(null);
   const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready">("checking");
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  // ref 会在同一个事件循环内立即挡住重复 Enter／双击，state 则把按钮显示为进行中。
+  // 首次 setup 若发出两次请求，第二个 409 不应盖掉第一笔已经成功的登录结果。
+  const authenticationRequestInFlight = useRef(false);
+  const [authenticationSubmitting, setAuthenticationSubmitting] = useState(false);
   const [accounts, setAccounts] = useState<AppUser[]>([]);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [importing, setImporting] = useState(false);
@@ -1390,6 +1394,9 @@ export default function Home() {
   useEffect(() => {
     // 页面启动时先检查登录状态，再请求受保护的业务资料；未登录浏览器不会先下载教师或课程数据。
     void fetch("/api/auth/status").then(async (response) => {
+      // BUSY 503 和未知500都不能被当成“没有用户”而误显示登录表单；交给下方 catch
+      // 保持检查状态并提示刷新，避免老师误以为账号或会话已经消失。
+      if (!response.ok) throw new Error("Authentication status is temporarily unavailable.");
       const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
       if (status.setupRequired) return setAuthScreen("setup");
       if (!status.user) return setAuthScreen("login");
@@ -1479,25 +1486,66 @@ export default function Home() {
   }, [authScreen, personalKind, personalOwnerId, timetableYear, view]);
 
   async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
-    // 首次管理员建立和日常登录共用同一套简洁字段；浏览器根据当前认证画面选择接口，真正的安全校验全部由服务端完成。
+    // 首次管理员建立和日常登录共用账号密码；部署令牌只发送给 setup 接口，普通登录请求绝不携带它。
     event.preventDefault();
+    if (authenticationRequestInFlight.current) return;
+    authenticationRequestInFlight.current = true;
+    setAuthenticationSubmitting(true);
     const data = new FormData(event.currentTarget);
     const endpoint = authScreen === "setup" ? "/api/auth/setup" : "/api/auth/login";
-    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Authentication failed.", "error");
-    setCurrentUser(body.user);
-    setAuthScreen("ready");
-    await loadData();
-    setNotice(`Signed in as ${body.user.username}.`, "success");
+    const credentials = {
+      username: String(data.get("username") ?? ""),
+      password: String(data.get("password") ?? ""),
+    };
+    // 本地开发没有配置 TIMETABLING_SETUP_TOKEN 时允许空值；生产环境是否匹配由服务端统一判断。
+    const requestBody = authScreen === "setup"
+      ? { ...credentials, setupToken: String(data.get("setupToken") ?? "") }
+      : credentials;
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      const body = await response.json().catch(() => ({})) as { error?: string; user?: AppUser };
+      if (!response.ok || !body.user) {
+        setNotice(body.error ?? "Authentication failed. Try again.", "error");
+        return;
+      }
+      setCurrentUser(body.user);
+      setAuthScreen("ready");
+      try {
+        await loadData();
+        setNotice(`Signed in as ${body.user.username}.`, "success");
+      } catch {
+        // 会话已经建立时不能再说“登录失败”；保留已登录状态并明确要求刷新资料。
+        setNotice("Signed in, but scheduling data could not be loaded. Refresh before making changes.", "warning");
+      }
+    } catch {
+      // 断网或服务器没有返回可用结果时保留表单和输入，让老师可以直接重试。
+      setNotice("Authentication could not reach the server. Check the connection and try again.", "error");
+    } finally {
+      authenticationRequestInFlight.current = false;
+      setAuthenticationSubmitting(false);
+    }
   }
 
   async function logout() {
     // 登出不仅清除浏览器 Cookie，也在服务端删除会话记录，复制旧 Cookie 也不能继续访问资料。
-    await fetch("/api/auth/logout", { method: "POST" });
-    setCurrentUser(null);
-    setAuthScreen("login");
-    setNotice("Signed out.", "success");
+    try {
+      const response = await fetch("/api/auth/logout", { method: "POST" });
+      const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        setNotice(body.error ?? "Sign out could not be completed. Try again.", "error");
+        return;
+      }
+      setCurrentUser(null);
+      setAuthScreen("login");
+      setNotice("Signed out.", "success");
+    } catch {
+      // 服务端没有确认撤销会话前保留当前画面，避免看似退出、刷新后又自动登录。
+      setNotice("Sign out could not reach the server. Check the connection and try again.", "error");
+    }
   }
 
   async function openAccounts() {
@@ -1989,9 +2037,26 @@ export default function Home() {
                     className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
                   />
                 </label>
+                {authScreen === "setup" && (
+                  <label className="text-sm font-semibold">
+                    Deployment setup token
+                    <input
+                      name="setupToken"
+                      maxLength={512}
+                      autoComplete="off"
+                      type="password"
+                      className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                    />
+                    <span className="mt-1.5 block text-xs font-normal leading-5 text-slate-500">
+                      Required for the first production setup: enter Railway&apos;s TIMETABLING_SETUP_TOKEN. Leave blank only in local development when that variable is not configured.
+                    </span>
+                  </label>
+                )}
               </div>
-              <button className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="submit">
-                {authScreen === "setup" ? "Create administrator" : "Sign in"}
+              <button disabled={authenticationSubmitting} className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">
+                {authenticationSubmitting
+                  ? (authScreen === "setup" ? "Creating administrator…" : "Signing in…")
+                  : (authScreen === "setup" ? "Create administrator" : "Sign in")}
               </button>
             </form>
           )}

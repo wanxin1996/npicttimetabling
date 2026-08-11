@@ -24,6 +24,7 @@ let sessionCookie = "";
 let serverProcess;
 let temporaryDirectory;
 let testDatabasePath;
+let administratorSetupToken = "";
 let serverOutput = "";
 let serverProcessError;
 let cleanupPromise;
@@ -80,7 +81,7 @@ async function chooseAvailablePort() {
   return address.port;
 }
 
-async function waitForServer() {
+async function waitForServer(acceptedHealthStatuses = [200]) {
   // standalone 进程启动后反复请求公开健康接口。较短单次超时配合总时限，
   // 可以区分“仍在启动”和“已经退出”，不会让测试无限等待。
   const deadline = Date.now() + 15_000;
@@ -91,7 +92,7 @@ async function waitForServer() {
     }
     try {
       const response = await fetch(new URL("/api/health", baseUrl), { signal: AbortSignal.timeout(1_000) });
-      if (response.status === 200) return;
+      if (acceptedHealthStatuses.includes(response.status)) return;
     } catch {
       // 连接尚未建立是启动过程中的正常状态，稍后重试即可。
     }
@@ -119,7 +120,10 @@ async function stopServer() {
   }
 }
 
-async function startServer(databasePath) {
+async function startServer(databasePath, {
+  acceptedHealthStatuses = [200],
+  setupToken = administratorSetupToken,
+} = {}) {
   // 释放端口与 standalone 真正监听之间存在很短的竞争窗口。如果刚好被其他程序抢走，
   // 只在明确看到 EADDRINUSE 时重新选择端口；其他启动错误必须立即报告。
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -131,7 +135,7 @@ async function startServer(databasePath) {
     // 先删除可能继承自开发终端或 Railway 的位置变量，再设置唯一的临时数据库和端口。
     // 这样即使开发人员本机已经配置正式路径，测试子进程也绝不会打开它。
     const serverEnvironment = { ...process.env };
-    for (const name of ["RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_VOLUME_MOUNT_PATH", "TIMETABLING_DATABASE_PATH", "PORT", "HOSTNAME"]) {
+    for (const name of ["RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_VOLUME_MOUNT_PATH", "TIMETABLING_DATABASE_PATH", "TIMETABLING_SETUP_TOKEN", "PORT", "HOSTNAME"]) {
       delete serverEnvironment[name];
     }
     Object.assign(serverEnvironment, {
@@ -140,6 +144,8 @@ async function startServer(databasePath) {
       PORT: String(port),
       TIMETABLING_DATABASE_PATH: databasePath,
     });
+    // setup 完成后的重启回归刻意不提供 token；已有管理员的数据库仍必须健康可用。
+    if (setupToken) serverEnvironment.TIMETABLING_SETUP_TOKEN = setupToken;
 
     serverProcess = spawn(process.execPath, [standaloneServerPath], {
       cwd: projectRoot,
@@ -155,7 +161,7 @@ async function startServer(databasePath) {
     });
 
     try {
-      await waitForServer();
+      await waitForServer(acceptedHealthStatuses);
       return;
     } catch (error) {
       const portWasTaken = /EADDRINUSE/.test(serverOutput);
@@ -304,16 +310,58 @@ async function verifyAuthentication() {
   const health = await requestApi("/api/health", { authenticated: false });
   assert.equal(health.body.status, "ok");
   await requestApi("/api/teachers", { authenticated: false, expectedStatus: 401 });
+  await requestApi("/api/auth/accounts", { authenticated: false, expectedStatus: 401 });
+  await requestApi("/api/auth/password", { method: "PATCH", authenticated: false, json: {}, expectedStatus: 401 });
   const initialStatus = await requestApi("/api/auth/status", { authenticated: false });
   assert.equal(initialStatus.body.setupRequired, true);
   assert.equal(initialStatus.body.user, null);
+
+  // 公开 setup／login 必须在 JSON.parse、限流和 Scrypt 之前拒绝超过 64 KiB 的 body。
+  // 连续六次超限登录使用同一个正常长度用户名；管理员建立后该用户名的第一次普通
+  // 错误密码仍应是 401 而非 429，从而证明超限请求没有污染限流桶。
+  const oversizedAuthenticationBody = JSON.stringify({
+    username: "bounded-body-user",
+    password: "x".repeat(70 * 1024),
+    setupToken: administratorSetupToken,
+  });
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const oversizedLogin = await requestApi("/api/auth/login", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: 413,
+      headers: { "Content-Type": "application/json" },
+      body: oversizedAuthenticationBody,
+    });
+    assert.deepEqual(oversizedLogin.body, { error: "JSON request is too large." });
+  }
+  const oversizedSetup = await requestApi("/api/auth/setup", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 413,
+    headers: { "Content-Type": "application/json" },
+    body: oversizedAuthenticationBody,
+  });
+  assert.deepEqual(oversizedSetup.body, { error: "JSON request is too large." });
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT COUNT(*) AS count FROM app_users").get().count), 0);
+
+  // production 空数据库先拒绝错误 token，而且不能在响应中回显候选值；随后只有部署时
+  // 显式传入的随机 token 才能创建第一位管理员。
+  const wrongSetupToken = `${administratorSetupToken.slice(0, -1)}x`;
+  const unauthorizedSetup = await requestApi("/api/auth/setup", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 403,
+    json: { username: "attacker-admin", password: "IntegrationTest123!", setupToken: wrongSetupToken },
+  });
+  assert(!JSON.stringify(unauthorizedSetup.body).includes(administratorSetupToken));
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT COUNT(*) AS count FROM app_users").get().count), 0);
 
   // 空数据库只允许创建第一位管理员；保存响应中的 Cookie 对后续所有 API 请求认证。
   const setup = await requestApi("/api/auth/setup", {
     method: "POST",
     authenticated: false,
     expectedStatus: 201,
-    json: { username: "integration-admin", password: "IntegrationTest123!" },
+    json: { username: "integration-admin", password: "IntegrationTest123!", setupToken: administratorSetupToken },
   });
   const setCookie = setup.response.headers.get("set-cookie") || "";
   sessionCookie = setCookie.split(";", 1)[0];
@@ -321,6 +369,50 @@ async function verifyAuthentication() {
   assert.match(setCookie, /HttpOnly/i);
   assert.match(setCookie, /Secure/i);
   assert.match(setCookie, /SameSite=Strict/i);
+  await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 401,
+    json: { username: "bounded-body-user", password: "WrongPassword123!" },
+  });
+
+  // token 即使仍然正确，也不能在管理员已存在后重复使用；数据库用户数必须保持一。
+  await requestApi("/api/auth/setup", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 409,
+    json: { username: "second-admin", password: "IntegrationTest123!", setupToken: administratorSetupToken },
+  });
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT COUNT(*) AS count FROM app_users").get().count), 1);
+
+  // 用户名和密码分别超过字段上限时都必须在限流 Map 与 Scrypt 之前被拒绝；
+  // 不能只用“两项同时错误”的样本，否则其中一个边界被删除后测试仍会假绿。
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await requestApi("/api/auth/login", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: 400,
+      json: { username: "u".repeat(65), password: "ValidLength123!" },
+    });
+    await requestApi("/api/auth/login", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: 400,
+      json: { username: "bounded-password-user", password: "x".repeat(257) },
+    });
+  }
+  await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 401,
+    json: { username: "u".repeat(64), password: "WrongPassword123!" },
+  });
+  await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    expectedStatus: 401,
+    json: { username: "bounded-password-user", password: "WrongPassword123!" },
+  });
 
   // 旧数据库使用 ALTER TABLE 时 revision 一定追加在 courses 表尾；全新数据库必须
   // 保持相同物理列顺序，否则同版本完整 SQLite 备份会因表形状不同而无法恢复。
@@ -328,6 +420,58 @@ async function verifyAuthentication() {
   assert.equal(courseColumns.at(-1).name, "revision");
   assert.equal(courseColumns.at(-1).dflt_value, "1");
   report("身份保护、首次管理员和安全 Cookie");
+}
+
+async function verifyProductionSetupConfigurationFailsClosed(databasePath, configuredToken) {
+  // 使用独立空库和真实 production standalone 分别覆盖“未配置”和“配置过短”。
+  // 两种部署错误都必须拒绝 setup，不能因为方便首次使用而退回匿名管理员抢注。
+  administratorSetupToken = configuredToken;
+  await startServer(databasePath, { acceptedHealthStatuses: [503] });
+  try {
+    const unhealthy = await requestApi("/api/health", { authenticated: false, expectedStatus: 503 });
+    assert.deepEqual(unhealthy.body, { status: "error" });
+    const rejected = await requestApi("/api/auth/setup", {
+      method: "POST",
+      authenticated: false,
+      expectedStatus: 503,
+      json: {
+        username: "must-not-exist",
+        password: "IntegrationTest123!",
+        setupToken: configuredToken || "attacker-supplied-token",
+      },
+    });
+    assert.deepEqual(rejected.body, {
+      error: "Administrator setup is unavailable. Contact the deployment administrator.",
+    });
+    assert(!JSON.stringify(rejected.body).includes(configuredToken || "attacker-supplied-token"));
+    const db = new Database(databasePath, { readonly: true });
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM app_users").get().count, 0);
+    } finally {
+      db.close();
+    }
+  } finally {
+    await stopServer();
+    serverProcess = undefined;
+  }
+}
+
+async function verifyPostSetupRestartWithoutToken(databasePath) {
+  // setup token 只保护 production 空库。首位管理员建立后，部署者应能删除一次性 Secret；
+  // 同一持久数据库重启后 health、旧会话和正常密码登录都必须继续工作。
+  await stopServer();
+  await startServer(databasePath, { setupToken: "" });
+  const health = await requestApi("/api/health", { authenticated: false });
+  assert.deepEqual(health.body, { status: "ok" });
+  await requestApi("/api/teachers");
+  const login = await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    json: { username: "integration-admin", password: "IntegrationTest123!" },
+  });
+  sessionCookie = (login.response.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert(sessionCookie.includes("="));
+  report("首位管理员建立后移除一次性 setup token，重启仍保持 health 与登录可用");
 }
 
 async function verifyWorkbookBoundaries() {
@@ -1304,6 +1448,12 @@ async function verifyAtomicMasterDataWarnings(ids) {
     WHEN NEW.code = 'ATOMIC_CREATE_FAIL' BEGIN SELECT RAISE(ABORT, 'forced student group creation failure'); END;
     CREATE TRIGGER zz_fail_room_creation BEFORE INSERT ON rooms
     WHEN NEW.code = '39-09-90' BEGIN SELECT RAISE(ABORT, 'forced room creation failure'); END;
+    CREATE TRIGGER zz_fail_teacher_creation BEFORE INSERT ON teachers
+    WHEN NEW.name = 'ATOMIC TEACHER FAIL' BEGIN SELECT RAISE(ABORT, 'forced teacher creation failure'); END;
+    CREATE TRIGGER zz_fail_course_creation BEFORE INSERT ON courses
+    WHEN NEW.code = 'ATOMIC_COURSE_FAIL' BEGIN SELECT RAISE(ABORT, 'forced course creation failure'); END;
+    CREATE TRIGGER zz_fail_account_creation BEFORE INSERT ON app_users
+    WHEN NEW.username = 'atomic-account-fail' BEGIN SELECT RAISE(ABORT, 'forced account creation failure'); END;
   `));
   try {
     await expectAtomicFailure("/api/student-groups", "The student group could not be created. Try again.", {
@@ -1314,16 +1464,86 @@ async function verifyAtomicMasterDataWarnings(ids) {
       method: "POST",
       json: { code: "39-09-90", capacity: 20, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
     });
+    await expectAtomicFailure("/api/teachers", "The teacher could not be created. Try again.", {
+      method: "POST",
+      json: { name: "ATOMIC TEACHER FAIL", staffType: "FT" },
+    });
+    await expectAtomicFailure("/api/courses", "The course could not be created. Try again.", {
+      method: "POST",
+      json: { code: "ATOMIC_COURSE_FAIL", catalog: "Must roll back", sectionCount: 1 },
+    });
+    await expectAtomicFailure("/api/auth/accounts", "The account could not be created. Try again.", {
+      method: "POST",
+      json: { username: "atomic-account-fail", password: "AtomicAccount123!" },
+    });
   } finally {
     executeTestDatabase((db) => db.exec(`
       DROP TRIGGER IF EXISTS zz_fail_student_group_creation;
       DROP TRIGGER IF EXISTS zz_fail_room_creation;
+      DROP TRIGGER IF EXISTS zz_fail_teacher_creation;
+      DROP TRIGGER IF EXISTS zz_fail_course_creation;
+      DROP TRIGGER IF EXISTS zz_fail_account_creation;
     `));
   }
+
+  // 缩放班次的安全业务冲突仍返回 409；任意 SQLite/trigger 故障则必须是固定 500，
+  // 并由事务回滚刚建立的尾部班次。
+  executeTestDatabase((db) => {
+    const courseIdLiteral = db.prepare("SELECT quote(?) AS value").get(ids.courseId).value;
+    db.exec(`CREATE TRIGGER zz_fail_section_resize BEFORE INSERT ON course_sections WHEN NEW.course_id = ${courseIdLiteral} AND NEW.sequence = 2 BEGIN SELECT RAISE(ABORT, 'forced section resize failure'); END;`);
+  });
+  try {
+    await expectAtomicFailure(`/api/courses/${ids.courseId}/sections`, "Section count could not be changed. Try again.", {
+      method: "PATCH",
+      json: { sectionCount: 2 },
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_section_resize"));
+  }
+
+  // 临时改名 allocation 表，使 section 的保存 SQL 可以先执行、但事务末尾的 variance
+  // 查询真实失败。接口必须返回固定 500；恢复表名后完整快照应证明 section revision、
+  // 关联和 warning 全部随同一事务回滚，没有“保存成功却报告失败”的半完成状态。
+  const sectionBeforeVarianceFailure = (await requestApi(`/api/courses/${ids.courseId}/sections`)).body
+    .find((section) => section.id === ids.sectionId);
+  assert(sectionBeforeVarianceFailure, "The allocation variance rollback fixture section was not found.");
+  const varianceFailureGroup = (await requestApi("/api/student-groups", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "ATOMIC_VARIANCE_GROUP", year: 1, program: "ATOMIC" },
+  })).body;
+  const snapshotBeforeVarianceFailure = readBusinessSnapshot();
+  executeTestDatabase((db) => db.exec("ALTER TABLE teaching_allocations RENAME TO teaching_allocations_hidden"));
+  try {
+    const failedVarianceRead = await requestApi(`/api/course-sections/${ids.sectionId}`, {
+      method: "PATCH",
+      expectedStatus: 500,
+      json: {
+        teacherId: sectionBeforeVarianceFailure.teacherId,
+        // 改成另一班级会先真实重写关联、提高 lesson revision 并刷新 warning；
+        // 末尾 variance 查询失败后，完整快照必须证明三者都随事务回滚。
+        studentGroupIds: [varianceFailureGroup.id],
+        revision: sectionBeforeVarianceFailure.revision,
+      },
+    });
+    assert.deepEqual(failedVarianceRead.body, { error: "The section could not be saved. Try again." });
+    assert(!/teaching_allocations|sqlite|database|table|column|stack/i.test(JSON.stringify(failedVarianceRead.body)));
+  } finally {
+    executeTestDatabase((db) => db.exec("ALTER TABLE teaching_allocations_hidden RENAME TO teaching_allocations"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeVarianceFailure);
 
   // 所有 JSON 写入路由都必须把 null 和损坏 JSON 转换成 400 JSON，不能让
   // request.json() 的语法异常穿过 Next.js 形成 HTML 或未受控 500。
   const jsonRoutes = [
+    ["/api/teachers", "POST"],
+    ["/api/courses", "POST"],
+    [`/api/courses/${ids.courseId}/sections`, "PATCH"],
+    ["/api/auth/accounts", "POST"],
+    ["/api/auth/accounts", "PATCH"],
+    ["/api/auth/password", "PATCH"],
+    ["/api/auth/setup", "POST"],
+    ["/api/auth/login", "POST"],
     ["/api/student-groups", "POST"],
     [`/api/student-groups/${ids.studentGroupId}`, "PATCH"],
     ["/api/rooms", "POST"],
@@ -1331,6 +1551,7 @@ async function verifyAtomicMasterDataWarnings(ids) {
     ["/api/rule-settings", "PATCH"],
     ["/api/unavailability", "POST"],
   ];
+  const snapshotBeforeMalformedJson = readBusinessSnapshot();
   for (const [pathname, method] of jsonRoutes) {
     await requestApi(pathname, { method, json: null, expectedStatus: 400 });
     await requestApi(pathname, {
@@ -1340,6 +1561,7 @@ async function verifyAtomicMasterDataWarnings(ids) {
       expectedStatus: 400,
     });
   }
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeMalformedJson);
   await requestApi("/api/rooms", {
     method: "POST",
     expectedStatus: 400,
@@ -1797,11 +2019,16 @@ async function run() {
 
   // 每次执行都创建全新临时数据库和随机端口，确保测试结果不依赖上一次状态。
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-api-crud-"));
+  await verifyProductionSetupConfigurationFailsClosed(path.join(temporaryDirectory, "setup-missing-token.db"), "");
+  await verifyProductionSetupConfigurationFailsClosed(path.join(temporaryDirectory, "setup-short-token.db"), "short-token");
+  await verifyProductionSetupConfigurationFailsClosed(path.join(temporaryDirectory, "setup-oversized-token.db"), "x".repeat(513));
+  administratorSetupToken = randomUUID();
   const databasePath = path.join(temporaryDirectory, "integration.db");
   testDatabasePath = databasePath;
   assert.equal(path.dirname(databasePath), temporaryDirectory);
   await startServer(databasePath);
   await verifyAuthentication();
+  await verifyPostSetupRestartWithoutToken(databasePath);
   await verifyWorkbookBoundaries();
   await verifyTeachingAllocationReimport();
   const relationshipIds = await verifyCrudAndRevisions();

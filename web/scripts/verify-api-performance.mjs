@@ -3,10 +3,12 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import Module from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import Database from "better-sqlite3";
+import ts from "typescript";
 
 // 这项回归使用已经生成的 production standalone 服务器，同时把全部资料写入
 // 操作系统临时目录。它不会连接 data/timetabling.db，也不会占用开发页面的 3000 端口。
@@ -53,11 +55,43 @@ let testDatabasePath;
 let statementAuditToken = "";
 let statementAuditReportPath = "";
 let administratorCookie = "";
+let administratorSetupToken = "";
 let cleanupPromise;
 
 function report(message) {
   // 每完成一个可独立理解的门槛就输出一行，方便基础开发人员定位失败阶段。
   console.log(`✓ ${message}`);
+}
+
+async function verifyLoginRateLimitMemoryBounds() {
+  // 直接转译并执行 production 限流模块，而不是在测试里复制 Map 算法。1,100 个不同
+  // 地址与用户名会尝试建立 2,200 个 key；硬上限和 key 规范化必须在每次记录返回时成立。
+  const sourcePath = path.join(projectRoot, "src", "lib", "login-rate-limit.ts");
+  const source = await readFile(sourcePath, "utf8");
+  const transpiled = ts.transpileModule(source, {
+    fileName: sourcePath,
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  });
+  const loadedModule = new Module(sourcePath);
+  loadedModule.filename = sourcePath;
+  loadedModule.paths = Module._nodeModulePaths(path.dirname(sourcePath));
+  loadedModule._compile(transpiled.outputText, sourcePath);
+  const { recordFailedLogin, loginRateLimitVerificationSnapshot } = loadedModule.exports;
+
+  for (let index = 0; index < 1_100; index += 1) {
+    const request = {
+      headers: new Headers({
+        "x-forwarded-for": `203.0.${index}.1-${"9".repeat(200)}`,
+        "x-real-ip": `198.51.100.${index % 255}`,
+      }),
+    };
+    recordFailedLogin(request, `${index}-${"U".repeat(100)}`);
+  }
+  const snapshot = loginRateLimitVerificationSnapshot();
+  assert(snapshot.trackedKeys <= snapshot.maximumTrackedKeys);
+  assert(snapshot.longestKeyLength <= 198,
+    `A login rate-limit key unexpectedly used ${snapshot.longestKeyLength} characters.`);
+  report("公开登录限流 Map 项数和 address/username key 长度保持硬上限");
 }
 
 function keepRecentServerOutput(chunk) {
@@ -126,7 +160,7 @@ async function startServer({ auditStatements = false } = {}) {
 
     // 删除可能继承的 Railway／正式数据库路径，再明确指定唯一临时数据库。
     const environment = { ...process.env };
-    for (const name of ["RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_VOLUME_MOUNT_PATH", "TIMETABLING_DATABASE_PATH", "PORT", "HOSTNAME"]) {
+    for (const name of ["RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_VOLUME_MOUNT_PATH", "TIMETABLING_DATABASE_PATH", "TIMETABLING_SETUP_TOKEN", "PORT", "HOSTNAME"]) {
       delete environment[name];
     }
     Object.assign(environment, {
@@ -134,6 +168,7 @@ async function startServer({ auditStatements = false } = {}) {
       HOSTNAME: "127.0.0.1",
       PORT: String(port),
       TIMETABLING_DATABASE_PATH: testDatabasePath,
+      TIMETABLING_SETUP_TOKEN: administratorSetupToken,
     });
     // 正常性能计时不加载任何插桩；只有最后两个结构审计进程显式传入随机 token 和临时报告路径。
     if (auditStatements) {
@@ -220,7 +255,7 @@ async function initializeAdministrator() {
     method: "POST",
     authenticated: false,
     expectedStatus: 201,
-    json: { username: "performance-admin", password: "PerformanceAdmin123!" },
+    json: { username: "performance-admin", password: "PerformanceAdmin123!", setupToken: administratorSetupToken },
   });
   administratorCookie = cookieFrom(setup.response);
 }
@@ -855,8 +890,11 @@ async function run() {
     throw new Error("Standalone build is missing. Run `npm run build` before this performance verification.");
   }
 
+  await verifyLoginRateLimitMemoryBounds();
+
   // 空库先由 production 初始化表和管理员；停止服务后批量造数，再重新启动同一临时库。
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-api-performance-"));
+  administratorSetupToken = randomBytes(32).toString("hex");
   testDatabasePath = path.join(temporaryDirectory, "performance.db");
   assert.equal(path.dirname(testDatabasePath), temporaryDirectory);
   await startServer();

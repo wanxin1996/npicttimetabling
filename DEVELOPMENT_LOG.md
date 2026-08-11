@@ -2319,3 +2319,32 @@
 1. 用包含本轮 UI 和后端安全修复的最终 production build，在 `1440×900`、`1024×768` 和窄屏视口重跑课程卡、三天同屏、Toast／Inspector 相交及键盘焦点验收。
 2. 完成首次管理员 setup token、登录输入上限、旧 JSON 路由、Workspace BUSY 与完整备份业务不变量修复。
 3. 五名真实排课老师的 `UX_TASK_TEST_RESULTS.json` 和 Railway 线上证据仍为空；这两项必须由真实外部验收完成，不能由开发者自测代替。
+
+## 2026-08-11｜关闭首次管理员抢注、公开输入 DoS 与旧 API 错误泄漏
+
+### 已完成
+
+- production 空库首次 setup 必须使用 `TIMETABLING_SETUP_TOKEN`：配置值要求 32–512 UTF-8 bytes，候选令牌先做 SHA-256 固定长度摘要再恒定时间比较；缺失、过短或过长配置会让空库 health 与 setup 一起 fail closed，已有管理员后则不再依赖一次性令牌。
+- 首位管理员检查和创建改为同一个 `IMMEDIATE` 事务，两个 standalone 同时 setup 时严格只有一个 201，另一方读取提交后的状态并得到稳定409。
+- 登录、setup、账号建立和密码修改统一限制用户名3–64字符、密码10–256字符；公开 JSON 在解析、限流和 Scrypt 前以流式读取限制为64KiB，不能用 chunked body 绕过 `Content-Length`。
+- 登录限流的地址和用户名 key 分别限制为128／64字符，并在每次写入后把进程 Map 硬限制在2,000项；转发头中的控制字符不会直接进入内存 key。
+- 认证 proxy 只公开 `status/login/setup/logout`，未来新增 `/api/auth/*` 不会自动绕过会话；accounts/password 未登录统一401。
+- login、status、logout、accounts、password 的数据库初始化、查询和写入异常都有固定 JSON 边界；真实 BUSY/LOCKED 返回503与 `Retry-After: 1`，未知故障只写服务器日志。退出失败时不会假装清除浏览器状态，页面会保留当前会话供重试。
+- 教师／课程建立、课程班次数量、账号建立和 Course Section 保存只把稳定业务冲突映射409；trigger、磁盘或未知数据库故障固定500，不返回 SQL、表名、路径或 stack。
+- 手工课程在建立事务内直接构造准确响应；Course Section 的 allocation variance 也在同一事务内读取，末尾读取失败会连同关联、lesson revision 和 warning 一起回滚，不再出现“数据已提交但接口说失败”。
+- 年级聚合 workspace 把数据库初始化和整个 `DEFERRED` 快照都纳入 BUSY 转换；认证 proxy 与公开 login 在真实独占锁下使用同一安全503契约。
+- 登录／setup UI 增加部署令牌字段、断网反馈和同步 ref 防双击；setup token 只随首次初始化请求发送，普通登录不会携带。`.env.example` 与 Railway 清单说明令牌生成、Secret 保存、首次成功后删除／轮换及重启复核顺序。
+
+### 自动验证
+
+- `git diff --check`、`npm run lint`、`npx tsc --noEmit --incremental false`、两个集成脚本 `node --check` 全部通过。
+- `npm run build` 通过，30个 Route Handler 与 production proxy 均成功生成 standalone 产物。
+- `node scripts/verify-api-crud.mjs` 在独立临时 SQLite 通过：公开64KiB上限、token配置三种失败、正确／重复setup、已有管理员移除token后重启、旧JSON路由、trigger回滚及完整CRUD／FK均有真实HTTP证据。
+- `node scripts/verify-cross-process-concurrency.mjs` 通过：两个production standalone共享临时库，setup严格一胜一冲突；真实 `BEGIN EXCLUSIVE` 同时让受保护workspace与公开login等待约5秒并返回安全503，释放后两者恢复。
+- 所有服务、Cookie、故障trigger和数据库都位于系统临时目录并在测试后清理；未连接或修改 `web/data/timetabling.db`。
+
+### 尚未完成
+
+1. 完整系统恢复仍需关闭安全副本与替换之间的跨进程写入窗口，并在提交前校验业务不变量。
+2. Teaching Members 显式零分配、三类主资料 revision CAS 与 section resize Course revision 仍需后续批次完成。
+3. 五名真实排课老师 UX 结果和 Railway 线上持久卷／HTTPS／重启／恢复证据仍不能由本地自动测试代替。
