@@ -2292,3 +2292,30 @@
 1. 若之后引入 Playwright／浏览器测试框架，把本轮 Course Configure 与 Inspector 的 `document.activeElement`、stale banner 和五字段草稿保护固化成一键 UI 回归；当前已完成真实浏览器人工验收和底层纯函数门槛。
 2. 为聚合 workspace 等剩余只读路由统一 SQLite `BUSY／LOCKED` 的安全503与 `Retry-After: 1`，并继续保持正式部署单应用实例。
 3. 继续本地完善排课功能和易用性；所有功能稳定后再进入免费／低频上线方案，不需要为了本轮测试提前部署。
+
+## 2026-08-11｜补齐课程卡资料、通知语义与 Inspector 键盘反馈
+
+### 已完成
+
+- 先在 `1440×900` 的真实应用内浏览器、隔离临时 SQLite 上走完“建立教师／班级／教室 → 新增课程 → 配置课程 → 分配教师和班级 → 默认待排区 → Inspector 放置课程”的完整 UI 路径；确认待排区默认开启、Inspector 已能更改多个 Student Groups，也现场复现了总表课程卡遗漏 Student Groups 的问题。
+- Master timetable 卡片现在固定使用清楚的资料层级：课程／班次名称为最大且加粗的 `11px`，教师、Student Groups 和 Room 固定为较小但仍可读的 `10px`；卡片不显示无用的 `2h／3h` 行，完整 `title` 和可访问名称也包含全部学生班级。
+- 操作通知改为显式 `info／success／warning／error`，不再靠英文句子里的关键词猜颜色。每次通知都有独立序号，因此八秒隐藏后再次产生完全相同的错误仍会重新挂载 live region、重新显示并重启计时。
+- 全部明显的保存、导入、认证、备份、课程与排课成功／失败／部分成功路径都明确传入通知类型；错误使用 `alert`，其余状态使用 polite live region。Inspector 的层级高于提示，窄窗口下关键 Close／Save 不会被 Toast 抢走点击区域。
+- Inspector 的问题面板沿用课程最高严重度：High 为红色、Warning 为黄色、Advisory 为蓝色，不再把所有提示一律渲染成红色 `Resolve issues`。
+- Edit、手工 Place 和 Candidate 子视图的 Close 会在卸载按钮后把焦点恢复到稳定存在的 Inspector Close；键盘焦点不会掉回 `body`。已有的草稿、revision、轮询 generation 和导航锁保持不变。
+- `openRules`、`openCycle` 与个人课表入口现在捕获网络中断、非成功 HTTP 和损坏 JSON；失败时保留当前完整画面并给出可重试说明，不再产生无反馈的未处理 Promise。
+- Fresh production 空库且完全没有课程时，待排区明确引导先 Import／Add course；只有确实存在课程但当前年级尚未配置时才显示配置说明，不再误说“allocation was imported”。
+- 页面平滑滚动和 CSS 动画尊重 `prefers-reduced-motion`。同时把原先全部超过 500 字符的 JSX 行拆成可逐段阅读的结构，并继续保留面向基础开发人员的中文区块注释。
+
+### 本次验证
+
+- `git diff --check`、`npm run lint` 与 `npx tsc --noEmit` 全部通过。
+- TypeScript AST 检查确认 `setNotice` 的 108 个调用点全部显式提供 tone，没有错误／成功路径落回默认中性样式。
+- 自动 UX 源码门槛能够识别固定卡片字号、Student Groups 与浮动 Inspector；最终新构建的多视口浏览器回归会在所有后端发布修复合并后统一执行，不能用本条源码验证代替五名真实老师的任务测试。
+- 本轮浏览器和课程资料只使用 `/private/tmp/timetabling-ui-release.*` 下的隔离数据库；正式 `web/data/timetabling.db` 未连接、未修改。
+
+### 下一步
+
+1. 用包含本轮 UI 和后端安全修复的最终 production build，在 `1440×900`、`1024×768` 和窄屏视口重跑课程卡、三天同屏、Toast／Inspector 相交及键盘焦点验收。
+2. 完成首次管理员 setup token、登录输入上限、旧 JSON 路由、Workspace BUSY 与完整备份业务不变量修复。
+3. 五名真实排课老师的 `UX_TASK_TEST_RESULTS.json` 和 Railway 线上证据仍为空；这两项必须由真实外部验收完成，不能由开发者自测代替。

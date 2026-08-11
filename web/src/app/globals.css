@@ -17,3 +17,18 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/*
+ * 操作系统要求减少动态效果时，课程高亮和按钮状态仍然保留，但取消长时间动画与过渡。
+ * JavaScript 发起的课表滚动也会读取同一偏好并改为即时移动，两边配合避免遗漏。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
