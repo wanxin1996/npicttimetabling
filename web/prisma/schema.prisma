@@ -206,7 +206,7 @@ model TeacherUnavailableWindow {
   teacherId String  @map("teacher_id")
   teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
 
-  @@index([teacherId, dayOfWeek, startHour, endHour], map: "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx")
+  @@unique([teacherId, dayOfWeek, startHour, endHour], map: "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key")
   @@map("teacher_unavailable_windows")
 }
 
@@ -218,7 +218,7 @@ model YearBlockedWindow {
   startHour Int    @map("start_hour")
   endHour   Int    @map("end_hour")
 
-  @@index([year, dayOfWeek, startHour, endHour], map: "year_blocked_windows_year_day_of_week_start_hour_end_hour_idx")
+  @@unique([year, dayOfWeek, startHour, endHour], map: "year_blocked_windows_year_day_of_week_start_hour_end_hour_key")
   @@map("year_blocked_windows")
 }
 

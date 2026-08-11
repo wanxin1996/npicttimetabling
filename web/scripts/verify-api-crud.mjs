@@ -2405,6 +2405,180 @@ async function verifyManagementSnapshots(ids) {
   report("Management／Course workspace 聚合一致性、导入关联、身份边界与安全500");
 }
 
+async function verifyRulesWorkspaceContracts(ids) {
+  const workspacePath = "/api/rules/workspace";
+  await requestApi(workspacePath, { authenticated: false, expectedStatus: 401 });
+
+  // Rules 页面只接受这一个四数组聚合。静止状态下它必须逐字段等于四条旧清单接口，
+  // 并且受保护 GET 不能更新 warning、revision、timestamp、账号或会话。
+  const snapshotBeforeAggregateReads = readBusinessSnapshot();
+  const sessionsBeforeAggregateReads = executeTestDatabase((db) => (
+    db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()
+  ));
+  const workspace = await requestApi(workspacePath);
+  assert.deepEqual(Object.keys(workspace.body).sort(), ["issues", "ruleSettings", "teachers", "unavailableWindows"]);
+  for (const key of ["issues", "ruleSettings", "teachers", "unavailableWindows"]) {
+    assert(Array.isArray(workspace.body[key]), `Rules workspace ${key} must be an array.`);
+  }
+  const [unavailableWindows, issues, ruleSettings, teachers] = await Promise.all([
+    requestApi("/api/unavailability"),
+    requestApi("/api/issues"),
+    requestApi("/api/rule-settings"),
+    requestApi("/api/teachers"),
+  ]);
+  assert.deepEqual(workspace.body.unavailableWindows, unavailableWindows.body);
+  assert.deepEqual(workspace.body.issues, issues.body);
+  assert.deepEqual(workspace.body.ruleSettings, ruleSettings.body);
+  assert.deepEqual(workspace.body.teachers, teachers.body);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeAggregateReads);
+  assert.deepEqual(
+    executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()),
+    sessionsBeforeAggregateReads,
+  );
+
+  // route 必须使用与 database export 相同的严格 parser：只接受原生安全整数、封闭
+  // Year 键和 opaque Teacher ID。整组400前后比较完整快照，防止验证发生在 INSERT 后。
+  const validWindow = { kind: "Teacher", ownerId: ids.teacherId, dayOfWeek: 2, startHour: 9, endHour: 11 };
+  const invalidWindowPosts = [
+    { ...validWindow, dayOfWeek: "2" },
+    { ...validWindow, dayOfWeek: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validWindow, startHour: 7 },
+    { ...validWindow, endHour: 19 },
+    { ...validWindow, endHour: validWindow.startHour },
+    { ...validWindow, ownerId: "  " },
+    { ...validWindow, ownerId: "TEACHER\nCONTROL" },
+    { ...validWindow, ownerId: "T".repeat(129) },
+    { ...validWindow, kind: "Year", ownerId: "01" },
+    { ...validWindow, kind: "Year", ownerId: 1 },
+  ];
+  const beforeStrictWindowInputs = readBusinessSnapshot();
+  for (const invalidInput of invalidWindowPosts) {
+    const rejected = await requestApi("/api/unavailability", {
+      method: "POST",
+      expectedStatus: 400,
+      json: invalidInput,
+    });
+    assert.deepEqual(rejected.body, { error: "Choose a valid owner, weekday and time range." });
+  }
+  for (const query of [
+    "id=&kind=Teacher",
+    "id=%20%20&kind=Teacher",
+    "id=WINDOW%0ACONTROL&kind=Teacher",
+    `id=${encodeURIComponent("W".repeat(129))}&kind=Year`,
+    "id=valid-window-id&kind=Unknown",
+    "id=valid-window-id",
+  ]) {
+    const rejected = await requestApi(`/api/unavailability?${query}`, {
+      method: "DELETE",
+      expectedStatus: 400,
+    });
+    assert.deepEqual(rejected.body, { error: "Rule id and kind are required." });
+  }
+  assert.deepEqual(readBusinessSnapshot(), beforeStrictWindowInputs);
+
+  // 两张 window 表各自的自然键都由数据库 unique 最终保护。第一次创建成功后，精确
+  // 重试必须是 typed 409，且包含 warning 的完整业务快照逐字段不变。
+  const duplicateInputs = [
+    { kind: "Teacher", ownerId: ids.teacherId, dayOfWeek: 1, startHour: 8, endHour: 9 },
+    { kind: "Year", ownerId: "3", dayOfWeek: 5, startHour: 16, endHour: 18 },
+  ];
+  const createdWindows = [];
+  try {
+    for (const input of duplicateInputs) {
+      const created = await requestApi("/api/unavailability", {
+        method: "POST",
+        expectedStatus: 201,
+        json: input,
+      });
+      assert.equal(typeof created.body.id, "string");
+      createdWindows.push({ id: created.body.id, kind: input.kind });
+      const beforeConflict = readBusinessSnapshot();
+      const conflict = await requestApi("/api/unavailability", {
+        method: "POST",
+        expectedStatus: 409,
+        json: input,
+      });
+      assert.deepEqual(Object.keys(conflict.body).sort(), ["code", "error"]);
+      assert.equal(conflict.body.code, "UNAVAILABLE_WINDOW_EXISTS");
+      assert(!/sqlite|unique|constraint|teacher_unavailable|year_blocked|index/i.test(JSON.stringify(conflict.body)));
+      assert.deepEqual(readBusinessSnapshot(), beforeConflict);
+    }
+  } finally {
+    for (const window of createdWindows.reverse()) {
+      await requestApi(`/api/unavailability?id=${encodeURIComponent(window.id)}&kind=${window.kind}`, {
+        method: "DELETE",
+      }).catch(() => undefined);
+    }
+  }
+
+  const rule = ruleSettings.body.find((candidate) => candidate.key === "prefer_9am");
+  assert(rule, "The prefer_9am Rules CAS fixture was not found.");
+
+  // expectedEnabled 必须是 JSON 原生 boolean 且不可省略；所有400均在进入事务前零写入。
+  const beforeInvalidExpected = readBusinessSnapshot();
+  for (const invalidPatch of [
+    { key: rule.key, enabled: !rule.enabled },
+    { key: rule.key, expectedEnabled: null, enabled: !rule.enabled },
+    { key: rule.key, expectedEnabled: String(rule.enabled), enabled: !rule.enabled },
+    { key: rule.key, expectedEnabled: Number(rule.enabled), enabled: !rule.enabled },
+  ]) {
+    const rejected = await requestApi("/api/rule-settings", {
+      method: "PATCH",
+      expectedStatus: 400,
+      json: invalidPatch,
+    });
+    assert.deepEqual(rejected.body, { error: "Rule key and enabled state are invalid." });
+  }
+  assert.deepEqual(readBusinessSnapshot(), beforeInvalidExpected);
+
+  // expected 与 current 相符且 desired 未改变时是真 no-op：不执行 UPDATE，也不刷新
+  // warning；响应显式 changed:false，完整数据库快照保持相同。
+  const beforeNoOp = readBusinessSnapshot();
+  const noOp = await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    json: { key: rule.key, expectedEnabled: rule.enabled, enabled: rule.enabled },
+  });
+  assert.deepEqual(noOp.body, { ok: true, enabled: rule.enabled, changed: false });
+  assert.deepEqual(readBusinessSnapshot(), beforeNoOp);
+
+  const toggled = await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    json: { key: rule.key, expectedEnabled: rule.enabled, enabled: !rule.enabled },
+  });
+  assert.deepEqual(toggled.body, { ok: true, enabled: !rule.enabled, changed: true });
+  const afterToggle = await requestApi(workspacePath);
+  assert.equal(afterToggle.body.ruleSettings.find((candidate) => candidate.key === rule.key).enabled, !rule.enabled);
+
+  // 比较 expected 必须发生在 no-op 判定之前。另一个浏览器已改成 desired 后，旧页面
+  // 即使提交的 desired 看似等于旧 expected，仍必须 typed 409 且零写入。
+  const beforeStale = readBusinessSnapshot();
+  const stale = await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { key: rule.key, expectedEnabled: rule.enabled, enabled: rule.enabled },
+  });
+  assert.deepEqual(Object.keys(stale.body).sort(), ["code", "error"]);
+  assert.equal(stale.body.code, "RULE_SETTING_CHANGED");
+  assert(!/sqlite|database|rule_settings|is_enabled|update /i.test(JSON.stringify(stale.body)));
+  assert.deepEqual(readBusinessSnapshot(), beforeStale);
+
+  const beforeUnknown = readBusinessSnapshot();
+  const unknown = await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    expectedStatus: 404,
+    json: { key: "unknown_rule", expectedEnabled: true, enabled: false },
+  });
+  assert.deepEqual(unknown.body, { error: "Rule setting not found." });
+  assert.deepEqual(readBusinessSnapshot(), beforeUnknown);
+
+  const restored = await requestApi("/api/rule-settings", {
+    method: "PATCH",
+    json: { key: rule.key, expectedEnabled: !rule.enabled, enabled: rule.enabled },
+  });
+  assert.deepEqual(restored.body, { ok: true, enabled: rule.enabled, changed: true });
+  report("Rules 聚合等价且零写入，window unique 409 与 rule expectedEnabled CAS 合同完整");
+}
+
 async function verifyAtomicMasterDataWarnings(ids) {
   // 先正常建立一条年级不可用时段。稍后故意让删除后的 warning 重算失败，
   // 便能确认 DELETE 不是先提交、再在重算时才报告一个误导性的失败。
@@ -2471,7 +2645,7 @@ async function verifyAtomicMasterDataWarnings(ids) {
     });
     await expectAtomicFailure("/api/rule-settings", "The rule setting could not be updated. Try again.", {
       method: "PATCH",
-      json: { key: lunchBreakRule.key, enabled: !lunchBreakRule.enabled },
+      json: { key: lunchBreakRule.key, expectedEnabled: lunchBreakRule.enabled, enabled: !lunchBreakRule.enabled },
     });
     await expectAtomicFailure("/api/unavailability", "The unavailable window could not be saved. Try again.", {
       method: "POST",
@@ -2489,11 +2663,11 @@ async function verifyAtomicMasterDataWarnings(ids) {
   // 这证明前面的 500 来自故障注入，而不是接口本身永久不可用。
   await requestApi("/api/rule-settings", {
     method: "PATCH",
-    json: { key: lunchBreakRule.key, enabled: !lunchBreakRule.enabled },
+    json: { key: lunchBreakRule.key, expectedEnabled: lunchBreakRule.enabled, enabled: !lunchBreakRule.enabled },
   });
   await requestApi("/api/rule-settings", {
     method: "PATCH",
-    json: { key: lunchBreakRule.key, enabled: lunchBreakRule.enabled },
+    json: { key: lunchBreakRule.key, expectedEnabled: !lunchBreakRule.enabled, enabled: lunchBreakRule.enabled },
   });
   await requestApi(`/api/unavailability?id=${yearWindow.id}&kind=Year`, { method: "DELETE" });
 
@@ -2851,6 +3025,60 @@ async function verifySystemBackupAcrossColumnOrders() {
     });
     assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
     assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+  }
+
+  // 上传库的表/列形状比较刻意不依赖索引，因此攻击者可以删除 window unique key 后
+  // 保存重复自然键，同时仍通过 integrity 与 FK。两张表都必须由 business invariant
+  // 在复制 live 数据前拒绝；不能等到 live INSERT 碰 unique 才变成误导性的500。
+  const duplicateWindowBackupFixtures = [
+    {
+      filename: "duplicate-teacher-unavailable-window.sqlite",
+      mutate(db) {
+        db.exec("DROP INDEX IF EXISTS teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key");
+        const teacher = db.prepare("SELECT id FROM teachers ORDER BY id LIMIT 1").get();
+        assert(teacher, "The teacher-window backup fixture needs one teacher.");
+        const insert = db.prepare(`INSERT INTO teacher_unavailable_windows
+          (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, 4, 9, 11)`);
+        insert.run(randomUUID(), teacher.id);
+        insert.run(randomUUID(), teacher.id);
+        assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM teacher_unavailable_windows
+          WHERE teacher_id = ? AND day_of_week = 4 AND start_hour = 9 AND end_hour = 11`).get(teacher.id).count, 2);
+      },
+    },
+    {
+      filename: "duplicate-year-blocked-window.sqlite",
+      mutate(db) {
+        db.exec("DROP INDEX IF EXISTS year_blocked_windows_year_day_of_week_start_hour_end_hour_key");
+        const insert = db.prepare(`INSERT INTO year_blocked_windows
+          (id, year, day_of_week, start_hour, end_hour) VALUES (?, 2, 5, 14, 16)`);
+        insert.run(randomUUID());
+        insert.run(randomUUID());
+        assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM year_blocked_windows
+          WHERE year = 2 AND day_of_week = 5 AND start_hour = 14 AND end_hour = 16`).get().count, 2);
+      },
+    },
+  ];
+  for (const fixture of duplicateWindowBackupFixtures) {
+    const fixturePath = path.join(temporaryDirectory, fixture.filename);
+    await writeFile(fixturePath, await readFile(reorderedBackupPath), { mode: 0o600 });
+    const fixtureDatabase = new Database(fixturePath);
+    try {
+      fixture.mutate(fixtureDatabase);
+      assert.deepEqual(fixtureDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      assert.deepEqual(fixtureDatabase.pragma("foreign_key_check"), []);
+    } finally {
+      fixtureDatabase.close();
+    }
+    await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(fixturePath), fixture.filename, expectedCurrentToken),
+      expectedStatus: 400,
+    });
+    assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+    assert.deepEqual(
+      executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()),
+      sessionsBeforeRejectedRestore,
+    );
   }
 
   // 每条 allocation 单独都是合法的600，但同一课程两条合计1200，超过课程最多999班。
@@ -3602,6 +3830,7 @@ async function run() {
   await verifyTeachingImportFailureBoundaries();
   const relationshipIds = await verifyCrudAndRevisions();
   await verifyManagementSnapshots(relationshipIds);
+  await verifyRulesWorkspaceContracts(relationshipIds);
   await verifyAtomicMasterDataWarnings(relationshipIds);
   await verifySystemBackupAcrossColumnOrders();
   await verifyAtomicCycleActions(relationshipIds);

@@ -914,6 +914,19 @@ async function verifyDataManagementWorkspaceSnapshotConsistency(serverA, serverB
   await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
   await rename(files.snapshotTemporary, files.snapshotArm);
 
+  // data marker 必须只存在于 data aggregate 的专用 teachers reader。Rules aggregate 也
+  // 返回 teachers，legacy /api/teachers 更直接调用同一底层映射；两者在 arm 已就绪时
+  // 仍须正常完成，且不能 rename/消费 data arm。否则五秒 Rules polling 可抢走测试钩子，
+  // 更重要的是说明 production 又把聚合专属读取语义泄漏回共享 reader。
+  const [rulesIsolationRead, teachersIsolationRead] = await Promise.all([
+    requestApi(serverA, "/api/rules/workspace", { cookie: fixture.schedulerACookie }),
+    requestApi(serverA, "/api/teachers", { cookie: fixture.schedulerACookie }),
+  ]);
+  assertRulesWorkspaceShape(rulesIsolationRead.body);
+  assert(Array.isArray(teachersIsolationRead.body));
+  assert.deepEqual(JSON.parse(await readFile(files.snapshotArm, "utf8")), snapshotControl);
+  await assert.rejects(readFile(files.snapshotReady, "utf8"), (error) => error?.code === "ENOENT");
+
   let workspaceSettled = false;
   let importSettled = false;
   let pendingImport;
@@ -1140,11 +1153,394 @@ async function verifyCourseWorkspaceSnapshotConsistency(serverA, serverB, fixtur
   report("课程详情聚合跨进程保持 currentCourse、班次与分配差异同一快照");
 }
 
+function assertRulesWorkspaceShape(body) {
+  assert.deepEqual(Object.keys(body).sort(), ["issues", "ruleSettings", "teachers", "unavailableWindows"]);
+  for (const key of ["issues", "ruleSettings", "teachers", "unavailableWindows"]) {
+    assert(Array.isArray(body[key]), `Rules workspace ${key} must be an array.`);
+  }
+}
+
+async function verifyConcurrentRuleAndWindowConflicts(serverA, serverB, fixture) {
+  const initialRules = (await requestApi(serverA, "/api/rule-settings", {
+    cookie: fixture.schedulerACookie,
+  })).body;
+  const rule = initialRules.find((candidate) => candidate.key === "same_block");
+  assert(rule, "The cross-process rule CAS fixture was not found.");
+
+  // A 的专属 marker 在真实 CAS UPDATE 改变一行后暂停；随后才启动 B，并用通用 writer
+  // ready 证明 B 已到达自己的 `.immediate()` 而非仍停在 HTTP/认证层。释放 A 后，它必须
+  // 先提交，B 再读取同一旧 expected 并稳定得到 RULE_SETTING_CHANGED。
+  const ruleNonce = randomBytes(16).toString("hex");
+  const writerNonce = randomBytes(16).toString("hex");
+  const ruleControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: ruleNonce,
+    ruleKey: rule.key,
+    expectedEnabled: rule.enabled,
+    enabled: !rule.enabled,
+  };
+  const writerControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: writerNonce,
+  };
+  const ruleFiles = {
+    arm: path.join(authRaceControlDirectory, "rules-workspace-rule-write-arm-A.json"),
+    temporary: path.join(authRaceControlDirectory, `rules-workspace-rule-write-arm-A-${ruleNonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `rules-workspace-rule-write-ready-A-${ruleNonce}.json`),
+    release: path.join(authRaceControlDirectory, `rules-workspace-rule-write-release-A-${ruleNonce}.txt`),
+    writerArm: path.join(authRaceControlDirectory, "writer-arm-B.json"),
+    writerTemporary: path.join(authRaceControlDirectory, `writer-arm-B-${writerNonce}.tmp`),
+    writerReady: path.join(authRaceControlDirectory, `writer-ready-B-${writerNonce}.json`),
+  };
+  activeRaceReleases.set(ruleFiles.release, ruleNonce);
+  await writeFile(ruleFiles.temporary, JSON.stringify(ruleControl), { flag: "wx", mode: 0o600 });
+  await rename(ruleFiles.temporary, ruleFiles.arm);
+  let leftSettled = false;
+  let rightSettled = false;
+  let pendingRight;
+  const pendingLeft = requestApi(serverA, "/api/rule-settings", {
+    method: "PATCH",
+    cookie: fixture.schedulerACookie,
+    json: { key: rule.key, expectedEnabled: rule.enabled, enabled: !rule.enabled },
+  });
+  pendingLeft.then(
+    () => { leftSettled = true; },
+    () => { leftSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      ruleFiles.ready,
+      ruleControl,
+      () => leftSettled,
+      "Concurrent rule expectedEnabled CAS winner",
+      "the applied rule CAS UPDATE",
+    );
+    await writeFile(ruleFiles.writerTemporary, JSON.stringify(writerControl), { flag: "wx", mode: 0o600 });
+    await rename(ruleFiles.writerTemporary, ruleFiles.writerArm);
+    pendingRight = requestApi(serverB, "/api/rule-settings", {
+      method: "PATCH",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: 409,
+      json: { key: rule.key, expectedEnabled: rule.enabled, enabled: !rule.enabled },
+    });
+    pendingRight.then(
+      () => { rightSettled = true; },
+      () => { rightSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      ruleFiles.writerReady,
+      writerControl,
+      () => rightSettled,
+      "Concurrent rule expectedEnabled CAS loser",
+      "its SQLite writer entry",
+    );
+    assert.equal(leftSettled, false);
+    assert.equal(rightSettled, false);
+    await releaseRaceBarrier(ruleFiles.release, ruleNonce);
+    const [winner, loser] = await Promise.all([pendingLeft, pendingRight]);
+    assert.deepEqual(winner.body, { ok: true, enabled: !rule.enabled, changed: true });
+    assert.equal(loser.body.code, "RULE_SETTING_CHANGED");
+    assert(!/sqlite|database|rule_settings|is_enabled|constraint|update /i.test(JSON.stringify(loser.body)));
+    const [latestA, latestB] = await Promise.all([
+      requestApi(serverA, "/api/rules/workspace", { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, "/api/rules/workspace", { cookie: fixture.schedulerBCookie }),
+    ]);
+    assert.deepEqual(latestA.body, latestB.body);
+    assert.equal(latestA.body.ruleSettings.find((candidate) => candidate.key === rule.key).enabled, !rule.enabled);
+  } finally {
+    await releaseRaceBarrier(ruleFiles.release, ruleNonce).catch(() => undefined);
+    activeRaceReleases.delete(ruleFiles.release);
+    await Promise.allSettled([pendingLeft, pendingRight].filter(Boolean));
+    await removeRaceFiles(ruleFiles);
+  }
+  const currentRule = (await requestApi(serverB, "/api/rule-settings", {
+    cookie: fixture.schedulerBCookie,
+  })).body.find((candidate) => candidate.key === rule.key);
+  if (currentRule.enabled !== rule.enabled) {
+    await requestApi(serverB, "/api/rule-settings", {
+      method: "PATCH",
+      cookie: fixture.schedulerBCookie,
+      json: { key: rule.key, expectedEnabled: currentRule.enabled, enabled: rule.enabled },
+    });
+  }
+
+  // Window 的竞争采用相同证据链，但 A 在真实 INSERT 后暂停。B 已到达 writer entry
+  // 仍不能越过 A 的事务；释放后 unique key 必须给出一个201和一个 typed409，数据库
+  // 自然键计数严格为1，不能依赖 route 的预查形成两个成功响应。
+  const windowInput = { kind: "Year", ownerId: "1", dayOfWeek: 4, startHour: 16, endHour: 18 };
+  const windowNonce = randomBytes(16).toString("hex");
+  const windowWriterNonce = randomBytes(16).toString("hex");
+  const windowControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: windowNonce,
+    ...windowInput,
+  };
+  const windowWriterControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: windowWriterNonce,
+  };
+  const windowFiles = {
+    arm: path.join(authRaceControlDirectory, "rules-workspace-window-write-arm-A.json"),
+    temporary: path.join(authRaceControlDirectory, `rules-workspace-window-write-arm-A-${windowNonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `rules-workspace-window-write-ready-A-${windowNonce}.json`),
+    release: path.join(authRaceControlDirectory, `rules-workspace-window-write-release-A-${windowNonce}.txt`),
+    writerArm: path.join(authRaceControlDirectory, "writer-arm-B.json"),
+    writerTemporary: path.join(authRaceControlDirectory, `writer-arm-B-${windowWriterNonce}.tmp`),
+    writerReady: path.join(authRaceControlDirectory, `writer-ready-B-${windowWriterNonce}.json`),
+  };
+  activeRaceReleases.set(windowFiles.release, windowNonce);
+  await writeFile(windowFiles.temporary, JSON.stringify(windowControl), { flag: "wx", mode: 0o600 });
+  await rename(windowFiles.temporary, windowFiles.arm);
+  let createSettled = false;
+  let duplicateSettled = false;
+  let pendingDuplicate;
+  let createdWindow;
+  const pendingCreate = requestApi(serverA, "/api/unavailability", {
+    method: "POST",
+    cookie: fixture.schedulerACookie,
+    expectedStatus: 201,
+    json: windowInput,
+  });
+  pendingCreate.then(
+    () => { createSettled = true; },
+    () => { createSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      windowFiles.ready,
+      windowControl,
+      () => createSettled,
+      "Concurrent exact unavailable window winner",
+      "the applied unavailable-window INSERT",
+    );
+    await writeFile(windowFiles.writerTemporary, JSON.stringify(windowWriterControl), { flag: "wx", mode: 0o600 });
+    await rename(windowFiles.writerTemporary, windowFiles.writerArm);
+    pendingDuplicate = requestApi(serverB, "/api/unavailability", {
+      method: "POST",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: 409,
+      json: windowInput,
+    });
+    pendingDuplicate.then(
+      () => { duplicateSettled = true; },
+      () => { duplicateSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      windowFiles.writerReady,
+      windowWriterControl,
+      () => duplicateSettled,
+      "Concurrent exact unavailable window loser",
+      "its SQLite writer entry",
+    );
+    assert.equal(createSettled, false);
+    assert.equal(duplicateSettled, false);
+    await releaseRaceBarrier(windowFiles.release, windowNonce);
+    const completed = await Promise.all([pendingCreate, pendingDuplicate]);
+    createdWindow = completed[0].body;
+    assert.equal(typeof createdWindow.id, "string");
+    assert.equal(completed[1].body.code, "UNAVAILABLE_WINDOW_EXISTS");
+    assert(!/sqlite|unique|constraint|year_blocked|index/i.test(JSON.stringify(completed[1].body)));
+    assert.equal(readDatabaseValue(`SELECT COUNT(*) AS count FROM year_blocked_windows
+      WHERE year = 1 AND day_of_week = 4 AND start_hour = 16 AND end_hour = 18`).count, 1);
+  } finally {
+    await releaseRaceBarrier(windowFiles.release, windowNonce).catch(() => undefined);
+    activeRaceReleases.delete(windowFiles.release);
+    await Promise.allSettled([pendingCreate, pendingDuplicate].filter(Boolean));
+    await removeRaceFiles(windowFiles);
+  }
+  if (createdWindow?.id) {
+    await requestApi(serverA, `/api/unavailability?id=${encodeURIComponent(createdWindow.id)}&kind=Year`, {
+      method: "DELETE",
+      cookie: fixture.schedulerACookie,
+    });
+  }
+  report("规则 expectedEnabled 与不可用时段 unique 在两个 standalone 间各只有一个赢家");
+}
+
+async function verifyRulesWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
+  const workspacePath = "/api/rules/workspace";
+  const scheduled = readDatabaseValue(`SELECT lessons.day_of_week, lessons.start_hour,
+    lessons.duration_hours, courses.primary_year
+    FROM scheduled_lessons lessons
+    JOIN course_sections sections ON sections.id = lessons.section_id
+    JOIN courses ON courses.id = sections.course_id
+    WHERE courses.primary_year IS NOT NULL ORDER BY lessons.id LIMIT 1`);
+  assert(scheduled, "The Rules snapshot fixture needs one scheduled lesson with a primary year.");
+  const baselineInput = {
+    kind: "Teacher",
+    ownerId: fixture.dataWorkspaceTeacher.id,
+    dayOfWeek: 2,
+    startHour: 8,
+    endHour: 9,
+  };
+  const writeInput = {
+    kind: "Year",
+    ownerId: String(scheduled.primary_year),
+    dayOfWeek: scheduled.day_of_week,
+    startHour: scheduled.start_hour,
+    endHour: scheduled.start_hour + scheduled.duration_hours,
+  };
+  const baselineWindow = (await requestApi(serverA, "/api/unavailability", {
+    method: "POST",
+    cookie: fixture.schedulerACookie,
+    expectedStatus: 201,
+    json: baselineInput,
+  })).body;
+  let insertedWindow;
+  let pendingWorkspace;
+  let pendingWrite;
+
+  const oldWorkspace = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  assertRulesWorkspaceShape(oldWorkspace.body);
+  assert(oldWorkspace.body.unavailableWindows.some((window) => window.id === baselineWindow.id));
+  const snapshotNonce = randomBytes(16).toString("hex");
+  const writeNonce = randomBytes(16).toString("hex");
+  const snapshotControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: snapshotNonce,
+    windowId: baselineWindow.id,
+  };
+  const writeControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: writeNonce,
+    ...writeInput,
+  };
+  const files = {
+    snapshotArm: path.join(authRaceControlDirectory, "rules-workspace-arm-A.json"),
+    snapshotTemporary: path.join(authRaceControlDirectory, `rules-workspace-arm-A-${snapshotNonce}.tmp`),
+    snapshotReady: path.join(authRaceControlDirectory, `rules-workspace-ready-A-${snapshotNonce}.json`),
+    snapshotRelease: path.join(authRaceControlDirectory, `rules-workspace-release-${snapshotNonce}.txt`),
+    writeArm: path.join(authRaceControlDirectory, "rules-workspace-window-write-arm-B.json"),
+    writeTemporary: path.join(authRaceControlDirectory, `rules-workspace-window-write-arm-B-${writeNonce}.tmp`),
+    writeReady: path.join(authRaceControlDirectory, `rules-workspace-window-write-ready-B-${writeNonce}.json`),
+    writeRelease: path.join(authRaceControlDirectory, `rules-workspace-window-write-release-B-${writeNonce}.txt`),
+  };
+  activeRaceReleases.set(files.snapshotRelease, snapshotNonce);
+  activeRaceReleases.set(files.writeRelease, writeNonce);
+  await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
+  await rename(files.snapshotTemporary, files.snapshotArm);
+  let workspaceSettled = false;
+  let writeSettled = false;
+  pendingWorkspace = requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  pendingWorkspace.then(
+    () => { workspaceSettled = true; },
+    () => { workspaceSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      files.snapshotReady,
+      snapshotControl,
+      () => workspaceSettled,
+      "Rules workspace snapshot consistency",
+      "the materialized old unavailable-windows query",
+    );
+    await writeFile(files.writeTemporary, JSON.stringify(writeControl), { flag: "wx", mode: 0o600 });
+    await rename(files.writeTemporary, files.writeArm);
+    pendingWrite = requestApi(serverB, "/api/unavailability", {
+      method: "POST",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: 201,
+      json: writeInput,
+    });
+    pendingWrite.then(
+      () => { writeSettled = true; },
+      () => { writeSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      files.writeReady,
+      writeControl,
+      () => writeSettled,
+      "Rules workspace unavailable-window write",
+      "the applied unavailable-window INSERT",
+    );
+
+    // 此刻 B 已在自己的 IMMEDIATE 中真实插入新 window，但还停在 warning 重算之前。
+    // 先释放 B：它会完成 issues 对应的 warning 更新并进入 COMMIT；DELETE journal 必须
+    // 取得 PENDING 后等待 A 的旧 SHARED 读锁。因此在释放 A 前，B HTTP 201 与 A 聚合
+    // 响应都不能完成。这个锁证据排除了“请求碰巧慢”或“只暂停了 JavaScript”的假并发。
+    await releaseRaceBarrier(files.writeRelease, writeNonce);
+    await waitForPendingRollbackJournalWriter("Rules workspace unavailable-window write");
+    assert.equal(writeSettled, false, "The unavailable-window write committed while the old Rules snapshot still held a read transaction.");
+    assert.equal(workspaceSettled, false, "The Rules workspace left its snapshot barrier before the writer reached COMMIT.");
+
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
+    const completed = await Promise.all([pendingWorkspace, pendingWrite]);
+    const raceWorkspace = completed[0];
+    insertedWindow = completed[1].body;
+    // A 必须返回完整旧对象：不仅 windows 不含新行，issues、rules、teachers 也必须逐字段
+    // 等于竞争前版本，不能由四次独立 GET 拼出任何中间组合。
+    assert.deepEqual(raceWorkspace.body, oldWorkspace.body);
+    assert(!raceWorkspace.body.unavailableWindows.some((window) => window.id === insertedWindow.id));
+
+    // A 结束后两台 standalone 必须读取完全相同的完整新对象；新 window 与由它刷新出的
+    // issues 同时可见，固定规则和教师数组也都保留在同一次 aggregate 响应中。
+    const [latestA, latestB] = await Promise.all([
+      requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, workspacePath, { cookie: fixture.schedulerBCookie }),
+    ]);
+    assertRulesWorkspaceShape(latestA.body);
+    assert.deepEqual(latestA.body, latestB.body);
+    assert(latestA.body.unavailableWindows.some((window) => window.id === insertedWindow.id));
+    assert(latestA.body.unavailableWindows.some((window) => window.id === baselineWindow.id));
+    assert(latestA.body.teachers.some((teacher) => teacher.id === fixture.dataWorkspaceTeacher.id));
+    assert.deepEqual(latestA.body.ruleSettings, oldWorkspace.body.ruleSettings);
+    assert.notDeepEqual(latestA.body.issues, oldWorkspace.body.issues,
+      "The overlapping year window did not refresh the Rules issues snapshot.");
+  } finally {
+    await releaseRaceBarrier(files.writeRelease, writeNonce).catch(() => undefined);
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce).catch(() => undefined);
+    activeRaceReleases.delete(files.writeRelease);
+    activeRaceReleases.delete(files.snapshotRelease);
+    await Promise.allSettled([pendingWorkspace, pendingWrite].filter(Boolean));
+    await removeRaceFiles(files);
+
+    // 失败路径也通过 production DELETE 清理已提交夹具。先读取聚合定位可能在 HTTP
+    // 不确定结果下已提交的目标行，避免直接数据库删除绕过 warning 重算。
+    const current = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie }).catch(() => null);
+    const cleanupWindows = current?.body?.unavailableWindows?.filter((window) => (
+      window.id === baselineWindow.id
+      || (window.kind === writeInput.kind && window.ownerId === writeInput.ownerId
+        && window.dayOfWeek === writeInput.dayOfWeek && window.startHour === writeInput.startHour
+        && window.endHour === writeInput.endHour)
+    )) || [];
+    for (const window of cleanupWindows) {
+      await requestApi(serverA, `/api/unavailability?id=${encodeURIComponent(window.id)}&kind=${window.kind}`, {
+        method: "DELETE",
+        cookie: fixture.schedulerACookie,
+      }).catch(() => undefined);
+    }
+  }
+  report("Rules 聚合跨进程只返回完整旧版或完整新版，并与 window/warning 提交同边界");
+}
+
 async function armManagementWorkspaceEntryFault(kind, fixture, fault) {
-  // 两个 production 聚合各有独立首读 marker；control 仍绑定本轮 run token、A 进程
+  // 三个 production 聚合各有独立首读 marker；control 仍绑定本轮 run token、A 进程
   // 与随机 nonce。课程详情额外绑定稳定 course ID，防止其他详情请求误消费。
   const nonce = randomBytes(16).toString("hex");
-  const prefix = kind === "data" ? "data-workspace" : "course-workspace";
+  const prefix = {
+    data: "data-workspace",
+    course: "course-workspace",
+    rules: "rules-workspace",
+  }[kind];
+  assert(prefix, `Unknown management workspace kind ${kind}.`);
   const control = {
     version: 1,
     runToken: authRaceRunToken,
@@ -1176,6 +1572,11 @@ async function verifyManagementWorkspaceFailureBoundaries(serverA, fixture) {
       pathname: `/api/courses/${fixture.dataWorkspaceCourse.id}/workspace`,
       fallbackError: "The course sections workspace could not be loaded. Try again.",
     },
+    {
+      kind: "rules",
+      pathname: "/api/rules/workspace",
+      fallbackError: "The rules workspace could not be loaded. Try again.",
+    },
   ];
   const baselines = new Map();
   for (const testCase of cases) {
@@ -1188,7 +1589,7 @@ async function verifyManagementWorkspaceFailureBoundaries(serverA, fixture) {
   const observer = new Database(testDatabasePath, { readonly: true });
   const initialDataVersion = observer.pragma("data_version", { simple: true });
   try {
-    // 普通 Error 含敏感哨兵；两条路由都只能返回自己的固定 safe500，不能把 SQL、
+    // 普通 Error 含敏感哨兵；三条路由都只能返回自己的固定 safe500，不能把 SQL、
     // 文件路径或堆栈回显给浏览器。失败前后14表逐字段与 data_version 均保持不变。
     for (const testCase of cases) {
       const fault = await armManagementWorkspaceEntryFault(testCase.kind, fixture, "internal");
@@ -1214,7 +1615,7 @@ async function verifyManagementWorkspaceFailureBoundaries(serverA, fixture) {
     }
 
     // BUSY 必须发生在认证完成、DEFERRED 首读之前：preload 先报告 ready，第三连接再取
-    // EXCLUSIVE。SQLite 默认五秒超时后两路都返回同一503/Retry-After，并可立即恢复。
+    // EXCLUSIVE。SQLite 默认五秒超时后三路都返回同一503/Retry-After，并可立即恢复。
     for (const testCase of cases) {
       const fault = await armManagementWorkspaceEntryFault(testCase.kind, fixture, "busy");
       activeRaceReleases.set(fault.files.release, fault.control.nonce);
@@ -1274,7 +1675,7 @@ async function verifyManagementWorkspaceFailureBoundaries(serverA, fixture) {
   } finally {
     observer.close();
   }
-  report("两套管理聚合的真实 BUSY503 与未知500均安全、零写入且释放后恢复");
+  report("三套管理聚合的真实 BUSY503 与未知500均安全、零写入且释放后恢复");
 }
 
 async function verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
@@ -2855,6 +3256,8 @@ async function run() {
   await verifyConcurrentFirstPlacement(serverA, serverB, fixture);
   await verifyConcurrentCourseSetup(serverA, serverB, fixture);
   await verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture);
+  await verifyConcurrentRuleAndWindowConflicts(serverA, serverB, fixture);
+  await verifyRulesWorkspaceSnapshotConsistency(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);
   await verifyAuthenticationRaces(serverA, serverB, fixture);
   await verifyAtomicFullSystemRestore(serverA, serverB);

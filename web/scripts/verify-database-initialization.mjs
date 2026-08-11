@@ -13,10 +13,12 @@ import ts from "typescript";
 const projectRoot = process.cwd();
 const databaseSourcePath = path.join(projectRoot, "src", "lib", "database.ts");
 const masterDataInputSourcePath = path.join(projectRoot, "src", "lib", "master-data-input.ts");
+const unavailabilityInputSourcePath = path.join(projectRoot, "src", "lib", "unavailability-input.ts");
 const persistentStorageScriptPath = path.join(projectRoot, "scripts", "verify-persistent-storage.mjs");
 const nativeRequire = createRequire(import.meta.url);
 const databaseSource = await readFile(databaseSourcePath, "utf8");
 const masterDataInputSource = await readFile(masterDataInputSourcePath, "utf8");
+const unavailabilityInputSource = await readFile(unavailabilityInputSourcePath, "utf8");
 const schemaVersionMatch = databaseSource.match(/const runtimeSchemaVersion = (\d+);/);
 assert(schemaVersionMatch, "database.ts did not expose a readable runtime schema version constant.");
 const runtimeSchemaVersion = Number(schemaVersionMatch[1]);
@@ -123,6 +125,34 @@ function loadMasterDataInputSource() {
 
 const masterDataInputModule = loadMasterDataInputSource();
 
+function loadUnavailabilityInputSource() {
+  // 新时段 route 与 database 共用这一份 parser。初始化测试直接转译真实来源，并把它
+  // 对 master-data-input 的相对依赖绑定到上面已加载的同一个模块，避免手写替身漂移。
+  const transpiled = ts.transpileModule(unavailabilityInputSource, {
+    fileName: unavailabilityInputSourcePath,
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+    reportDiagnostics: true,
+  });
+  const errors = (transpiled.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+  );
+  assert.deepEqual(errors, [], "unavailability-input.ts could not be transpiled for initialization verification.");
+  const loadedModule = new Module(unavailabilityInputSourcePath);
+  loadedModule.filename = unavailabilityInputSourcePath;
+  loadedModule.paths = Module._nodeModulePaths(path.dirname(unavailabilityInputSourcePath));
+  loadedModule.require = (request) => (
+    request === "./master-data-input" ? masterDataInputModule : nativeRequire(request)
+  );
+  loadedModule._compile(transpiled.outputText, unavailabilityInputSourcePath);
+  return loadedModule.exports;
+}
+
+const unavailabilityInputModule = loadUnavailabilityInputSource();
+
 function loadDatabaseSource(TrackingDatabase) {
   // TypeScript 的 transpileModule 只移除类型并转成 CommonJS，不复制或改写业务逻辑。
   // 自定义 Module.require 仅把 better-sqlite3 换成可计数子类；Node 内置模块仍走真实实现。
@@ -152,6 +182,7 @@ function loadDatabaseSource(TrackingDatabase) {
       return { administratorSetupConfigurationAvailable: () => true };
     }
     if (request === "./master-data-input") return masterDataInputModule;
+    if (request === "./unavailability-input") return unavailabilityInputModule;
     return nativeRequire(request);
   };
   loadedModule._compile(transpiled.outputText, databaseSourcePath);
@@ -388,6 +419,42 @@ function assertTeachingMembersSourceIndex(databasePath) {
   }
 }
 
+function assertUnavailableWindowUniqueIndexes(databasePath) {
+  // 名称、unique 标志和列顺序都属于 runtime schema 合同；只看到“某个索引”不足以
+  // 证明 API 的自然键重复会由 SQLite 作为最终防线拒绝。
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const expected = [
+      {
+        table: "teacher_unavailable_windows",
+        name: "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key",
+        columns: ["teacher_id", "day_of_week", "start_hour", "end_hour"],
+        oldName: "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx",
+      },
+      {
+        table: "year_blocked_windows",
+        name: "year_blocked_windows_year_day_of_week_start_hour_end_hour_key",
+        columns: ["year", "day_of_week", "start_hour", "end_hour"],
+        oldName: "year_blocked_windows_year_day_of_week_start_hour_end_hour_idx",
+      },
+    ];
+    for (const indexContract of expected) {
+      const indexes = db.prepare(`PRAGMA index_list(${indexContract.table})`).all();
+      const index = indexes.find((candidate) => candidate.name === indexContract.name);
+      assert(index, `${indexContract.name} was not created by runtime migration.`);
+      assert.equal(index.unique, 1, `${indexContract.name} is not unique.`);
+      assert.deepEqual(
+        db.prepare(`PRAGMA index_info(${indexContract.name})`).all().map((column) => column.name),
+        indexContract.columns,
+      );
+      assert(!indexes.some((candidate) => candidate.name === indexContract.oldName),
+        `${indexContract.oldName} survived the unique-key migration.`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
 async function withIsolatedDatabase(name, nodeEnvironment, callback) {
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), `timetabling-db-init-${name}-`));
   const databasePath = path.join(temporaryDirectory, "test.sqlite");
@@ -551,6 +618,73 @@ await withIsolatedDatabase("seed", "development", async (databasePath) => {
   report("development seed 中途失败会整体回滚、关闭连接并在重试后只写一套示例资料");
 });
 
+await withIsolatedDatabase("legacy-unavailable-window-keys", "production", async (databasePath) => {
+  const scenario = { failInitializationOnce: false, failSeedOnce: false };
+  const tracking = createTrackingDatabase(scenario);
+  const databaseModule = loadDatabaseSource(tracking.TrackingDatabase);
+  assert.equal(databaseModule.databaseHealth(), true);
+  assert.equal(tracking.instances.length, 1);
+  const db = tracking.instances[0];
+
+  // 模拟旧 runtime：移除新版 unique key、放回旧普通索引，并用目标 `_key` 名再建立
+  // 非 unique／错误列形状索引；IF NOT EXISTS 迁移会被这种同名残留骗过。两张表各保存
+  // 两个完全相同自然键，ID 按固定顺序插入，rowid 最小者就是必须保留的记录。
+  db.exec(`
+    DROP INDEX teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key;
+    DROP INDEX year_blocked_windows_year_day_of_week_start_hour_end_hour_key;
+    CREATE INDEX teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx
+      ON teacher_unavailable_windows (teacher_id, day_of_week, start_hour, end_hour);
+    CREATE INDEX year_blocked_windows_year_day_of_week_start_hour_end_hour_idx
+      ON year_blocked_windows (year, day_of_week, start_hour, end_hour);
+    CREATE INDEX teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key
+      ON teacher_unavailable_windows (teacher_id);
+    CREATE INDEX year_blocked_windows_year_day_of_week_start_hour_end_hour_key
+      ON year_blocked_windows (year, day_of_week);
+  `);
+  db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, 'FT')")
+    .run("legacy-window-teacher", "LEGACY WINDOW TEACHER");
+  const insertTeacherWindow = db.prepare(`INSERT INTO teacher_unavailable_windows
+    (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, 'legacy-window-teacher', 2, 9, 11)`);
+  insertTeacherWindow.run("legacy-teacher-window-min-rowid");
+  insertTeacherWindow.run("legacy-teacher-window-duplicate");
+  const insertYearWindow = db.prepare(`INSERT INTO year_blocked_windows
+    (id, year, day_of_week, start_hour, end_hour) VALUES (?, 3, 4, 13, 15)`);
+  insertYearWindow.run("legacy-year-window-min-rowid");
+  insertYearWindow.run("legacy-year-window-duplicate");
+
+  // 热重载版本失配会在同一连接运行真实初始化。迁移必须先去重再创建 unique；若顺序
+  // 颠倒，CREATE UNIQUE INDEX 会失败，若按任意 ID 排序则 survivor 也会不稳定。
+  globalThis.timetableSchemaVersion = runtimeSchemaVersion - 1;
+  assert.equal(databaseModule.databaseHealth(), true);
+  assert.equal(globalThis.timetableSchemaVersion, runtimeSchemaVersion);
+  assert.deepEqual(
+    db.prepare("SELECT id FROM teacher_unavailable_windows ORDER BY id").all(),
+    [{ id: "legacy-teacher-window-min-rowid" }],
+  );
+  assert.deepEqual(
+    db.prepare("SELECT id FROM year_blocked_windows ORDER BY id").all(),
+    [{ id: "legacy-year-window-min-rowid" }],
+  );
+  assertUnavailableWindowUniqueIndexes(databasePath);
+  for (const attempt of [
+    () => insertTeacherWindow.run("legacy-teacher-window-retry"),
+    () => insertYearWindow.run("legacy-year-window-retry"),
+  ]) {
+    assert.throws(attempt, (error) => (
+      error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_UNIQUE"
+    ));
+  }
+
+  // 再次执行整套 runtime 初始化必须是逐字段 no-op：不能换 survivor、重写资料或把
+  // unique key 降回普通索引。
+  const stateAfterFirstMigration = readMigratedLegacyState(databasePath);
+  globalThis.timetableSchemaVersion = runtimeSchemaVersion - 1;
+  assert.equal(databaseModule.databaseHealth(), true);
+  assert.deepEqual(readMigratedLegacyState(databasePath), stateAfterFirstMigration);
+  assertUnavailableWindowUniqueIndexes(databasePath);
+  report("旧不可用时段自然键按 MIN(rowid) 去重、升级 unique 且二次初始化幂等");
+});
+
 await withIsolatedDatabase("legacy-master-data", "production", async (databasePath) => {
   createLegacyMasterDataFixture(databasePath);
   const legacyStateBeforeMigration = readLegacyOriginalState(databasePath);
@@ -670,6 +804,67 @@ await withIsolatedDatabase("legacy-master-data", "production", async (databasePa
     assert(caught instanceof ErrorConstructor, `${label} threw ${caught?.constructor?.name || typeof caught} instead of ${ErrorConstructor.name}.`);
     assert.equal(caught.message, expectedMessage, `${label} returned the wrong typed input error.`);
     assert.deepEqual(readMigratedLegacyState(databasePath), directBoundarySnapshot, `${label} changed business data before rejecting input.`);
+  }
+
+  const unavailableWindowInputError = "Choose a valid owner, weekday and time range.";
+  const validTeacherWindow = {
+    kind: "Teacher",
+    ownerId: legacyFixtureIds.teacher,
+    dayOfWeek: 2,
+    startHour: 9,
+    endHour: 11,
+  };
+  const invalidUnavailableWindows = [
+    null,
+    [],
+    { ...validTeacherWindow, kind: "Unknown" },
+    { ...validTeacherWindow, ownerId: "" },
+    { ...validTeacherWindow, ownerId: "  " },
+    { ...validTeacherWindow, ownerId: "TEACHER\nCONTROL" },
+    { ...validTeacherWindow, ownerId: "T".repeat(129) },
+    { ...validTeacherWindow, dayOfWeek: "2" },
+    { ...validTeacherWindow, dayOfWeek: 2.5 },
+    { ...validTeacherWindow, dayOfWeek: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validTeacherWindow, dayOfWeek: 0 },
+    { ...validTeacherWindow, dayOfWeek: 6 },
+    { ...validTeacherWindow, startHour: "9" },
+    { ...validTeacherWindow, startHour: 7 },
+    { ...validTeacherWindow, startHour: 9.5 },
+    { ...validTeacherWindow, startHour: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validTeacherWindow, endHour: "11" },
+    { ...validTeacherWindow, endHour: 19 },
+    { ...validTeacherWindow, endHour: 9 },
+    { ...validTeacherWindow, endHour: 8 },
+    { ...validTeacherWindow, endHour: 11.5 },
+    { ...validTeacherWindow, endHour: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validTeacherWindow, kind: "Year", ownerId: "01" },
+    { ...validTeacherWindow, kind: "Year", ownerId: 1 },
+    { ...validTeacherWindow, kind: "Year", ownerId: "4" },
+  ];
+  for (const [index, input] of invalidUnavailableWindows.entries()) {
+    expectDirectInputFailure(
+      () => databaseModule.createUnavailableWindow(input),
+      databaseModule.MasterDataInputError,
+      unavailableWindowInputError,
+      `createUnavailableWindow invalid case ${index + 1}`,
+    );
+  }
+
+  // DELETE 也必须在动态表名或 SQL 执行前验证 opaque ID 与封闭 kind。若这里只测试
+  // route，未来维护脚本可绕过 HTTP 把控制字符或任意 kind 送入 database export。
+  for (const [index, [id, kind]] of [
+    ["", "Teacher"],
+    ["  ", "Teacher"],
+    ["WINDOW\nCONTROL", "Teacher"],
+    ["W".repeat(129), "Year"],
+    ["valid-window-id", "Unknown"],
+  ].entries()) {
+    expectDirectInputFailure(
+      () => databaseModule.deleteUnavailableWindow(id, kind),
+      databaseModule.MasterDataInputError,
+      "Rule id and kind are required.",
+      `deleteUnavailableWindow invalid case ${index + 1}`,
+    );
   }
 
   const manualCourseError = "Use a course code, optional catalog and a section count from 1 to 999.";

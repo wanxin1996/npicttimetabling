@@ -84,10 +84,18 @@ type ScheduleIssue = { id: string; lessonId: string; sectionId: string; occurren
 type YearTimetableWorkspace = { lessons: ScheduledLesson[]; unscheduledSections: UnscheduledSection[]; issues: ScheduleIssue[]; teachers: Teacher[]; rooms: Room[] };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
 type RuleSetting = { key: string; label: string; description: string; enabled: boolean };
+type RulesWorkspace = { unavailableWindows: UnavailableWindow[]; issues: ScheduleIssue[]; ruleSettings: RuleSetting[]; teachers: Teacher[] };
 type CycleStatus = { courses: number; sections: number; lessons: number; currentToken: string; backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number } };
 type PositionedLesson = { lesson: ScheduledLesson; lane: number; laneCount: number };
 type TimetableDropTarget = { dayOfWeek: number; startHour: number };
 type NoticeTone = "info" | "success" | "warning" | "error";
+
+class RulesWorkspaceRequestError extends Error {
+  constructor(readonly status: number) {
+    super("Rules workspace request failed.");
+    this.name = "RulesWorkspaceRequestError";
+  }
+}
 
 const timetableDays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const timetableHours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
@@ -560,6 +568,9 @@ export default function Home() {
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
   const [currentCycle, setCurrentCycle] = useState<CycleStatus | null>(null);
   const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready" | "load-error">("checking");
+  // load-error 会卸载整套可编辑资料，因此必须在专用状态中保存冻结原因；普通 toast
+  // 会在八秒后隐藏，而且错误画面过去只显示固定文案，无法说明写入结果未知或已提交但重载失败。
+  const [workspaceLoadErrorDetail, setWorkspaceLoadErrorDetail] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
   // ref 会在同一个事件循环内立即挡住重复 Enter／双击，state 则把按钮显示为进行中。
   // 首次 setup 若发出两次请求，第二个 409 不应盖掉第一笔已经成功的登录结果。
@@ -628,6 +639,7 @@ export default function Home() {
     // 写请求已提交后若聚合重载失败，或网络中断令提交结果未知，当前 revision 和关联
     // 清单都不再可信。统一卸载可编辑工作区，只保留 Refresh 入口；绝不能让老师
     // 在旧画面继续保存第二笔资料，或因重复点击把已成功的第一笔误报成冲突。
+    setWorkspaceLoadErrorDetail(message);
     setAuthScreen("load-error");
     setNotice(message, tone);
   }
@@ -785,6 +797,7 @@ export default function Home() {
     // 账号登录后会先看到旧 Accounts 页面或旧课表，直到后台刷新才被替换。
     visibleWorkspaceRefreshNumber.current += 1;
     activeManualTimetableRefreshNumber.current = null;
+    setWorkspaceLoadErrorDetail(null);
     setCurrentUser(null);
     setAccounts([]);
     setSystemRestoreCurrentToken(null);
@@ -1043,28 +1056,84 @@ export default function Home() {
     requestAnimationFrame(() => document.getElementById("lesson-editor")?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" }));
   }
 
-  async function fetchRulesWorkspace() {
-    // 三份规则资料必须作为一个完整批次读取。三个接口并不承诺数据库级同一快照；
-    // 这里只保证全部 HTTP 响应和 JSON 都可用后才一起更新画面，避免半套资料被应用。
-    const [rulesResponse, issuesResponse, settingsResponse] = await Promise.all([
-      fetch("/api/unavailability"),
-      fetch("/api/issues"),
-      fetch("/api/rule-settings"),
-    ]);
-    if (!rulesResponse.ok || !issuesResponse.ok || !settingsResponse.ok) throw new Error("Rules workspace request failed.");
-    const [nextWindows, nextIssues, nextSettings] = await Promise.all([
-      rulesResponse.json() as Promise<UnavailableWindow[]>,
-      issuesResponse.json() as Promise<ScheduleIssue[]>,
-      settingsResponse.json() as Promise<RuleSetting[]>,
-    ]);
-    return { nextWindows, nextIssues, nextSettings };
+  async function fetchRulesWorkspace(): Promise<RulesWorkspace> {
+    // 服务端在一个 SQLite DEFERRED 快照内读取窗口、问题、规则开关和教师。浏览器只
+    // 发一个 GET，避免写入刚好夹在多个旧接口之间，拼出数据库从未同时存在的 Rules 页面。
+    const response = await fetch("/api/rules/workspace", { cache: "no-store" });
+    if (!response.ok) throw new RulesWorkspaceRequestError(response.status);
+    const payload: unknown = await response.json();
+    if (typeof payload !== "object" || payload === null) throw new Error("The rules workspace response was invalid.");
+    const candidate = payload as Record<string, unknown>;
+    if (!Array.isArray(candidate.unavailableWindows)
+      || !Array.isArray(candidate.issues)
+      || !Array.isArray(candidate.ruleSettings)
+      || !Array.isArray(candidate.teachers)) {
+      throw new Error("The rules workspace response was incomplete.");
+    }
+    return {
+      unavailableWindows: candidate.unavailableWindows as UnavailableWindow[],
+      issues: candidate.issues as ScheduleIssue[],
+      ruleSettings: candidate.ruleSettings as RuleSetting[],
+      teachers: candidate.teachers as Teacher[],
+    };
   }
 
-  async function refreshRulesWorkspace() {
-    const { nextWindows, nextIssues, nextSettings } = await fetchRulesWorkspace();
-    setUnavailableWindows(nextWindows);
-    setScheduleIssues(nextIssues);
-    setRuleSettings(nextSettings);
+  function applyRulesWorkspace(workspace: RulesWorkspace) {
+    // React 会把同一异步 continuation 内的 state 写入合并为一次提交。四份数组只能从
+    // 同一聚合响应一起应用；任何调用者都不得先写窗口再等待问题或教师，避免用户看到
+    // 不可能版本，并让下一次表单提交始终引用与规则开关相同快照里的教师 ID。
+    setUnavailableWindows(workspace.unavailableWindows);
+    setScheduleIssues(workspace.issues);
+    setRuleSettings(workspace.ruleSettings);
+    setTeachers(workspace.teachers);
+    setWorkspaceLoadErrorDetail(null);
+    setLastSyncedAt(new Date());
+  }
+
+  async function refreshRulesWorkspace(mutationKey: string): Promise<RulesWorkspace | null> {
+    // beginManagementMutation 已使写入前的轮询失效；写入得到明确结果后再领取一个更高
+    // generation。除了号码仍最新，还必须确认原 mutation key 仍持锁，防止迟到的旧写入
+    // 刷新在登出、冻结或未来另一笔操作之后应用 state 并给出虚假的成功提示。
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
+    try {
+      const workspace = await fetchRulesWorkspace();
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current
+        || managementMutationKeyRef.current !== mutationKey) return null;
+      applyRulesWorkspace(workspace);
+      return workspace;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
+    }
+  }
+
+  async function reloadRulesWorkspaceAfterConflict(mutationKey: string, message: string, failureMessage: string) {
+    // 409 表示服务端已经明确拒绝本次旧基线写入，结果并非未知；仍须在持锁期间取得
+    // 一个完整新快照，才能再次开放按钮。若新快照也读不到，旧窗口／规则状态已知过期，
+    // 必须冻结整页，不能只显示 toast 后让老师继续从旧值发出第二笔 CAS。
+    try {
+      const workspace = await refreshRulesWorkspace(mutationKey);
+      if (!workspace) throw new Error("The conflict refresh was superseded.");
+      setNotice(message, "warning");
+      return true;
+    } catch (error) {
+      if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+        handleRulesMutationUnauthorized();
+        return false;
+      }
+      freezeManagementWorkspace(failureMessage, "error");
+      return false;
+    }
+  }
+
+  function handleRulesMutationUnauthorized() {
+    // 401 明确表示本次写入未通过会话保护；先清掉上一账号的全部业务资料，再切回登录页。
+    // finally 稍后只负责释放当前 mutation key，不能让过期会话继续停留在可编辑 Rules 画面。
+    clearSessionBoundWorkspace();
+    setAuthScreen("login");
+    setNotice("Your session expired. Please sign in again before changing rules.", "error");
   }
 
   async function openRules() {
@@ -1080,15 +1149,19 @@ export default function Home() {
     try {
       const workspace = await fetchRulesWorkspace();
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
-      setUnavailableWindows(workspace.nextWindows);
-      setScheduleIssues(workspace.nextIssues);
-      setRuleSettings(workspace.nextSettings);
+      applyRulesWorkspace(workspace);
       setActiveView("Rules & issues");
       setShowForm(false);
       return true;
-    } catch {
+    } catch (error) {
       // 断网时保留老师当前页面和资料，不留下未处理的 Promise，也不误显示空白规则页。
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+        if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+          clearSessionBoundWorkspace();
+          setAuthScreen("login");
+          setNotice("Your session expired. Please sign in again.", "error");
+          return false;
+        }
         setNotice("Rules and timetable issues could not be loaded. Check the connection and try again.", "error");
       }
       return false;
@@ -1540,24 +1613,37 @@ export default function Home() {
     try {
       const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 401) {
+          handleRulesMutationUnauthorized();
+          return;
+        }
+        const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (response.status === 409 && body.code === "UNAVAILABLE_WINDOW_EXISTS") {
+          await reloadRulesWorkspaceAfterConflict(
+            mutationKey,
+            body.error
+              ? `${body.error} The latest rules workspace has been loaded.`
+              : "That unavailable time was already saved, possibly by another scheduler. The latest rules workspace has been loaded.",
+            "That unavailable time already exists, but the latest rules workspace could not be loaded. Refresh before making another change.",
+          );
+          return;
+        }
         setNotice(body.error ?? "Unavailable time could not be saved.", "error");
         return;
       }
       committed = true;
+      const workspace = await refreshRulesWorkspace(mutationKey);
+      if (!workspace) throw new Error("The saved rules refresh was superseded.");
       form.reset();
-      try {
-        await refreshRulesWorkspace();
-        setNotice(`${kind} unavailable time saved.`, "success");
-      } catch {
-        // POST 已提交但清单不可信时，继续启用同一表单会让老师重复新增相同限制。
-        // 进入不可编辑画面，要求完整刷新后再写。
-        setAuthScreen("load-error");
-        setNotice(`${kind} unavailable time was saved, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      setNotice(`${kind} unavailable time saved.`, "success");
+    } catch (error) {
+      // 写入响应成功后，会话仍可能恰好在 aggregate 重载前过期。401 是明确的认证
+      // 状态，不应误报成资料未知；清空上一账号资料并回登录页，下一次登录会完整重载。
+      if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+        handleRulesMutationUnauthorized();
+        return;
       }
-    } catch {
-      setAuthScreen("load-error");
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? `${kind} unavailable time was saved, but its latest result could not be loaded. Refresh before continuing.`
         : "The unavailable-time request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
@@ -1571,23 +1657,37 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/unavailability?id=${window.id}&kind=${window.kind}`, { method: "DELETE" });
+      // 数据库 ID 的公开契约允许不透明字符串；URLSearchParams 会安全编码 &、#、? 等
+      // 字符，避免直接插值把一个 ID 拆成额外查询参数或截断真正的删除目标。
+      const search = new URLSearchParams({ id: window.id, kind: window.kind });
+      const response = await fetch(`/api/unavailability?${search.toString()}`, { method: "DELETE" });
       if (!response.ok) {
+        if (response.status === 401) {
+          handleRulesMutationUnauthorized();
+          return;
+        }
         const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 404) {
+          await reloadRulesWorkspaceAfterConflict(
+            mutationKey,
+            `${window.ownerLabel} unavailable time was already removed by another scheduler. The latest rules workspace has been loaded.`,
+            `${window.ownerLabel} unavailable time was removed by another scheduler, but the latest rules workspace could not be loaded. Refresh before making another change.`,
+          );
+          return;
+        }
         setNotice(body.error ?? "Unavailable time could not be removed.", "error");
         return;
       }
       committed = true;
-      try {
-        await refreshRulesWorkspace();
-        setNotice(`${window.ownerLabel} unavailable time removed.`, "success");
-      } catch {
-        setAuthScreen("load-error");
-        setNotice(`${window.ownerLabel} unavailable time was removed, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      const workspace = await refreshRulesWorkspace(mutationKey);
+      if (!workspace) throw new Error("The removed rules refresh was superseded.");
+      setNotice(`${window.ownerLabel} unavailable time removed.`, "success");
+    } catch (error) {
+      if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+        handleRulesMutationUnauthorized();
+        return;
       }
-    } catch {
-      setAuthScreen("load-error");
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? "The unavailable time was removed, but the latest rules page could not be loaded. Refresh before continuing."
         : "The remove request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
@@ -1601,23 +1701,42 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch("/api/rule-settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: rule.key, enabled: !rule.enabled }) });
+      const response = await fetch("/api/rule-settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        // expectedEnabled 是老师实际看到的基线。服务端在同一写事务里比较它，另一账号
+        // 已先切换时返回 typed 409，而不是让迟到请求静默覆盖对方的新选择。
+        body: JSON.stringify({ key: rule.key, expectedEnabled: rule.enabled, enabled: !rule.enabled }),
+      });
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 401) {
+          handleRulesMutationUnauthorized();
+          return;
+        }
+        const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (response.status === 409 && body.code === "RULE_SETTING_CHANGED") {
+          await reloadRulesWorkspaceAfterConflict(
+            mutationKey,
+            body.error
+              ? `${body.error} The latest rules workspace has been loaded; review the current setting before trying again.`
+              : `${rule.label} was changed by another scheduler. The latest rules workspace has been loaded; review it before trying again.`,
+            `${rule.label} was changed by another scheduler, but the latest rules workspace could not be loaded. Refresh before making another change.`,
+          );
+          return;
+        }
         setNotice(body.error ?? "The rule setting could not be changed.", "error");
         return;
       }
       committed = true;
-      try {
-        await refreshRulesWorkspace();
-        setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`, "success");
-      } catch {
-        setAuthScreen("load-error");
-        setNotice(`${rule.label} was ${rule.enabled ? "disabled" : "enabled"}, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      const workspace = await refreshRulesWorkspace(mutationKey);
+      if (!workspace) throw new Error("The changed rules refresh was superseded.");
+      setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`, "success");
+    } catch (error) {
+      if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+        handleRulesMutationUnauthorized();
+        return;
       }
-    } catch {
-      setAuthScreen("load-error");
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? `${rule.label} was changed, but the latest rules page could not be loaded. Refresh before continuing.`
         : "The rule-setting request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
@@ -1657,6 +1776,7 @@ export default function Home() {
     try {
       const workspace = await fetchData();
       if (requestNumber !== visibleWorkspaceRefreshNumber.current) return null;
+      setWorkspaceLoadErrorDetail(null);
       setTeachers(workspace.teachers);
       setGroups(workspace.groups);
       setRooms(workspace.rooms);
@@ -1689,10 +1809,12 @@ export default function Home() {
         if (!response.ok) throw new Error("Authentication status is temporarily unavailable.");
         const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
         if (status.setupRequired) {
+          setWorkspaceLoadErrorDetail(null);
           setAuthScreen("setup");
           return;
         }
         if (!status.user) {
+          setWorkspaceLoadErrorDetail(null);
           setAuthScreen("login");
           return;
         }
@@ -1731,12 +1853,26 @@ export default function Home() {
       const requestNumber = ++visibleWorkspaceRefreshNumber.current;
       let responses: Response[] = [];
       try {
+        if (view === "Rules & issues") {
+          const workspace = await fetchRulesWorkspace();
+          // 轮询开始后，导航或 beginManagementMutation 都会提高 generation；写入锁也要
+          // 再核对一次，确保未来即使某个调用点漏提号码，保存前的旧快照仍不能覆盖页面。
+          if (!active || requestNumber !== visibleWorkspaceRefreshNumber.current
+            || managementMutationKeyRef.current !== null) return;
+          applyRulesWorkspace(workspace);
+          return;
+        }
         if (view === "Year timetables") responses = await Promise.all([fetch(`/api/schedule/workspace?year=${timetableYear}`)]);
         if (view === "Personal timetables" && personalOwnerId) responses = await Promise.all([fetch(`/api/schedule/personal?kind=${personalKind}&ownerId=${encodeURIComponent(personalOwnerId)}`), fetch("/api/teachers")]);
-        if (view === "Rules & issues") responses = await Promise.all([fetch("/api/unavailability"), fetch("/api/issues"), fetch("/api/rule-settings")]);
-      } catch {
+      } catch (error) {
         // 短暂断网只保留当前完整画面；下一次五秒 tick 会自然重试，不能产生
         // 未处理的 Promise rejection 或把半套 payload 写进页面。
+        if (active && requestNumber === visibleWorkspaceRefreshNumber.current
+          && error instanceof RulesWorkspaceRequestError && error.status === 401) {
+          clearSessionBoundWorkspace();
+          setAuthScreen("login");
+          setNotice("Your session expired. Please sign in again.", "error");
+        }
         return;
       }
       if (!active || responses.length === 0) return;
@@ -1781,7 +1917,6 @@ export default function Home() {
         setPersonalLessons(payloads[0] as ScheduledLesson[]);
         setTeachers(payloads[1] as Teacher[]);
       }
-      if (view === "Rules & issues") { setUnavailableWindows(payloads[0]); setScheduleIssues(payloads[1]); setRuleSettings(payloads[2]); }
       setLastSyncedAt(new Date());
     }
 
@@ -2902,7 +3037,9 @@ export default function Home() {
           ) : authScreen === "load-error" ? (
             <div>
               <h1 className="text-2xl font-black">Workspace unavailable</h1>
-              <p className="mt-2 text-sm leading-6 text-slate-500">The secure session or scheduling data could not be loaded. No editable empty workspace has been opened.</p>
+              <p className="mt-2 text-sm leading-6 text-slate-500">
+                {workspaceLoadErrorDetail ?? "The secure session or scheduling data could not be loaded. No editable empty workspace has been opened."}
+              </p>
               <button ref={loadErrorRefreshButtonRef} onClick={() => window.location.reload()} className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="button">Refresh and try again</button>
             </div>
           ) : (

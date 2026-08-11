@@ -50,6 +50,9 @@ const dataWorkspaceTeachersSqlMarker = "/* timetabling:data-workspace-teachers *
 const dataWorkspaceImportSqlMarker = "/* timetabling:data-workspace-import-write */";
 const courseWorkspaceSectionsSqlMarker = "/* timetabling:course-workspace-sections */";
 const courseWorkspaceSectionWriteSqlMarker = "/* timetabling:course-workspace-section-write */";
+const rulesWorkspaceWindowsSqlMarker = "/* timetabling:rules-workspace-windows */";
+const rulesWorkspaceRuleWriteSqlMarker = "/* timetabling:rules-workspace-rule-write */";
+const rulesWorkspaceWindowWriteSqlMarker = "/* timetabling:rules-workspace-window-write */";
 const ownPasswordPreReadSqlMarker = "/* timetabling:own-password-pre-read */";
 const databaseInitializationSqlMarker = "/* timetabling:database-initialization */";
 let pendingInitializationClose;
@@ -315,6 +318,113 @@ function consumeCourseWorkspaceSectionWriteArm(teacherId, sectionId, revision, c
   }
 }
 
+function consumeRulesWorkspaceEntryArm() {
+  // Rules 聚合已通过 proxy 身份校验并建立 DEFERRED，但首张 windows 表尚未真实读取。
+  // internal 在这里注入未知异常；busy 则暂停，让第三连接取得 EXCLUSIVE 后再放行首读。
+  if (processLabel !== "A") return;
+  const entryArmFile = path.join(controlDirectory, "rules-workspace-entry-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(entryArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (!["busy", "internal"].includes(control.fault)) return;
+    const readyFile = path.join(controlDirectory, `rules-workspace-entry-ready-A-${control.nonce}.json`);
+    fs.renameSync(entryArmFile, readyFile);
+    if (control.fault === "internal") {
+      throw new Error("SECRET rules workspace fault: SELECT windows from /private/tmp/private.sqlite stack");
+    }
+    const releaseFile = path.join(controlDirectory, `rules-workspace-entry-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "rules workspace entry");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeRulesWorkspaceSnapshotArm(rows) {
+  // 首张 windows 查询已经把完整旧行物化后暂停 A。之后 issues、rule settings 与
+  // teachers 必须继续留在同一 DEFERRED 快照，不能和 B 随后的规则写入拼成混合响应。
+  if (processLabel !== "A") return;
+  const snapshotArmFile = path.join(controlDirectory, "rules-workspace-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(snapshotArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.windowId !== "string" || !Array.isArray(rows)) return;
+    if (!rows.some((row) => row && row.id === control.windowId)) return;
+    const readyFile = path.join(controlDirectory, `rules-workspace-ready-A-${control.nonce}.json`);
+    fs.renameSync(snapshotArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `rules-workspace-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "rules workspace snapshot");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeRulesWorkspaceRuleWriteArm(argumentsList, changes) {
+  // marker 只放在规则 CAS UPDATE：参数顺序固定为 desired、rule key、expected。
+  // 真实 UPDATE 恰好改变一行后才暂停，ready 因而能证明 B 已完成业务写但尚未 COMMIT。
+  if (changes !== 1) return;
+  const writeArmFile = path.join(controlDirectory, `rules-workspace-rule-write-arm-${processLabel}.json`);
+  try {
+    const control = JSON.parse(fs.readFileSync(writeArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.ruleKey !== "string"
+      || typeof control.expectedEnabled !== "boolean" || typeof control.enabled !== "boolean") return;
+    if (argumentsList[0] !== Number(control.enabled) || argumentsList[1] !== control.ruleKey
+      || argumentsList[2] !== Number(control.expectedEnabled)) return;
+    const readyFile = path.join(
+      controlDirectory,
+      `rules-workspace-rule-write-ready-${processLabel}-${control.nonce}.json`,
+    );
+    fs.renameSync(writeArmFile, readyFile);
+    const releaseFile = path.join(
+      controlDirectory,
+      `rules-workspace-rule-write-release-${processLabel}-${control.nonce}.txt`,
+    );
+    waitForRaceRelease(releaseFile, control.nonce, "rules workspace rule write");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeRulesWorkspaceWindowWriteArm(kind, argumentsList, changes) {
+  // 两张 window 表共用一个专属 INSERT marker，但 control 同时绑定 kind、owner 和完整
+  // 半开区间。只有指定进程真实插入目标行后才消费 arm，普通 Rules 保存完全透明。
+  if (changes !== 1) return;
+  const writeArmFile = path.join(controlDirectory, `rules-workspace-window-write-arm-${processLabel}.json`);
+  try {
+    const control = JSON.parse(fs.readFileSync(writeArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (control.kind !== kind || typeof control.ownerId !== "string") return;
+    if (!Number.isSafeInteger(control.dayOfWeek) || !Number.isSafeInteger(control.startHour)
+      || !Number.isSafeInteger(control.endHour)) return;
+    if (String(argumentsList[1]) !== control.ownerId || argumentsList[2] !== control.dayOfWeek
+      || argumentsList[3] !== control.startHour || argumentsList[4] !== control.endHour) return;
+    const readyFile = path.join(
+      controlDirectory,
+      `rules-workspace-window-write-ready-${processLabel}-${control.nonce}.json`,
+    );
+    fs.renameSync(writeArmFile, readyFile);
+    const releaseFile = path.join(
+      controlDirectory,
+      `rules-workspace-window-write-release-${processLabel}-${control.nonce}.txt`,
+    );
+    waitForRaceRelease(releaseFile, control.nonce, "rules workspace window write");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
 function consumeCandidateEntryArm(sectionId) {
   // Candidate 路由已经完成 Cookie 验证并进入 DEFERRED 事务，但第一条业务 SELECT
   // 尚未执行。测试可在这里安全建立 EXCLUSIVE 锁，确保 BUSY 真正来自 Candidate 路径。
@@ -434,8 +544,8 @@ function patchBetterSqlite3(Database) {
     return result;
   };
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装带显式 production marker 的目标语句：Candidate、Year workspace、两套
-    // 管理聚合与自改密码首读。其余 SQL 保持透明，普通生产构建也不会加载本 preload。
+    // 只包装带显式 production marker 的目标语句：Candidate、Year workspace、三套
+    // 管理聚合、Rules 写入与自改密码首读。其余 SQL 保持透明。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;
@@ -525,6 +635,32 @@ function patchBetterSqlite3(Database) {
           runArguments[2],
           result.changes,
         );
+        return result;
+      };
+    }
+    if (sql.includes(rulesWorkspaceWindowsSqlMarker)) {
+      const originalAll = statement.all;
+      statement.all = function rulesWorkspaceAwareAll(...allArguments) {
+        consumeRulesWorkspaceEntryArm();
+        const rows = Reflect.apply(originalAll, this, allArguments);
+        consumeRulesWorkspaceSnapshotArm(rows);
+        return rows;
+      };
+    }
+    if (sql.includes(rulesWorkspaceRuleWriteSqlMarker)) {
+      const originalRun = statement.run;
+      statement.run = function rulesWorkspaceRuleWriteAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        consumeRulesWorkspaceRuleWriteArm(runArguments, result.changes);
+        return result;
+      };
+    }
+    if (sql.includes(rulesWorkspaceWindowWriteSqlMarker)) {
+      const originalRun = statement.run;
+      const kind = sql.includes("teacher_unavailable_windows") ? "Teacher" : "Year";
+      statement.run = function rulesWorkspaceWindowWriteAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        consumeRulesWorkspaceWindowWriteArm(kind, runArguments, result.changes);
         return result;
       };
     }

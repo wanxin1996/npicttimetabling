@@ -32,6 +32,11 @@ import {
   STUDENT_GROUP_PROGRAM_MAX_LENGTH,
   TEACHER_NAME_MAX_LENGTH,
 } from "./master-data-input";
+import {
+  isOpaqueResourceId as isUnavailableWindowResourceId,
+  parseUnavailableWindowInput,
+  type UnavailableWindowInput,
+} from "./unavailability-input";
 
 // 下面这些类型描述数据库发送给浏览器的简化数据结构。
 // 字段名刻意使用业务人员容易理解的名称，避免前端代码直接依赖 SQLite 的底层列名。
@@ -231,6 +236,15 @@ export type RuleSettingRecord = {
   enabled: boolean;
 };
 
+export type RulesWorkspaceRecord = {
+  // Rules 画面中的四组资料必须来自同一个 SQLite 快照；若把这些数组拆成独立 GET，
+  // 规则开关与已经重新计算的 warnings 可能分别来自提交前后两个时刻。
+  unavailableWindows: UnavailableWindowRecord[];
+  issues: ScheduleIssueRecord[];
+  ruleSettings: RuleSettingRecord[];
+  teachers: TeacherRecord[];
+};
+
 export type AppUserRecord = { id: string; username: string; isAdmin: boolean; isActive: boolean };
 
 export type CycleStatusRecord = {
@@ -276,7 +290,7 @@ const globalForDatabase = globalThis as unknown as {
 // 这个数字只在 initializeTables 的表、列或索引定义发生变化时增加。
 // 开发热重载会保留全局 SQLite 连接，但会重新载入本文件；版本不同就补做一次迁移，
 // 同一版本的普通 API 请求则直接复用连接，不再每次解析整组 CREATE／ALTER 语句。
-const runtimeSchemaVersion = 2026081102;
+const runtimeSchemaVersion = 2026081103;
 
 function databaseFilePath() {
   // 数据库路径统一从这里取得，确保正式数据库和恢复前自动生成的安全副本
@@ -520,6 +534,14 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
         end_hour <= start_hour LIMIT 1`,
     },
     {
+      area: "teacher unavailable-window uniqueness",
+      // 上传来源可能有正确的表和列，却刻意删掉 live 数据库的 unique index。
+      // 因此恢复前必须直接检查自然键，而不能把 INSERT 时的约束失败误报成未知 500。
+      sql: `SELECT 1 FROM teacher_unavailable_windows
+        GROUP BY teacher_id, day_of_week, start_hour, end_hour
+        HAVING COUNT(*) > 1 LIMIT 1`,
+    },
+    {
       area: "year blocked windows",
       sql: `SELECT 1 FROM year_blocked_windows WHERE
         typeof(id) <> 'text' OR trim(id) = '' OR
@@ -528,6 +550,12 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
         typeof(start_hour) <> 'integer' OR start_hour NOT BETWEEN 8 AND 17 OR
         typeof(end_hour) <> 'integer' OR end_hour NOT BETWEEN 9 AND 18 OR
         end_hour <= start_hour LIMIT 1`,
+    },
+    {
+      area: "year blocked-window uniqueness",
+      sql: `SELECT 1 FROM year_blocked_windows
+        GROUP BY year, day_of_week, start_hour, end_hour
+        HAVING COUNT(*) > 1 LIMIT 1`,
     },
     {
       area: "rule settings",
@@ -1128,15 +1156,15 @@ function initializeTables(db: DatabaseInstance) {
       id TEXT PRIMARY KEY,
       teacher_id TEXT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
       day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
-      start_hour INTEGER NOT NULL,
-      end_hour INTEGER NOT NULL CHECK (end_hour > start_hour)
+      start_hour INTEGER NOT NULL CHECK (start_hour BETWEEN 8 AND 17),
+      end_hour INTEGER NOT NULL CHECK (end_hour BETWEEN 9 AND 18 AND end_hour > start_hour)
     );
     CREATE TABLE IF NOT EXISTS year_blocked_windows (
       id TEXT PRIMARY KEY,
       year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
       day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
-      start_hour INTEGER NOT NULL,
-      end_hour INTEGER NOT NULL CHECK (end_hour > start_hour)
+      start_hour INTEGER NOT NULL CHECK (start_hour BETWEEN 8 AND 17),
+      end_hour INTEGER NOT NULL CHECK (end_hour BETWEEN 9 AND 18 AND end_hour > start_hour)
     );
     CREATE TABLE IF NOT EXISTS rule_settings (
       rule_key TEXT PRIMARY KEY,
@@ -1231,6 +1259,36 @@ function initializeTables(db: DatabaseInstance) {
     db.exec("ALTER TABLE course_sections ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
   }
 
+  // 早期版本只为自然键建立普通索引，因此同一教师／年级的完全相同时段可能被重复保存。
+  // 升级必须先确定性保留最早的 rowid，再把约束升级为 unique。整个过程用 IMMEDIATE
+  // 串行化：两个 standalone 同时启动时，后一个进程只能在前一个提交后检查同一结果，
+  // 不会一个正在删重、另一个已尝试建索引而留下半完成 schema。新旧两个索引名称
+  // 都先删除再重建，避免历史中间版本留下“名称正确、形状或 unique 属性错误”的索引，
+  // 被 IF NOT EXISTS 静默当成已完成迁移。
+  const migrateUnavailableWindowKeys = db.transaction(() => {
+    db.exec(`
+      DELETE FROM teacher_unavailable_windows
+      WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM teacher_unavailable_windows
+        GROUP BY teacher_id, day_of_week, start_hour, end_hour
+      );
+      DELETE FROM year_blocked_windows
+      WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM year_blocked_windows
+        GROUP BY year, day_of_week, start_hour, end_hour
+      );
+      DROP INDEX IF EXISTS teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx;
+      DROP INDEX IF EXISTS year_blocked_windows_year_day_of_week_start_hour_end_hour_idx;
+      DROP INDEX IF EXISTS teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key;
+      DROP INDEX IF EXISTS year_blocked_windows_year_day_of_week_start_hour_end_hour_key;
+      CREATE UNIQUE INDEX teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key
+        ON teacher_unavailable_windows (teacher_id, day_of_week, start_hour, end_hour);
+      CREATE UNIQUE INDEX year_blocked_windows_year_day_of_week_start_hour_end_hour_key
+        ON year_blocked_windows (year, day_of_week, start_hour, end_hour);
+    `);
+  });
+  migrateUnavailableWindowKeys.immediate();
+
   // SQLite 不会像 Prisma migration 那样自动建立 @@index，也不会为普通外键自动加索引。
   // 这里只建立实际 API 查询会使用的最小集合；普通唯一键已经自动拥有索引，不再重复建立。
   // 复合索引名称写出完整列清单，避免旧版本曾建立同名前缀索引时，IF NOT EXISTS
@@ -1258,10 +1316,6 @@ function initializeTables(db: DatabaseInstance) {
       ON scheduled_lessons (day_of_week, start_hour);
     CREATE INDEX IF NOT EXISTS scheduled_lessons_section_id_day_of_week_start_hour_idx
       ON scheduled_lessons (section_id, day_of_week, start_hour);
-    CREATE INDEX IF NOT EXISTS teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx
-      ON teacher_unavailable_windows (teacher_id, day_of_week, start_hour, end_hour);
-    CREATE INDEX IF NOT EXISTS year_blocked_windows_year_day_of_week_start_hour_end_hour_idx
-      ON year_blocked_windows (year, day_of_week, start_hour, end_hour);
   `);
 }
 
@@ -1548,10 +1602,11 @@ export function resetAppUserPassword(userId: string, newPassword: string) {
   }
 }
 
-export function listTeachers(): TeacherRecord[] {
+function readTeachers(db: DatabaseInstance, markDataWorkspaceSnapshot: boolean): TeacherRecord[] {
   // 在教师资料旁统计从教学分配表导入的班次数量，让资料页无需额外计算，
-  // 就能直接显示每位教师预计承担多少个班次。
-  const rows = masterDataDatabase().prepare(`
+  // 就能直接显示每位教师预计承担多少个班次。测试屏障 marker 只属于 Data aggregate
+  // 的第一条查询：独立 /teachers、Year 或 Rules 轮询不能误消费另一个请求的 preload arm。
+  const query = markDataWorkspaceSnapshot ? `
     /* timetabling:data-workspace-teachers */
     SELECT teachers.id, teachers.revision, teachers.name, teachers.staff_type, teachers.is_active,
       COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
@@ -1559,8 +1614,20 @@ export function listTeachers(): TeacherRecord[] {
     LEFT JOIN teaching_allocations ON teaching_allocations.teacher_id = teachers.id
     GROUP BY teachers.id
     ORDER BY teachers.staff_type DESC, teachers.name ASC
-  `).all() as Array<{ id: string; revision: number; name: string; staff_type: "FT" | "PT"; is_active: number; sections: number }>;
+  ` : `
+    SELECT teachers.id, teachers.revision, teachers.name, teachers.staff_type, teachers.is_active,
+      COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
+    FROM teachers
+    LEFT JOIN teaching_allocations ON teaching_allocations.teacher_id = teachers.id
+    GROUP BY teachers.id
+    ORDER BY teachers.staff_type DESC, teachers.name ASC
+  `;
+  const rows = db.prepare(query).all() as Array<{ id: string; revision: number; name: string; staff_type: "FT" | "PT"; is_active: number; sections: number }>;
   return rows.map((row) => ({ id: row.id, revision: row.revision, name: row.name, staffType: row.staff_type, status: activeStatus(row.is_active), sections: row.sections }));
+}
+
+export function listTeachers(): TeacherRecord[] {
+  return readTeachers(masterDataDatabase(), false);
 }
 
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
@@ -1873,15 +1940,46 @@ export function setRoomStatus(id: string, isActive: boolean, revision: number): 
   }
 }
 
-export function listUnavailableWindows(): UnavailableWindowRecord[] {
+function readUnavailableWindows(db: DatabaseInstance, markRulesWorkspaceSnapshot: boolean): UnavailableWindowRecord[] {
   // 教师和年级不可用时段合并成一个界面列表，但保留类型字段，方便编辑时识别来源。
-  const teachers = database().prepare(`SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label, windows.day_of_week, windows.start_hour, windows.end_hour FROM teacher_unavailable_windows windows JOIN teachers ON teachers.id = windows.teacher_id ORDER BY teachers.name, windows.day_of_week, windows.start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
-  const years = database().prepare(`SELECT id, CAST(year AS TEXT) AS owner_id, 'Year ' || year AS owner_label, day_of_week, start_hour, end_hour FROM year_blocked_windows ORDER BY year, day_of_week, start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
+  // aggregate 的第一条 SELECT 独占 marker 并固定 DEFERRED 快照；legacy GET 不携带，
+  // 从而不会误触发跨进程测试为 Rules workspace 安装的读屏障。
+  const teacherQuery = markRulesWorkspaceSnapshot
+    ? `/* timetabling:rules-workspace-windows */
+       SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label,
+         windows.day_of_week, windows.start_hour, windows.end_hour
+       FROM teacher_unavailable_windows windows
+       JOIN teachers ON teachers.id = windows.teacher_id
+       ORDER BY teachers.name, windows.day_of_week, windows.start_hour`
+    : `SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label,
+         windows.day_of_week, windows.start_hour, windows.end_hour
+       FROM teacher_unavailable_windows windows
+       JOIN teachers ON teachers.id = windows.teacher_id
+       ORDER BY teachers.name, windows.day_of_week, windows.start_hour`;
+  const teachers = db.prepare(teacherQuery).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
+  const years = db.prepare(`SELECT id, CAST(year AS TEXT) AS owner_id, 'Year ' || year AS owner_label, day_of_week, start_hour, end_hour FROM year_blocked_windows ORDER BY year, day_of_week, start_hour`).all() as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
   return [...teachers.map((row) => ({ id: row.id, kind: "Teacher" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour })), ...years.map((row) => ({ id: row.id, kind: "Year" as const, ownerId: row.owner_id, ownerLabel: row.owner_label, dayOfWeek: row.day_of_week, startHour: row.start_hour, endHour: row.end_hour }))];
 }
 
-export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; ownerId: string; dayOfWeek: number; startHour: number; endHour: number }) {
+export function listUnavailableWindows(): UnavailableWindowRecord[] {
+  return readUnavailableWindows(database(), false);
+}
+
+export class UnavailableWindowConflictError extends Error {
+  // exact duplicate 是可解释的业务冲突；专用类型让 route 返回稳定 409，同时继续隐藏
+  // index 名、表名和底层 SQLite 英文错误。
+  constructor() {
+    super("This unavailable window already exists.");
+    this.name = "UnavailableWindowConflictError";
+  }
+}
+
+export function createUnavailableWindow(input: UnavailableWindowInput) {
   // 不可用时段采用左闭右开区间 [开始, 结束)，与课程重叠判断规则保持一致。
+  // 即使调用者不是 HTTP route，也必须经过同一套原生类型、opaque ID 与安全整数检查。
+  const parsed = parseUnavailableWindowInput(input);
+  if (!parsed.ok) throw new MasterDataInputError(parsed.error);
+  input = parsed.value;
   const id = crypto.randomUUID();
   const db = database();
   const createTransaction = db.transaction(() => {
@@ -1889,18 +1987,49 @@ export function createUnavailableWindow(input: { kind: "Teacher" | "Year"; owner
       // API 会先验证格式；数据库边界再确认教师仍存在，封住删除与保存同时发生的竞态。
       const teacherExists = db.prepare("SELECT 1 FROM teachers WHERE id = ?").get(input.ownerId);
       if (!teacherExists) throw new MasterDataInputError("Choose a valid teacher.");
-      db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
+      db.prepare(`/* timetabling:rules-workspace-window-write */
+        INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour)
+        VALUES (?, ?, ?, ?, ?)`
+      ).run(id, input.ownerId, input.dayOfWeek, input.startHour, input.endHour);
     } else {
-      db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)").run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+      db.prepare(`/* timetabling:rules-workspace-window-write */
+        INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour)
+        VALUES (?, ?, ?, ?, ?)`
+      ).run(id, Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
     }
     // 新时段和受影响课程 warning 必须一起出现；任何重算故障都会删除刚插入的时段。
     refreshAllScheduleWarnings(db);
     return id;
   });
-  return createTransaction.immediate();
+  try {
+    return createTransaction.immediate();
+  } catch (error) {
+    if (error instanceof MasterDataInputError) throw error;
+    if (isSqliteUniqueConstraintError(error)) {
+      // 不能把任意 UNIQUE 故障都翻译成“同一时段已存在”。UUID 主键当前使用不同的
+      // SQLite extended code，但未来表上可能再增加其他唯一键；故事务回滚后按本次
+      // natural key 做一次精确确认。只有确实找到同一窗口才对外给 typed 409，其他
+      // unique、trigger 或故障注入仍保留原异常并由 route 隐藏成安全 500。
+      const duplicate = input.kind === "Teacher"
+        ? db.prepare(`SELECT 1 FROM teacher_unavailable_windows
+            WHERE teacher_id = ? AND day_of_week = ? AND start_hour = ? AND end_hour = ?`
+          ).get(input.ownerId, input.dayOfWeek, input.startHour, input.endHour)
+        : db.prepare(`SELECT 1 FROM year_blocked_windows
+            WHERE year = ? AND day_of_week = ? AND start_hour = ? AND end_hour = ?`
+          ).get(Number(input.ownerId), input.dayOfWeek, input.startHour, input.endHour);
+      if (duplicate) throw new UnavailableWindowConflictError();
+    }
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
+  // DELETE 的 HTTP 查询参数和直接数据库调用共享 opaque-ID 边界；动态 table 名只会
+  // 从封闭 kind 集合中选择，不能由任意字符串进入 SQL。
+  if (!isUnavailableWindowResourceId(id) || (kind !== "Teacher" && kind !== "Year")) {
+    throw new MasterDataInputError("Rule id and kind are required.");
+  }
   // 先根据类型选择准确的数据表，避免不同表中恰好出现相同 ID 时误删其他记录。
   const table = kind === "Teacher" ? "teacher_unavailable_windows" : "year_blocked_windows";
   const db = database();
@@ -1910,7 +2039,12 @@ export function deleteUnavailableWindow(id: string, kind: "Teacher" | "Year") {
     if (removed) refreshAllScheduleWarnings(db);
     return removed;
   });
-  return deleteTransaction.immediate();
+  try {
+    return deleteTransaction.immediate();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
@@ -1923,26 +2057,78 @@ const ruleSettingDetails: Array<Omit<RuleSettingRecord, "enabled">> = [
   { key: "separate_weekly_sessions", label: "Separate twice-weekly sessions", description: "Warn when both meetings of one class use the same day." },
 ];
 
-export function listRuleSettings(): RuleSettingRecord[] {
+function readRuleSettings(db: DatabaseInstance): RuleSettingRecord[] {
   // 在程序中把固定的规则说明与数据库中的开关值合并；数据库只保存老师可修改的状态，
   // 文字说明由代码统一维护，避免重复和版本不一致。
-  const rows = database().prepare("SELECT rule_key, is_enabled FROM rule_settings").all() as Array<{ rule_key: string; is_enabled: number }>;
+  const rows = db.prepare("SELECT rule_key, is_enabled FROM rule_settings").all() as Array<{ rule_key: string; is_enabled: number }>;
   const enabledByKey = new Map(rows.map((row) => [row.rule_key, Boolean(row.is_enabled)]));
   return ruleSettingDetails.map((rule) => ({ ...rule, enabled: enabledByKey.get(rule.key) ?? true }));
 }
 
-export function updateRuleSetting(key: string, enabled: boolean) {
+export function listRuleSettings(): RuleSettingRecord[] {
+  return readRuleSettings(database());
+}
+
+export function listRulesWorkspace(): RulesWorkspaceRecord {
+  // 四组 Rules 资料在同一个 DEFERRED 事务内读取。第一条 marked SELECT 一旦执行，
+  // SQLite 就固定已提交快照；另一个进程的规则 CAS 与 warning 重算只能全部出现在
+  // 下一次 workspace，不能让页面看到“新开关 + 旧问题”或反向的混合状态。
+  try {
+    const db = database();
+    const readWorkspace = db.transaction(() => ({
+      unavailableWindows: readUnavailableWindows(db, true),
+      issues: listScheduleIssues(),
+      ruleSettings: readRuleSettings(db),
+      teachers: readTeachers(db, false),
+    }));
+    return readWorkspace.deferred();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
+}
+
+export class RuleSettingChangedError extends Error {
+  // expectedEnabled 相当于规则开关的一位 revision。发生竞态时必须让用户先查看最新
+  // warnings，而不是把“结果碰巧等于 desired”误当成当前请求已经成功。
+  constructor() {
+    super("This rule setting was changed by another scheduler. The latest rules have been reloaded.");
+    this.name = "RuleSettingChangedError";
+  }
+}
+
+export function updateRuleSetting(key: string, expectedEnabled: boolean, enabled: boolean): { enabled: boolean; changed: boolean } | null {
   // 只有已登记的政策规则键可以修改。教师、班级和教室重叠等核心冲突没有开关，
   // 因而不会被用户意外停用。
-  if (!ruleSettingDetails.some((rule) => rule.key === key)) return false;
+  if (typeof key !== "string" || typeof expectedEnabled !== "boolean" || typeof enabled !== "boolean") {
+    throw new MasterDataInputError("Rule key and enabled state are invalid.");
+  }
+  if (!ruleSettingDetails.some((rule) => rule.key === key)) return null;
   const db = database();
   const settingTransaction = db.transaction(() => {
-    const changed = db.prepare("UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ?").run(enabled ? 1 : 0, key).changes > 0;
+    const current = db.prepare("SELECT is_enabled FROM rule_settings WHERE rule_key = ?").get(key) as { is_enabled: number } | undefined;
+    if (!current) return null;
+    const currentEnabled = Boolean(current.is_enabled);
+    // 比较 expected 必须发生在 no-op 判断之前。若另一位老师已经改成相同 desired，
+    // 当前 stale 请求仍然是 409，而不是虚假报告“本次保存没有变化”。
+    if (currentEnabled !== expectedEnabled) throw new RuleSettingChangedError();
+    if (currentEnabled === enabled) return { enabled: currentEnabled, changed: false };
+
+    const result = db.prepare(`/* timetabling:rules-workspace-rule-write */
+      UPDATE rule_settings SET is_enabled = ? WHERE rule_key = ? AND is_enabled = ?`
+    ).run(enabled ? 1 : 0, key, expectedEnabled ? 1 : 0);
+    if (result.changes !== 1) throw new RuleSettingChangedError();
     // 规则开关和由它生成／清除的所有 warning 对老师来说是一个不可分割的结果。
-    if (changed) refreshAllScheduleWarnings(db);
-    return changed;
+    refreshAllScheduleWarnings(db);
+    return { enabled, changed: true };
   });
-  return settingTransaction.immediate();
+  try {
+    return settingTransaction.immediate();
+  } catch (error) {
+    if (error instanceof RuleSettingChangedError || error instanceof MasterDataInputError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
@@ -2685,7 +2871,9 @@ export function listDataManagementWorkspace(): DataManagementWorkspaceRecord {
   try {
     const db = database();
     const readWorkspace = db.transaction(() => ({
-      teachers: listTeachers(),
+      // 只有 aggregate 调用携带专属 marker；共享 listTeachers() 保持普通查询，避免
+      // Rules／Year 轮询抢走 data-workspace 的确定性跨进程屏障。
+      teachers: readTeachers(db, true),
       groups: listStudentGroups(),
       rooms: listRooms(),
       courses: listCourses(),

@@ -381,8 +381,8 @@ function verifyRuntimeIndexes() {
     ["scheduled_lessons_room_id_day_of_week_start_hour_idx", ["room_id", "day_of_week", "start_hour"]],
     ["scheduled_lessons_day_of_week_start_hour_idx", ["day_of_week", "start_hour"]],
     ["scheduled_lessons_section_id_day_of_week_start_hour_idx", ["section_id", "day_of_week", "start_hour"]],
-    ["teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx", ["teacher_id", "day_of_week", "start_hour", "end_hour"]],
-    ["year_blocked_windows_year_day_of_week_start_hour_end_hour_idx", ["year", "day_of_week", "start_hour", "end_hour"]],
+    ["teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key", ["teacher_id", "day_of_week", "start_hour", "end_hour"]],
+    ["year_blocked_windows_year_day_of_week_start_hour_end_hour_key", ["year", "day_of_week", "start_hour", "end_hour"]],
   ]);
   const db = new Database(testDatabasePath, { readonly: true });
   try {
@@ -406,8 +406,8 @@ function verifyRuntimeIndexes() {
     planUses("SELECT id FROM scheduled_lessons WHERE room_id = ? AND day_of_week = ? AND start_hour < ?", ["perf-room-001", 1, 18], "scheduled_lessons_room_id_day_of_week_start_hour_idx");
     planUses("SELECT id FROM scheduled_lessons WHERE day_of_week = ? AND start_hour < ?", [1, 18], "scheduled_lessons_day_of_week_start_hour_idx");
     planUses("SELECT 1 FROM scheduled_lessons WHERE id <> ? AND section_id = ? AND day_of_week = ?", ["none", "perf-section-001", 1], "scheduled_lessons_section_id_day_of_week_start_hour_idx");
-    planUses("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?", ["perf-teacher-001", 1, 18, 8], "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_idx");
-    planUses("SELECT 1 FROM year_blocked_windows WHERE year = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?", [1, 3, 18, 8], "year_blocked_windows_year_day_of_week_start_hour_end_hour_idx");
+    planUses("SELECT 1 FROM teacher_unavailable_windows WHERE teacher_id = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?", ["perf-teacher-001", 1, 18, 8], "teacher_unavailable_windows_teacher_id_day_of_week_start_hour_end_hour_key");
+    planUses("SELECT 1 FROM year_blocked_windows WHERE year = ? AND day_of_week = ? AND start_hour < ? AND end_hour > ?", [1, 3, 18, 8], "year_blocked_windows_year_day_of_week_start_hour_end_hour_key");
   } finally {
     db.close();
   }
@@ -607,6 +607,37 @@ async function verifyReadPerformance(schedulerCookies) {
     assert(pollWallMedian <= limits.pollWallMilliseconds, `Poll wall median ${formatMilliseconds(pollWallMedian)} exceeded ${limits.pollWallMilliseconds} ms.`);
     assert(pollP95 <= limits.pollP95Milliseconds, `Poll request p95 ${formatMilliseconds(pollP95)} exceeded ${limits.pollP95Milliseconds} ms.`);
     report(`六账号 6 请求一致快照轮询：整轮中位 ${formatMilliseconds(pollWallMedian)}；请求 p95 ${formatMilliseconds(pollP95)}`);
+
+    // Rules 页也每五秒请求一次聚合快照。单独测六个账号同时轮询，
+    // 并逐项锁定四组资料数量；若路由意外返回空数组，不能因为“更快”而假通过。
+    const rulesPollWalls = [];
+    const rulesPollRequestDurations = [];
+    const runRulesPollBurst = async () => {
+      const startedAt = performance.now();
+      const results = await Promise.all(
+        schedulerCookies.map((cookie) => requestApi("/api/rules/workspace", { cookie })),
+      );
+      for (const result of results) {
+        assert.equal(result.body.unavailableWindows.length, 33);
+        assert.equal(result.body.issues.length, scale.initialIssues);
+        assert.equal(result.body.ruleSettings.length, 7);
+        assert.equal(result.body.teachers.length, scale.teachers);
+      }
+      return { wall: performance.now() - startedAt, durations: results.map((result) => result.durationMilliseconds) };
+    };
+    await runRulesPollBurst();
+    for (let round = 0; round < 3; round += 1) {
+      const result = await runRulesPollBurst();
+      rulesPollWalls.push(result.wall);
+      rulesPollRequestDurations.push(...result.durations);
+    }
+    const rulesPollWallMedian = median(rulesPollWalls);
+    const rulesPollP95 = percentile(rulesPollRequestDurations, 0.95);
+    assert(rulesPollWallMedian <= limits.pollWallMilliseconds,
+      `Rules poll wall median ${formatMilliseconds(rulesPollWallMedian)} exceeded ${limits.pollWallMilliseconds} ms.`);
+    assert(rulesPollP95 <= limits.pollP95Milliseconds,
+      `Rules poll request p95 ${formatMilliseconds(rulesPollP95)} exceeded ${limits.pollP95Milliseconds} ms.`);
+    report(`六账号 Rules 聚合轮询：整轮中位 ${formatMilliseconds(rulesPollWallMedian)}；请求 p95 ${formatMilliseconds(rulesPollP95)}`);
 
     // trigger 建立后才记录 data_version；整个纯读阶段不能提交任何数据库变化。
     assert.equal(observer.pragma("data_version", { simple: true }), dataVersionBefore);
