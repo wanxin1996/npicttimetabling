@@ -1,12 +1,14 @@
 import { DatabaseBusyError, listYearTimetableWorkspace } from "@/lib/database";
+import { safeDatabaseFailureResponse } from "@/lib/database-response";
+import { parseTimetableYear } from "@/lib/schedule-input";
 
 // 年级排课工作区读取本地 SQLite，并且必须让总表与待排区来自同一数据库快照。
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   // 三个年级各有独立总表；拒绝其他数字，避免错误参数悄悄返回空画面。
-  const year = Number(new URL(request.url).searchParams.get("year") ?? 1);
-  if (![1, 2, 3].includes(year)) {
+  const year = parseTimetableYear(new URL(request.url).searchParams.get("year"));
+  if (year === null) {
     return Response.json({ error: "Year must be 1, 2 or 3." }, { status: 400 });
   }
 
@@ -20,7 +22,8 @@ export async function GET(request: Request) {
     if (error instanceof DatabaseBusyError) {
       return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
     }
-    console.error("Year timetable workspace read failed", error);
-    return Response.json({ error: "The timetable workspace could not be loaded. Try again." }, { status: 500 });
+    // 原始 SQLite BUSY（例如初始化尚未转换的错误）也应成为同样可重试的 503；
+    // 其他异常只在服务器日志保留技术细节。
+    return safeDatabaseFailureResponse(error, "Year timetable workspace read failed", "The timetable workspace could not be loaded. Try again.");
   }
 }

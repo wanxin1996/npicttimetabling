@@ -1,4 +1,6 @@
 import { CycleActionBusyError, CycleActionConflictError, cycleStatus, restoreLastCycleBackup, startNewCycle } from "@/lib/database";
+import { safeDatabaseFailureResponse } from "@/lib/database-response";
+import { readJsonObject } from "@/lib/request-json";
 
 export const runtime = "nodejs";
 
@@ -7,24 +9,18 @@ export function GET() {
   try {
     return Response.json(cycleStatus());
   } catch (error) {
-    if (error instanceof CycleActionBusyError) return Response.json({ error: error.message }, { status: 503 });
-    console.error("Cycle status load failed", error);
-    return Response.json({ error: "Cycle status could not be loaded. Try again." }, { status: 500 });
+    if (error instanceof CycleActionBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
+    // 原始 BUSY 仍可能来自事务建立前的初始化；统一边界补齐该情况。
+    return safeDatabaseFailureResponse(error, "Cycle status load failed", "Cycle status could not be loaded. Try again.");
   }
 }
 
 export async function POST(request: Request) {
   // 同一接口处理“开始新周期”和“恢复周期”两项相关高风险操作；
   // action 名称及准确确认短语共同决定允许执行哪个数据库事务。
-  let parsedBody: unknown;
-  try {
-    parsedBody = await request.json();
-  } catch {
-    return Response.json({ error: "Choose a valid cycle action." }, { status: 400 });
-  }
-  const body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
-    ? parsedBody as Record<string, unknown>
-    : {};
+  const parsed = await readJsonObject(request, "Choose a valid cycle action.");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   try {
     if (body.action === "start") {
       // 服务器要求完全匹配确认短语，防止有人绕过界面三次确认，
@@ -41,10 +37,9 @@ export async function POST(request: Request) {
     return Response.json({ error: "Choose a valid cycle action." }, { status: 400 });
   } catch (error) {
     if (error instanceof CycleActionConflictError) return Response.json({ error: error.message }, { status: 409 });
-    if (error instanceof CycleActionBusyError) return Response.json({ error: error.message }, { status: 503 });
+    if (error instanceof CycleActionBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
     // 未知 SQLite、trigger 或文件故障只写服务器日志；不能把技术文字泄露给浏览器，
     // 也不能误报成老师可以靠重新确认解决的 409。
-    console.error("Cycle action failed", error);
-    return Response.json({ error: "The cycle action could not be completed. Try again." }, { status: 500 });
+    return safeDatabaseFailureResponse(error, "Cycle action failed", "The cycle action could not be completed. Try again.");
   }
 }

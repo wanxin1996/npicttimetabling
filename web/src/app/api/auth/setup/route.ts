@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { attachSessionCookie } from "@/lib/auth";
 import { createInitialAdmin, InitialAdministratorAlreadyExistsError } from "@/lib/database";
 import { passwordHasValidLength, usernameHasValidLength, verifyAdministratorSetupToken } from "@/lib/auth-input";
+import { safeDatabaseFailureResponse } from "@/lib/database-response";
 import { readJsonObject } from "@/lib/request-json";
 
 export const runtime = "nodejs";
@@ -35,7 +36,8 @@ export async function POST(request: NextRequest) {
     if (error instanceof InitialAdministratorAlreadyExistsError) {
       return NextResponse.json({ error: error.message }, { status: 409 });
     }
-    console.error("Initial administrator setup failed", error);
-    return NextResponse.json({ error: "Administrator setup failed. Try again." }, { status: 500 });
+    // 首次建库也可能在连接初始化阶段碰到另一个实例的 SQLite 锁；统一转换后，
+    // 浏览器可按 Retry-After 重试，其他内部错误则不会泄漏路径或 SQL。
+    return safeDatabaseFailureResponse(error, "Initial administrator setup failed", "Administrator setup failed. Try again.");
   }
 }

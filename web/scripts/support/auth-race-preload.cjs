@@ -46,6 +46,10 @@ const candidateSnapshotSqlMarker = "/* timetabling:candidate-snapshot */";
 const candidateRoomUpdateSqlMarker = "/* timetabling:candidate-race-room-update */";
 const yearWorkspaceLessonsSqlMarker = "/* timetabling:year-workspace-lessons */";
 const yearWorkspacePlacementSqlMarker = "/* timetabling:year-workspace-race-placement */";
+const dataWorkspaceTeachersSqlMarker = "/* timetabling:data-workspace-teachers */";
+const dataWorkspaceImportSqlMarker = "/* timetabling:data-workspace-import-write */";
+const courseWorkspaceSectionsSqlMarker = "/* timetabling:course-workspace-sections */";
+const courseWorkspaceSectionWriteSqlMarker = "/* timetabling:course-workspace-section-write */";
 const databaseInitializationSqlMarker = "/* timetabling:database-initialization */";
 let pendingInitializationClose;
 
@@ -174,6 +178,142 @@ function consumeYearWorkspacePlacementArm(sectionId, occurrence, changes) {
   }
 }
 
+function consumeDataWorkspaceEntryArm() {
+  // 认证完成且 DEFERRED 已建立、首张 teachers 清单尚未读取时暂停 A。第三连接随后
+  // 可以确定性制造真实 SQLITE_BUSY；internal 分支则验证未知异常不会泄漏 SQL 细节。
+  if (processLabel !== "A") return;
+  const entryArmFile = path.join(controlDirectory, "data-workspace-entry-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(entryArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (!["busy", "internal"].includes(control.fault)) return;
+    const readyFile = path.join(controlDirectory, `data-workspace-entry-ready-A-${control.nonce}.json`);
+    fs.renameSync(entryArmFile, readyFile);
+    if (control.fault === "internal") {
+      throw new Error("SECRET data workspace fault: SELECT teachers from /private/tmp/private.sqlite stack");
+    }
+    const releaseFile = path.join(controlDirectory, `data-workspace-entry-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "data workspace entry");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeDataWorkspaceSnapshotArm(rows) {
+  // teachers 已完整物化为旧版本后暂停 A；后续 groups、rooms、courses 仍必须留在
+  // 同一个 DEFERRED 快照，不能与 B 随后提交的 Teaching Members 导入拼成混合画面。
+  if (processLabel !== "A") return;
+  const snapshotArmFile = path.join(controlDirectory, "data-workspace-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(snapshotArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.teacherId !== "string" || !Array.isArray(rows)) return;
+    const target = rows.find((row) => row && row.id === control.teacherId);
+    if (!target || target.staff_type !== control.expectedStaffType
+      || target.sections !== control.expectedSections) return;
+    const readyFile = path.join(controlDirectory, `data-workspace-ready-A-${control.nonce}.json`);
+    fs.renameSync(snapshotArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `data-workspace-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "data workspace snapshot");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeDataWorkspaceImportArm(courseId, changes) {
+  // B 已在同一 IMMEDIATE 导入事务完成教师、allocation、班次和课程 revision 写入后
+  // 才建立 ready。释放测试暂停点后，正式 COMMIT 仍应被 A 的旧快照读锁挡住。
+  if (processLabel !== "B" || changes !== 1) return;
+  const importArmFile = path.join(controlDirectory, "data-workspace-import-arm-B.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(importArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.courseId !== courseId) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    const readyFile = path.join(controlDirectory, `data-workspace-import-ready-B-${control.nonce}.json`);
+    fs.renameSync(importArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `data-workspace-import-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "data workspace import");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeCourseWorkspaceEntryArm(courseId) {
+  // 课程聚合已完成认证、并在首张 sections 查询前暂停。绑定 courseId 可防止 arm 被
+  // 同进程的其他课程详情请求误消费。
+  if (processLabel !== "A") return;
+  const entryArmFile = path.join(controlDirectory, "course-workspace-entry-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(entryArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.courseId !== courseId) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (!["busy", "internal"].includes(control.fault)) return;
+    const readyFile = path.join(controlDirectory, `course-workspace-entry-ready-A-${control.nonce}.json`);
+    fs.renameSync(entryArmFile, readyFile);
+    if (control.fault === "internal") {
+      throw new Error("SECRET course workspace fault: SELECT sections from /private/tmp/private.sqlite stack");
+    }
+    const releaseFile = path.join(controlDirectory, `course-workspace-entry-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "course workspace entry");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeCourseWorkspaceSnapshotArm(rows, courseId) {
+  // A 已物化旧版 sections 后暂停；currentCourse 在同一事务更早读取，variance 则会在
+  // 释放后读取，三者必须共同保持旧提交版本。
+  if (processLabel !== "A") return;
+  const snapshotArmFile = path.join(controlDirectory, "course-workspace-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(snapshotArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.courseId !== courseId) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.sectionId !== "string" || !Array.isArray(rows)) return;
+    const target = rows.find((row) => row && row.id === control.sectionId);
+    if (!target || target.teacher_id !== control.expectedTeacherId) return;
+    const readyFile = path.join(controlDirectory, `course-workspace-ready-A-${control.nonce}.json`);
+    fs.renameSync(snapshotArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `course-workspace-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "course workspace snapshot");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeCourseWorkspaceSectionWriteArm(teacherId, sectionId, revision, changes) {
+  // B 的 CAS UPDATE 已真实改变目标班次，但外层 IMMEDIATE 尚未提交。四个参数全部匹配
+  // 才建立 ready，避免普通 Section 保存被测试屏障误拦截。
+  if (processLabel !== "B" || changes !== 1) return;
+  const writeArmFile = path.join(controlDirectory, "course-workspace-section-write-arm-B.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(writeArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (control.teacherId !== teacherId || control.sectionId !== sectionId || control.revision !== revision) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    const readyFile = path.join(controlDirectory, `course-workspace-section-write-ready-B-${control.nonce}.json`);
+    fs.renameSync(writeArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `course-workspace-section-write-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "course workspace section write");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
 function consumeCandidateEntryArm(sectionId) {
   // Candidate 路由已经完成 Cookie 验证并进入 DEFERRED 事务，但第一条业务 SELECT
   // 尚未执行。测试可在这里安全建立 EXCLUSIVE 锁，确保 BUSY 真正来自 Candidate 路径。
@@ -264,8 +404,8 @@ function patchBetterSqlite3(Database) {
     return result;
   };
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装五个 Statement marker：Candidate 首条读取、Active rooms 读取、候选竞态
-    // 教室 UPDATE，以及年级 workspace 的首条读取和测试首次排课。其余 SQL 保持透明。
+    // 只包装带显式 production marker 的目标语句：Candidate、Year workspace 与两套
+    // 管理聚合的读写屏障。其余 SQL 保持透明，普通生产构建也不会加载本 preload。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;
@@ -308,6 +448,45 @@ function patchBetterSqlite3(Database) {
       statement.run = function yearWorkspacePlacementAwareRun(...runArguments) {
         const result = Reflect.apply(originalRun, this, runArguments);
         consumeYearWorkspacePlacementArm(runArguments[1], runArguments[2], result.changes);
+        return result;
+      };
+    }
+    if (sql.includes(dataWorkspaceTeachersSqlMarker)) {
+      const originalAll = statement.all;
+      statement.all = function dataWorkspaceAwareAll(...allArguments) {
+        consumeDataWorkspaceEntryArm();
+        const rows = Reflect.apply(originalAll, this, allArguments);
+        consumeDataWorkspaceSnapshotArm(rows);
+        return rows;
+      };
+    }
+    if (sql.includes(dataWorkspaceImportSqlMarker)) {
+      const originalRun = statement.run;
+      statement.run = function dataWorkspaceImportAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        consumeDataWorkspaceImportArm(runArguments[0], result.changes);
+        return result;
+      };
+    }
+    if (sql.includes(courseWorkspaceSectionsSqlMarker)) {
+      const originalAll = statement.all;
+      statement.all = function courseWorkspaceAwareAll(...allArguments) {
+        consumeCourseWorkspaceEntryArm(allArguments[0]);
+        const rows = Reflect.apply(originalAll, this, allArguments);
+        consumeCourseWorkspaceSnapshotArm(rows, allArguments[0]);
+        return rows;
+      };
+    }
+    if (sql.includes(courseWorkspaceSectionWriteSqlMarker)) {
+      const originalRun = statement.run;
+      statement.run = function courseWorkspaceSectionWriteAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        consumeCourseWorkspaceSectionWriteArm(
+          runArguments[0],
+          runArguments[1],
+          runArguments[2],
+          result.changes,
+        );
         return result;
       };
     }

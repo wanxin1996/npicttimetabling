@@ -39,12 +39,16 @@ model AuthSession {
 
 model Teacher {
   // 一位教师可以关联导入的教学分配、生成的课程班次以及个人不可用时段。
-  id        String   @id @default(uuid())
-  name      String   @unique
-  staffType String   @default("FT") @map("staff_type")
-  isActive  Boolean  @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+  id                 String   @id @default(uuid())
+  name               String   @unique
+  staffType          String   @default("FT") @map("staff_type")
+  isActive           Boolean  @default(true) @map("is_active")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at")
+  revision           Int      @default(1)
+  // 导入来源键保存 Excel 中首次认领的 Lecturer 标识。人工改名不会改变它，
+  // 因而下一次导入仍会更新原教师，而不会因显示名称不同建立重复记录。
+  teachingMembersKey String?  @unique @map("teaching_members_key")
 
   allocations        TeachingAllocation[]
   sections           CourseSection[] @relation("AssignedSectionTeacher")
@@ -62,6 +66,8 @@ model StudentGroup {
   program   String
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+  // 浏览器提交打开表单时看到的版本，防止旧表单覆盖另一账号刚保存的资料。
+  revision  Int      @default(1)
 
   sections SectionStudentGroup[]
 
@@ -80,6 +86,8 @@ model Room {
   isActive          Boolean  @default(true) @map("is_active")
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
+  // 容量、设施、地址和启用状态共享同一个版本，因为它们都影响排课候选或警告。
+  revision          Int      @default(1)
 
   lessons ScheduledLesson[]
 

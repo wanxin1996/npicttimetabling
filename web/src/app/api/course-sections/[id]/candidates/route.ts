@@ -5,6 +5,7 @@ import {
   CandidateSlotsStateConflictError,
   listCandidateSlots,
 } from "@/lib/database";
+import { safeDatabaseFailureResponse } from "@/lib/database-response";
 
 // 候选建议按需实时计算，因为每次时间表编辑都可能改变哪些教师、班级、教室组合无冲突。
 export const runtime = "nodejs";
@@ -26,7 +27,8 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     if (error instanceof CandidateSlotsNotFoundError) return Response.json({ error: error.message }, { status: 404 });
     if (error instanceof CandidateSlotsStateConflictError) return Response.json({ code: "CANDIDATE_REQUEST_STALE", error: error.message }, { status: 409 });
     if (error instanceof CandidateSlotsBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
-    console.error("Candidate slot calculation failed", error);
-    return Response.json({ error: "Candidate slots could not be calculated. Try again." }, { status: 500 });
+    // database 初始化可能在专用 CandidateSlotsBusyError 产生前就抛出原始 BUSY；
+    // 统一边界同时覆盖这条路径，并把其他技术异常固定为安全 JSON 500。
+    return safeDatabaseFailureResponse(error, "Candidate slot calculation failed", "Candidate slots could not be calculated. Try again.");
   }
 }

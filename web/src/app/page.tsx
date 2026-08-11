@@ -2,6 +2,15 @@
 
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { reconcileLessonDraft } from "@/lib/lesson-draft-reconciliation.mjs";
+import {
+  COURSE_CATALOG_MAX_LENGTH,
+  COURSE_CODE_MAX_LENGTH,
+  ROOM_CAPACITY_MAXIMUM,
+  ROOM_CODE_MAX_LENGTH,
+  STUDENT_GROUP_CODE_MAX_LENGTH,
+  STUDENT_GROUP_PROGRAM_MAX_LENGTH,
+  TEACHER_NAME_MAX_LENGTH,
+} from "@/lib/master-data-input";
 
 // 所有功能页面共用同一个外层布局；View 只决定中间区域显示哪一种排课资料，避免为每张资料表重复维护导航和登录逻辑。
 type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
@@ -9,6 +18,7 @@ type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boole
 
 type Teacher = {
   id: string;
+  revision: number;
   name: string;
   staffType: "FT" | "PT";
   status: "Active" | "Inactive";
@@ -17,6 +27,7 @@ type Teacher = {
 
 type StudentGroup = {
   id: string;
+  revision: number;
   code: string;
   year: number;
   program: string;
@@ -24,6 +35,7 @@ type StudentGroup = {
 
 type Room = {
   id: string;
+  revision: number;
   code: string;
   capacity: number;
   features: string[];
@@ -62,6 +74,8 @@ type CourseSection = {
   revision: number;
 };
 type AllocationVariance = { teacherId: string; teacherName: string; expectedSections: number; actualSections: number };
+type DataManagementWorkspace = { teachers: Teacher[]; groups: StudentGroup[]; rooms: Room[]; courses: Course[] };
+type CourseSectionsWorkspace = { currentCourse: Course; sections: CourseSection[]; allocationVariances: AllocationVariance[] };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type TimetableLoadResult = { loaded: boolean; reopenedLesson: ScheduledLesson | null; unscheduledSections: UnscheduledSection[] };
 type UnscheduledSection = { id: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
@@ -473,6 +487,11 @@ export default function Home() {
   const [editingTeacher, setEditingTeacher] = useState<Teacher | null>(null);
   const [editingGroup, setEditingGroup] = useState<StudentGroup | null>(null);
   const [editingRoom, setEditingRoom] = useState<Room | null>(null);
+  // 教师、班级和教室的编辑／状态按钮按“资料页 + 稳定 ID + 动作”保存引用。
+  // 多人冲突关闭旧表单后，画面可精确回到老师刚才使用的入口，而不是把键盘焦点丢到页面开头。
+  const masterRecordButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const masterDataSearchInputRef = useRef<HTMLInputElement>(null);
+  const loadErrorRefreshButtonRef = useRef<HTMLButtonElement>(null);
   const [courses, setCourses] = useState<Course[]>([]);
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
   // 每门课程的 Configure 按钮按稳定课程 ID 保存引用。旧设置表单因 409 被关闭后，
@@ -483,6 +502,11 @@ export default function Home() {
   const savingCourseSetupIdRef = useRef<string | null>(null);
   const [savingCourseSetupId, setSavingCourseSetupId] = useState<string | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
+  const sectionCountInputRef = useRef<HTMLInputElement>(null);
+  // 班次表单以 revision 为 key 重建。按稳定 section ID 保存可聚焦标题，保存或409重载后
+  // 才能回到同一行；若目标班次已被另一账号移除，则退到本面板 Close，而不是误入邻行。
+  const sectionAssignmentFocusRefs = useRef(new Map<string, HTMLParagraphElement>());
+  const sectionsCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [sections, setSections] = useState<CourseSection[]>([]);
   const [allocationVariances, setAllocationVariances] = useState<AllocationVariance[]>([]);
   // ref 会在第一次点击时立即锁住班次，state 则负责把当前按钮显示为 Saving 并暂时停用其余 Save；
@@ -600,6 +624,24 @@ export default function Home() {
     setManagementMutationKey(null);
   }
 
+  function freezeManagementWorkspace(message: string, tone: NoticeTone = "warning") {
+    // 写请求已提交后若聚合重载失败，或网络中断令提交结果未知，当前 revision 和关联
+    // 清单都不再可信。统一卸载可编辑工作区，只保留 Refresh 入口；绝不能让老师
+    // 在旧画面继续保存第二笔资料，或因重复点击把已成功的第一笔误报成冲突。
+    setAuthScreen("load-error");
+    setNotice(message, tone);
+  }
+
+  function restoreSectionAssignmentFocus(sectionId: string) {
+    // openSections 的三份 state 会在本轮事件结束统一提交；下一帧才查询 ref，确保取得
+    // 新 revision 对应的 DOM。绝不按数组位置回退，以免焦点落到另一班次的保存表单。
+    window.requestAnimationFrame(() => {
+      const sectionTarget = sectionAssignmentFocusRefs.current.get(sectionId);
+      if (sectionTarget?.isConnected) sectionTarget.focus();
+      else sectionsCloseButtonRef.current?.focus();
+    });
+  }
+
   useEffect(() => {
     // 轮询回调每五秒才执行一次，不能依赖建立 interval 时捕获的旧 editingLesson。
     // ref 始终指向画面当前编辑对象，让后台同步可以判断服务器 revision 是否已经变化。
@@ -613,6 +655,14 @@ export default function Home() {
     const animationFrame = window.requestAnimationFrame(() => courseDurationInputRef.current?.focus());
     return () => window.cancelAnimationFrame(animationFrame);
   }, [editingCourse, showForm, view]);
+
+  useEffect(() => {
+    // 资料冲突后的强制重载若也失败，应用会切到完全不可编辑的错误画面。
+    // 等 React 卸载旧工作区后再聚焦唯一恢复入口，键盘用户可以直接重新载入，而不会停在已消失的旧按钮上。
+    if (authScreen !== "load-error") return;
+    const animationFrame = window.requestAnimationFrame(() => loadErrorRefreshButtonRef.current?.focus());
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [authScreen]);
 
   useEffect(() => {
     // 每次产生新的操作结果时重新开始八秒计时；依赖请求序号而不是文案，才能可靠处理连续两次相同结果。
@@ -1587,19 +1637,47 @@ export default function Home() {
   }
 
   const fetchData = useCallback(async () => {
-    // 教师、学生班级、教室和课程互不依赖，因此并行读取四张清单，缩短首次进入资料维护页的等待时间。
-    const [teacherResponse, groupResponse, roomResponse, courseResponse] = await Promise.all([fetch("/api/teachers"), fetch("/api/student-groups"), fetch("/api/rooms"), fetch("/api/courses")]);
-    if (!teacherResponse.ok || !groupResponse.ok || !roomResponse.ok || !courseResponse.ok) throw new Error("Could not load data.");
-    return Promise.all([teacherResponse.json() as Promise<Teacher[]>, groupResponse.json() as Promise<StudentGroup[]>, roomResponse.json() as Promise<Room[]>, courseResponse.json() as Promise<Course[]>]);
+    // 服务端在一个 SQLite DEFERRED 快照内读取四张清单。浏览器只发一个请求，
+    // 因此 Teaching Members 导入不能夹在教师和课程响应之间制造“不可能版本”。
+    const response = await fetch("/api/data-management/workspace", { cache: "no-store" });
+    if (!response.ok) throw new Error("Could not load the master-data workspace.");
+    const workspace = await response.json() as DataManagementWorkspace;
+    if (!Array.isArray(workspace.teachers) || !Array.isArray(workspace.groups)
+      || !Array.isArray(workspace.rooms) || !Array.isArray(workspace.courses)) {
+      throw new Error("The master-data workspace response was incomplete.");
+    }
+    return workspace;
   }, []);
 
   const loadData = useCallback(async () => {
-    // 所有新增、编辑和 Excel 导入成功后共用这一套刷新流程，确保页面四张基础清单保持同步。
-    const [nextTeachers, nextGroups, nextRooms, nextCourses] = await fetchData();
-    setTeachers(nextTeachers);
-    setGroups(nextGroups);
-    setRooms(nextRooms);
-    setCourses(nextCourses);
+    // 每次显式资料刷新领取全局 generation；导航、登出或较新的读取都会提高它。
+    // 慢响应即使最后成功，也只能返回 null，绝不能把旧清单或旧 revision 倒灌到新页面。
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
+    try {
+      const workspace = await fetchData();
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current) return null;
+      setTeachers(workspace.teachers);
+      setGroups(workspace.groups);
+      setRooms(workspace.rooms);
+      setCourses(workspace.courses);
+      // 四张清单的成功刷新可能来自 Course Setup、Teaching Members 导入或教师变更；
+      // 这些操作都可能让已打开的 currentCourse、section revision、教师选项与 variance
+      // 过期。统一卸载依赖编辑器，只有 changeSectionCount 会紧接着用本轮返回的最新版
+      // course 显式 openSections 重开，其他路径要求老师重新审阅后再进入详情。
+      setSelectedCourse(null);
+      setSections([]);
+      setAllocationVariances([]);
+      sectionAssignmentFocusRefs.current.clear();
+      // React state 要到下一次绘制才会更新；把本次原子响应直接返回给冲突处理者，
+      // 让它立即使用服务器最新版对象，不从提交前的 render 再读旧 revision。
+      return workspace;
+    } finally {
+      // 旧请求结束时不能释放后来请求的保护号码。
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
+    }
   }, [fetchData]);
 
   useEffect(() => {
@@ -1621,7 +1699,7 @@ export default function Home() {
 
         // 必须先完整取得四张基础清单，之后才开放可编辑工作区。若这里先设 ready，
         // 首次读取失败会把真正有资料的数据库伪装成四张可编辑空表。
-        await loadData();
+        if (!await loadData()) throw new Error("The initial master-data workspace refresh was superseded.");
         setCurrentUser(status.user);
         setAuthScreen("ready");
         setNotice("Local data is saved and ready for scheduling setup.", "success");
@@ -1764,7 +1842,7 @@ export default function Home() {
       try {
         // 登录接口成功只代表会话已建立；基础资料全部读取成功后才开放编辑页面，
         // 否则断网会让真实数据库看起来像一套可修改的空资料。
-        await loadData();
+        if (!await loadData()) throw new Error("The signed-in master-data workspace refresh was superseded.");
         setCurrentUser(authenticatedUser);
         setAuthScreen("ready");
         setNotice(`Signed in as ${authenticatedUser.username}.`, "success");
@@ -1784,7 +1862,7 @@ export default function Home() {
         const status = await statusResponse.json() as { user?: AppUser | null };
         if (!status.user || typeof status.user.username !== "string") throw new Error("No confirmed session is available.");
         try {
-          await loadData();
+          if (!await loadData()) throw new Error("The recovered-session master-data workspace refresh was superseded.");
           setCurrentUser(status.user);
           setAuthScreen("ready");
           setNotice(`Signed in as ${status.user.username}. The original response was interrupted, but the session was confirmed.`, "warning");
@@ -2128,7 +2206,7 @@ export default function Home() {
       setSections([]);
       form.reset();
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The new-cycle master-data workspace refresh was superseded.");
         setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.", "success");
       } catch {
         // 清空已经提交后，旧课程清单不再可信。切到不可编辑错误画面，防止老师在
@@ -2173,7 +2251,7 @@ export default function Home() {
       setCurrentCycle(body);
       form.reset();
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The restored-cycle master-data workspace refresh was superseded.");
         setNotice("The last emergency cycle backup was restored.", "success");
       } catch {
         // 恢复会替换整套课程资料；刷新失败时隐藏旧可编辑清单，直到完整页面重载。
@@ -2191,6 +2269,60 @@ export default function Home() {
     }
   }
 
+  type MasterRecordView = "Teachers" | "Student groups" | "Rooms";
+  type MasterRecordAction = "edit" | "status";
+
+  function masterRecordButtonKey(recordView: MasterRecordView, recordId: string, action: MasterRecordAction) {
+    // 同一个数据库 ID 可能在不同资料种类中重复，所以引用键同时包含页面和动作，
+    // 才能在刷新后准确找回原来的 Edit 或 Activate／Deactivate 按钮。
+    return `${recordView}:${recordId}:${action}`;
+  }
+
+  function closeMasterRecordForm() {
+    // 任何 MASTER_DATA_CHANGED 都表示打开表单时看到的 revision 已经失效。
+    // 一次清掉三种编辑对象，确保旧原生输入不会在切换资料页后被意外再次提交。
+    setShowForm(false);
+    setEditingTeacher(null);
+    setEditingGroup(null);
+    setEditingRoom(null);
+  }
+
+  async function reloadMasterRecordAfterConflict(input: {
+    recordView: MasterRecordView;
+    recordId: string;
+    action: MasterRecordAction;
+    label: string;
+    serverMessage?: string;
+  }) {
+    // 冲突一经确认就先卸载旧表单并清除筛选，让刷新后的目标记录一定有机会重新出现在表格中。
+    // 管理资料全局锁会保持到此函数结束，所以等待 GET 时也不能打开另一张表单或发出第二笔写入。
+    closeMasterRecordForm();
+    setQuery("");
+    try {
+      const latest = await loadData();
+      if (!latest) throw new Error("The conflict refresh was superseded before it could establish a new editing baseline.");
+      const targetStillExists = input.recordView === "Teachers"
+        ? latest.teachers.some((teacher) => teacher.id === input.recordId)
+        : input.recordView === "Student groups"
+          ? latest.groups.some((group) => group.id === input.recordId)
+          : latest.rooms.some((room) => room.id === input.recordId);
+      setNotice(targetStillExists
+        ? `${input.serverMessage ?? `${input.label} was changed by another scheduler.`} The latest record has been loaded; review it before trying again.`
+        : `${input.serverMessage ?? `${input.label} changed in another session.`} The latest list has been loaded, but that record is no longer available.`, "warning");
+      window.requestAnimationFrame(() => {
+        const originalButton = masterRecordButtonRefs.current.get(masterRecordButtonKey(input.recordView, input.recordId, input.action));
+        // 删除记录的功能目前并未开放；这个后备焦点仍保护未来扩展或损坏资料情形，避免焦点落到 body。
+        if (targetStillExists && originalButton?.isConnected) originalButton.focus();
+        else masterDataSearchInputRef.current?.focus();
+      });
+    } catch {
+      // 冲突后旧列表已知不可信；如果最新版也读不到，继续显示任何可编辑资料都会鼓励用户依据旧 revision 操作。
+      // 切换到 load-error 会完全卸载工作区，并由专用 Effect 聚焦“Refresh and try again”。
+      setAuthScreen("load-error");
+      setNotice(`${input.label} was changed by another scheduler, but the latest master-data lists could not be loaded. Refresh before making changes.`, "error");
+    }
+  }
+
   async function toggleTeacher(teacher: Teacher) {
     // 教师只切换启用状态而不删除记录，保护历史排课和分配关联；停用后不再出现在新的选择清单。
     const isActive = teacher.status !== "Active";
@@ -2198,23 +2330,27 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+      const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: teacher.revision }) });
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
+          await reloadMasterRecordAfterConflict({ recordView: "Teachers", recordId: teacher.id, action: "status", label: teacher.name, serverMessage: body.error });
+          return;
+        }
         setNotice(body.error ?? "Teacher status could not be updated.", "error");
         return;
       }
       committed = true;
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The teacher refresh was superseded after the status change committed.");
         setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}.`, "success");
       } catch {
-        setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${teacher.name} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`);
       }
     } catch {
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? "Teacher status changed, but the latest data could not be loaded. Refresh before continuing."
-        : "The teacher-status response was interrupted, so the result is unknown. Refresh the teacher list before retrying.", "warning");
+        : "The teacher-status response was interrupted, so the result is unknown. Refresh the teacher list before retrying.");
     } finally {
       finishManagementMutation(mutationKey);
     }
@@ -2227,23 +2363,27 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+      const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: room.revision }) });
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
+          await reloadMasterRecordAfterConflict({ recordView: "Rooms", recordId: room.id, action: "status", label: room.code, serverMessage: body.error });
+          return;
+        }
         setNotice(body.error ?? "Room status could not be updated.", "error");
         return;
       }
       committed = true;
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The room refresh was superseded after the status change committed.");
         setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}.`, "success");
       } catch {
-        setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${room.code} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`);
       }
     } catch {
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? "Room status changed, but the latest data could not be loaded. Refresh before continuing."
-        : "The room-status response was interrupted, so the result is unknown. Refresh the room list before retrying.", "warning");
+        : "The room-status response was interrupted, so the result is unknown. Refresh the room list before retrying.");
     } finally {
       finishManagementMutation(mutationKey);
     }
@@ -2258,6 +2398,7 @@ export default function Home() {
     let endpoint = "";
     let method = "POST";
     let payload: Record<string, unknown> = {};
+    let editedRecord: { view: MasterRecordView; id: string; label: string } | null = null;
 
     if (view === "Teachers") {
       // 教师新增和更正共用姓名与类别字段；编辑时沿用原数据库编号，使既有课程分配不会因为改名而断开。
@@ -2265,7 +2406,9 @@ export default function Home() {
       if (!name) return;
       endpoint = editingTeacher ? `/api/teachers/${editingTeacher.id}` : "/api/teachers";
       method = editingTeacher ? "PATCH" : "POST";
-      payload = { name, staffType: data.get("staffType") };
+      // revision 来自打开表单时保存的完整教师快照；后台清单即使稍后刷新，也不能改写本次提交的比较基准。
+      payload = { name, staffType: data.get("staffType"), ...(editingTeacher ? { revision: editingTeacher.revision } : {}) };
+      if (editingTeacher) editedRecord = { view: "Teachers", id: editingTeacher.id, label: editingTeacher.name };
     }
 
     if (view === "Student groups") {
@@ -2274,7 +2417,8 @@ export default function Home() {
       if (!code) return;
       endpoint = editingGroup ? `/api/student-groups/${editingGroup.id}` : "/api/student-groups";
       method = editingGroup ? "PATCH" : "POST";
-      payload = { code, year: Number(data.get("year")), program: String(data.get("program") ?? "").trim().toUpperCase() };
+      payload = { code, year: Number(data.get("year")), program: String(data.get("program") ?? "").trim().toUpperCase(), ...(editingGroup ? { revision: editingGroup.revision } : {}) };
+      if (editingGroup) editedRecord = { view: "Student groups", id: editingGroup.id, label: editingGroup.code };
     }
 
     if (view === "Rooms") {
@@ -2283,7 +2427,8 @@ export default function Home() {
       if (!code) return;
       endpoint = editingRoom ? `/api/rooms/${editingRoom.id}` : "/api/rooms";
       method = editingRoom ? "PATCH" : "POST";
-      payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
+      payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")), ...(editingRoom ? { revision: editingRoom.revision } : {}) };
+      if (editingRoom) editedRecord = { view: "Rooms", id: editingRoom.id, label: editingRoom.code };
     }
 
     const viewAtSubmit = view;
@@ -2293,8 +2438,18 @@ export default function Home() {
     // 浏览器先统一大小写和数字格式再发送；数据库约束与服务端验证仍是最终防线，不能只依赖表单。
     try {
       const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 409 && body.code === "MASTER_DATA_CHANGED" && editedRecord) {
+          await reloadMasterRecordAfterConflict({
+            recordView: editedRecord.view,
+            recordId: editedRecord.id,
+            action: "edit",
+            label: editedRecord.label,
+            serverMessage: body.error,
+          });
+          return;
+        }
         setNotice(body.error ?? "This record could not be saved.", "error");
         return;
       }
@@ -2305,15 +2460,15 @@ export default function Home() {
       setEditingGroup(null);
       setEditingRoom(null);
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The record refresh was superseded after the save committed.");
         setNotice(`${viewAtSubmit.slice(0, -1)} saved to the local database.`, "success");
       } catch {
-        setNotice("The record was saved, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+        freezeManagementWorkspace("The record was saved, but the latest master-data lists could not be loaded. Refresh before continuing.");
       }
     } catch {
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? "The record was saved, but the latest data could not be loaded. Refresh before continuing."
-        : "The save response was interrupted, so the result is unknown. Refresh this list before retrying.", "warning");
+        : "The save response was interrupted, so the result is unknown. Refresh this list before retrying.");
     } finally {
       finishManagementMutation(mutationKey);
     }
@@ -2334,7 +2489,7 @@ export default function Home() {
     // 工作表名称、表头、每行内容和全部分配由服务端校验，并在一个事务中更新，失败时不会留下半份导入资料。
     try {
       const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
-      const body = await response.json().catch(() => ({})) as { error?: string; courses?: number; teachers?: number; sections?: number; ignoredZeroRows?: number };
+      const body = await response.json().catch(() => ({})) as { error?: string; courses?: number; teachers?: number; sections?: number; zeroAllocationRows?: number; ignoredZeroRows?: number };
       if (!response.ok) {
         setNotice(body.error ?? "Teaching allocation import failed.", "error");
         return;
@@ -2342,18 +2497,21 @@ export default function Home() {
       committed = true;
       form.reset();
       try {
-        await loadData();
-        const summary = [body.courses, body.teachers, body.sections, body.ignoredZeroRows].every((value) => typeof value === "number")
-          ? `Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${body.ignoredZeroRows} zero-allocation rows were ignored.`
+        if (!await loadData()) throw new Error("The import refresh was superseded after the transaction committed.");
+        // 新接口使用 zeroAllocationRows；部署滚动更新期间旧服务器仍可能只返回
+        // ignoredZeroRows，所以仅把旧名称当兼容后备，展示语义始终是“已处理的明确零分配”。
+        const zeroAllocationRows = body.zeroAllocationRows ?? body.ignoredZeroRows;
+        const summary = [body.courses, body.teachers, body.sections, zeroAllocationRows].every((value) => typeof value === "number")
+          ? `Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${zeroAllocationRows} explicit zero-allocation rows processed; matching existing allocations were cleared.`
           : "Teaching allocation import completed.";
         setNotice(summary, "success");
       } catch {
-        setNotice("Teaching allocation import completed, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+        freezeManagementWorkspace("Teaching allocation import completed, but the latest master-data lists could not be loaded. Refresh before continuing.");
       }
     } catch {
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? "Teaching allocation import completed, but its latest result could not be loaded. Refresh before continuing."
-        : "The import response was interrupted, so the result is unknown. Refresh the course and teacher lists before retrying.", "warning");
+        : "The import response was interrupted, so the result is unknown. Refresh the course and teacher lists before retrying.");
     } finally {
       setImporting(false);
       finishManagementMutation(mutationKey);
@@ -2381,18 +2539,18 @@ export default function Home() {
       form.reset();
       setShowForm(false);
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The course refresh was superseded after manual creation committed.");
         const createdSummary = typeof body.configuredSections === "number"
           ? `${body.code ?? submittedCode} and ${body.configuredSections} unassigned sections created.`
           : `${body.code ?? submittedCode} and its unassigned sections were created.`;
         setNotice(createdSummary, "success");
       } catch {
-        setNotice(`${body.code ?? submittedCode} was created, but the latest course list could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${body.code ?? submittedCode} was created, but the latest course list could not be loaded. Refresh before continuing.`);
       }
     } catch {
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? `${submittedCode || "The course"} was created, but its latest details could not be loaded. Refresh before continuing.`
-        : "The create-course response was interrupted, so the result is unknown. Refresh the course list before retrying.", "warning");
+        : "The create-course response was interrupted, so the result is unknown. Refresh the course list before retrying.");
     } finally {
       finishManagementMutation(mutationKey);
     }
@@ -2410,25 +2568,60 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/courses/${courseAtSubmit.id}/sections`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionCount }) });
-      const body = await response.json().catch(() => ({})) as { error?: string };
+      const response = await fetch(`/api/courses/${courseAtSubmit.id}/sections`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        // 课程 revision 是老师打开 Sections 面板时看到的版本。导入、课程设置或另一位
+        // 老师先调整班次数量后，服务器会拒绝这个旧基准，避免依据旧总数误删新版班次。
+        body: JSON.stringify({ sectionCount, revision: courseAtSubmit.revision }),
+      });
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
+        if (response.status === 404) {
+          // 新周期会原子删除全部课程；从旧画面提交到404时，不只是当前课程过期，
+          // 整张课程清单都可能已被替换，必须卸载可编辑 workspace 后完整刷新。
+          freezeManagementWorkspace(`${body.error ?? `${courseAtSubmit.code} is no longer available.`} Refresh the master-data workspace before continuing.`, "error");
+          return;
+        }
+        if (response.status === 409 && body.code === "COURSE_SETUP_CHANGED") {
+          try {
+            // loadData 返回本次 GET 的实际对象；不能紧接着从 React courses state 读取，
+            // 因为它仍可能是提交前的旧 render。openSections 也必须收到这个最新版 course。
+            const latest = await loadData();
+            if (!latest) throw new Error("The section-count conflict refresh was superseded.");
+            const latestCourse = latest.courses.find((course) => course.id === courseAtSubmit.id);
+            if (!latestCourse || !await openSections(latestCourse, false)) throw new Error("Latest course details could not be loaded.");
+            setNotice(`${body.error ?? `${courseAtSubmit.code} was changed by another scheduler.`} The latest course and sections have been loaded; review the count before trying again.`, "warning");
+            window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
+          } catch {
+            // 旧课程对象已经明确过期；只要最新版课程或班次读取不完整，就必须卸载整个可编辑工作区。
+            freezeManagementWorkspace(`${courseAtSubmit.code} changed in another session, but its latest course details could not be loaded. Refresh before making changes.`, "error");
+          }
+          return;
+        }
         setNotice(body.error ?? "Section count could not be changed.", "error");
         return;
       }
       committed = true;
       try {
-        await loadData();
-        const sectionsLoaded = await openSections(courseAtSubmit, false);
-        if (!sectionsLoaded) throw new Error("Sections could not be refreshed.");
-        setNotice(`${courseAtSubmit.code} now has ${sectionCount} sections.`, "success");
+        // PATCH 成功也可能提高 course revision；从同一轮刷新结果取得新对象，再用它
+        // 重开班次面板，避免 selectedCourse 留着旧 revision 导致下一次调整产生假冲突。
+        const latest = await loadData();
+        if (!latest) throw new Error("The section-count refresh was superseded after the change committed.");
+        const latestCourse = latest.courses.find((course) => course.id === courseAtSubmit.id);
+        if (!latestCourse || !await openSections(latestCourse, false)) throw new Error("Sections could not be refreshed.");
+        setNotice(`${latestCourse.code} now has ${sectionCount} sections.`, "success");
+        window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
       } catch {
-        setNotice(`${courseAtSubmit.code} section count was changed, but the latest course details could not be loaded. Refresh before changing it again.`, "warning");
+        // 保存已经提交后，旧对象不能继续作为可编辑基准；隐藏工作区直到完整重载。
+        freezeManagementWorkspace(`${courseAtSubmit.code} section count was changed, but the latest course details could not be loaded. Refresh before changing it again.`);
       }
     } catch {
-      setNotice(committed
+      // 连接中断时无法知道 PATCH 是否到达提交边界。冻结旧 revision，避免老师在
+      // 结果未知时继续缩减班次或重复保存一笔其实已经提交的变更。
+      freezeManagementWorkspace(committed
         ? `${courseAtSubmit.code} section count was changed, but its latest details could not be loaded. Refresh before continuing.`
-        : "The section-count response was interrupted, so the result is unknown. Refresh the course sections before retrying.", "warning");
+        : "The section-count response was interrupted, so the result is unknown. Refresh the course sections before retrying.");
     } finally {
       finishManagementMutation(mutationKey);
     }
@@ -2447,6 +2640,10 @@ export default function Home() {
     const courseAtSubmit = editingCourse;
     savingCourseSetupIdRef.current = courseAtSubmit.id;
     setSavingCourseSetupId(courseAtSubmit.id);
+    // Course Setup 使用自己的即时锁而不是 managementMutationKey；仍必须主动废弃此前
+    // 已发出的 Sections／workspace 读取，防止保存完成后旧响应覆盖新的 course revision。
+    visibleWorkspaceRefreshNumber.current += 1;
+    activeManualTimetableRefreshNumber.current = null;
     const data = new FormData(event.currentTarget);
     let committed = false;
     try {
@@ -2473,33 +2670,41 @@ export default function Home() {
       committed = response.ok;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
+        if (response.status === 404) {
+          // Course Setup 的目标消失通常表示另一进程已开始新周期；旧 courses state
+          // 不能继续 Configure 或 Sections，因此直接进入唯一安全恢复入口。
+          setShowForm(false);
+          setEditingCourse(null);
+          freezeManagementWorkspace(`${body.error ?? `${courseAtSubmit.code} is no longer available.`} Refresh the master-data workspace before continuing.`, "error");
+          return;
+        }
         if (response.status === 409 && body.code === "COURSE_SETUP_CHANGED") {
           // 旧表单已经不可信，关闭它并重新载入课程清单；老师再次点 Configure 时
           // 会看到赢家版本，不会在不知道变化的情况下直接重试覆盖。
-          let latestCourseListLoaded = false;
           try {
-            await loadData();
-            latestCourseListLoaded = true;
+            if (!await loadData()) throw new Error("The course-setup conflict refresh was superseded.");
             setNotice("This course setup was changed by another scheduler. The latest setup has been loaded; reopen Configure to review it.", "warning");
           } catch {
-            setNotice("This course setup was changed by another scheduler, but the latest setup could not be loaded. Refresh before editing it again.", "error");
+            setShowForm(false);
+            setEditingCourse(null);
+            freezeManagementWorkspace("This course setup was changed by another scheduler, but the latest setup could not be loaded. Refresh before editing it again.", "error");
+            return;
           }
           setShowForm(false);
           setEditingCourse(null);
-          restoreCourseConfigureFocus(courseAtSubmit.id, latestCourseListLoaded);
+          restoreCourseConfigureFocus(courseAtSubmit.id, true);
           return;
         }
         return setNotice(body.error ?? "Course setup could not be saved.", "error");
       }
       try {
-        await loadData();
+        if (!await loadData()) throw new Error("The course-setup refresh was superseded after the save committed.");
       } catch {
         // PATCH 已经明确返回成功时不能再说“保存失败”。关闭持有旧 revision 的表单，
         // 并准确说明只有刷新清单失败，避免老师重复提交已经保存的配置。
         setShowForm(false);
         setEditingCourse(null);
-        restoreCourseConfigureFocus(courseAtSubmit.id, false);
-        setNotice(`${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`);
         return;
       }
       setShowForm(false);
@@ -2510,11 +2715,10 @@ export default function Home() {
       if (committed) {
         setShowForm(false);
         setEditingCourse(null);
-        restoreCourseConfigureFocus(courseAtSubmit.id, false);
       }
-      setNotice(committed
+      freezeManagementWorkspace(committed
         ? `${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`
-        : "The course-setup response was interrupted, so the result is unknown. Refresh the course list before retrying.", "warning");
+        : "The course-setup response was interrupted, so the result is unknown. Refresh the course list before retrying.");
     } finally {
       savingCourseSetupIdRef.current = null;
       setSavingCourseSetupId(null);
@@ -2522,23 +2726,48 @@ export default function Home() {
   }
 
   async function openSections(course: Course, showFailureNotice = true) {
-    // 只有点击 Sections 时才读取班次明细和教师分配差异，让最初的 52 门课程清单保持简洁且加载快速。
+    // currentCourse、班次和 allocation variance 由同一个服务端快照返回；每次点击
+    // 也领取 generation，较慢的上一门课程不能在后来点击或导航后重新打开自己。
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
     try {
-      const [sectionsResponse, allocationResponse] = await Promise.all([fetch(`/api/courses/${course.id}/sections`), fetch(`/api/courses/${course.id}/allocation`)]);
-      if (!sectionsResponse.ok || !allocationResponse.ok) throw new Error("Course sections request failed.");
-      const [nextSections, nextVariances] = await Promise.all([
-        sectionsResponse.json() as Promise<CourseSection[]>,
-        allocationResponse.json() as Promise<AllocationVariance[]>,
-      ]);
-      setSections(nextSections);
-      setAllocationVariances(nextVariances);
-      setSelectedCourse(course);
+      const response = await fetch(`/api/courses/${course.id}/workspace`, { cache: "no-store" });
+      if (response.status === 404) {
+        // 只有新周期或另一账号移除课程后才会从既有清单点击到404；此时整张旧课程表
+        // 都已知不可信，不能只关掉详情并继续允许 Configure／Sections。
+        if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+          freezeManagementWorkspace(`${course.code} is no longer available. Refresh the master-data workspace before continuing.`, "error");
+        }
+        return false;
+      }
+      if (!response.ok) throw new Error("Course sections workspace request failed.");
+      const workspace = await response.json() as CourseSectionsWorkspace;
+      if (!workspace.currentCourse || !Array.isArray(workspace.sections) || !Array.isArray(workspace.allocationVariances)) {
+        throw new Error("Course sections workspace response was incomplete.");
+      }
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current) return false;
+      setSections(workspace.sections);
+      setAllocationVariances(workspace.allocationVariances);
+      // 面板必须使用响应里的 currentCourse，而不是点击时闭包捕获的旧 revision。
+      setSelectedCourse(workspace.currentCourse);
+      setCourses((currentCourses) => {
+        const currentIndex = currentCourses.findIndex((item) => item.id === workspace.currentCourse.id);
+        if (currentIndex < 0) return [...currentCourses, workspace.currentCourse].sort((left, right) => left.code.localeCompare(right.code));
+        return currentCourses.map((item) => item.id === workspace.currentCourse.id ? workspace.currentCourse : item);
+      });
       setShowForm(false);
       setEditingCourse(null);
       return true;
     } catch {
-      if (showFailureNotice) setNotice("Course sections could not be loaded. Check the connection and try again.", "error");
+      // 已被更新 generation 取代的请求保持安静；只有仍属当前画面的失败可以写提示。
+      if (showFailureNotice && requestNumber === visibleWorkspaceRefreshNumber.current) {
+        setNotice("Course sections could not be loaded. Check the connection and try again.", "error");
+      }
       return false;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
     }
   }
 
@@ -2569,20 +2798,32 @@ export default function Home() {
       });
       const body = await response.json().catch(() => ({})) as { error?: string; allocationVariances?: AllocationVariance[] };
       if (!response.ok) {
+        if (response.status === 404) {
+          // 另一进程开始新周期后，旧 section ID 会稳定404。不能只提示并让同一面板
+          // 继续保存其他已删除班次；load-error 会卸载整套旧课程与关联表单。
+          freezeManagementWorkspace(`${body.error ?? `${section.label} is no longer available.`} Refresh the master-data workspace before continuing.`, "error");
+          return;
+        }
         // 409 表示另一位老师已经先保存；强制重新读取并用 revision 作为 form key，
         // 让非受控下拉框和复选框也立刻显示最新资料，而不是继续保留旧选择。
         const latestLoaded = response.status === 409 && courseAtStart ? await openSections(courseAtStart, false) : true;
+        if (response.status === 409 && !latestLoaded) {
+          freezeManagementWorkspace(`${body.error ?? "Section changed in another session."} The latest section details could not be loaded; refresh before editing again.`, "error");
+          return;
+        }
         setNotice(latestLoaded
           ? body.error ?? "Section could not be saved."
           : `${body.error ?? "Section changed in another session."} The latest section details could not be loaded; refresh before editing again.`, "error");
+        if (response.status === 409) restoreSectionAssignmentFocus(section.id);
         return;
       }
       committed = true;
       const latestLoaded = courseAtStart ? await openSections(courseAtStart, false) : true;
       if (!latestLoaded) {
-        setNotice(`${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before editing it again.`, "warning");
+        freezeManagementWorkspace(`${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before editing it again.`);
         return;
       }
+      restoreSectionAssignmentFocus(section.id);
       if (!Array.isArray(body.allocationVariances)) {
         setNotice(`${section.label} assignment was saved and reloaded, but the allocation summary was missing from the response. Refresh before relying on the mismatch count.`, "warning");
         return;
@@ -2590,10 +2831,11 @@ export default function Home() {
       const mismatchCount = body.allocationVariances?.length ?? 0;
       setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`, mismatchCount ? "warning" : "success");
     } catch {
-      // 请求中断时不能断言数据库没有写入；先刷新本班次确认实际 revision，再决定是否重试。
-      setNotice(committed
+      // 请求中断时不能断言数据库没有写入；旧班次和旧 course revision 都不可再编辑，
+      // 必须先通过唯一 Refresh 入口取得新的原子 workspace 后才能决定是否重试。
+      freezeManagementWorkspace(committed
         ? `${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before continuing.`
-        : "The section-save response was interrupted, so the result is unknown. Refresh the section before retrying.", "warning");
+        : "The section-save response was interrupted, so the result is unknown. Refresh the section before retrying.");
     } finally {
       savingSectionIdRef.current = null;
       setSavingSectionId(null);
@@ -2653,7 +2895,7 @@ export default function Home() {
             <div>
               <h1 className="text-2xl font-black">Workspace unavailable</h1>
               <p className="mt-2 text-sm leading-6 text-slate-500">The secure session or scheduling data could not be loaded. No editable empty workspace has been opened.</p>
-              <button onClick={() => window.location.reload()} className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="button">Refresh and try again</button>
+              <button ref={loadErrorRefreshButtonRef} onClick={() => window.location.reload()} className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="button">Refresh and try again</button>
             </div>
           ) : (
             <form onSubmit={submitAuthentication}>
@@ -3556,7 +3798,7 @@ export default function Home() {
                   <button key={item} disabled={savingCourseSetupId !== null || managementMutationKey !== null} onClick={() => openView(item)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition disabled:cursor-wait disabled:opacity-50 ${view === item ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`} type="button">{item}</button>
                 ))}
               </div>
-              <label className="relative block sm:w-64"><span className="sr-only">Search data</span><input ref={view === "Courses" ? courseSearchInputRef : undefined} value={query} onChange={(event) => setQuery(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:bg-white" placeholder={`Search ${view.toLowerCase()}...`} /></label>
+              <label className="relative block sm:w-64"><span className="sr-only">Search data</span><input ref={view === "Courses" ? courseSearchInputRef : masterDataSearchInputRef} value={query} onChange={(event) => setQuery(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:bg-white" placeholder={`Search ${view.toLowerCase()}...`} /></label>
             </div>
 
             {showForm && view === "Courses" && !editingCourse && (
@@ -3564,7 +3806,7 @@ export default function Home() {
               <div className="grid border-b border-blue-100 bg-blue-50/60 lg:grid-cols-2 lg:divide-x lg:divide-blue-100">
                 <form onSubmit={importTeachingMembers} className="p-4">
                   <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
-                  <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
+                  <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections. A row with 0 explicitly clears that lecturer&apos;s existing allocation for the course; it is processed, not ignored.</p>
                   <div className="flex flex-col gap-3">
                     <input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" />
                     <button disabled={managementMutationKey !== null} className="w-fit rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">
@@ -3576,8 +3818,9 @@ export default function Home() {
                   <p className="mb-1 text-sm font-bold text-blue-950">Add a missing course manually</p>
                   <p className="mb-3 text-xs leading-5 text-blue-800">Use this only when the Teaching Members file omitted a course. New sections start without teachers.</p>
                   <div className="grid gap-3 sm:grid-cols-[1fr_1fr_110px_auto]">
-                    <input name="code" required placeholder="Mod" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
-                    <input name="catalog" placeholder="Catalog (optional)" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
+                    {/* 浏览器长度边界直接复用服务端公开常量；用户会在输入时得到原生反馈，API 仍负责最终验证。 */}
+                    <input name="code" required maxLength={COURSE_CODE_MAX_LENGTH} placeholder="Mod" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
+                    <input name="catalog" maxLength={COURSE_CATALOG_MAX_LENGTH} placeholder="Catalog (optional)" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
                     <input name="sectionCount" required min="1" max="999" type="number" placeholder="Sections" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-blue-700 px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "manual-course-create" ? "Adding..." : "Add"}</button>
                   </div>
@@ -3615,15 +3858,15 @@ export default function Home() {
                   </label>
                   <label className="text-xs font-semibold text-slate-700">
                     Minimum capacity
-                    <input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
+                    <input name="minimumRoomCapacity" min="1" max={ROOM_CAPACITY_MAXIMUM} defaultValue={editingCourse.minimumRoomCapacity ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
                   </label>
                 </div>
                 {/* 起止周都留空表示每周上课；同时填写时支持 1–4、3–6、5–8 等包含两端的区间。 */}
                 <div className="mt-3 max-w-lg rounded-xl border border-emerald-100 bg-white/70 p-3">
                   <p className="text-xs font-bold text-slate-700">Teaching weeks</p>
                   <div className="mt-2 grid grid-cols-2 gap-3">
-                    <label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" defaultValue={editingCourse.weekStart ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
-                    <label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" defaultValue={editingCourse.weekEnd ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                    <label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" max="52" defaultValue={editingCourse.weekStart ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                    <label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" max="52" defaultValue={editingCourse.weekEnd ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
                   </div>
                   <p className="mt-2 text-xs text-emerald-800">Leave both blank for every week. Limited ranges include both the start and end week.</p>
                 </div>
@@ -3641,34 +3884,42 @@ export default function Home() {
 
             {showForm && view !== "Courses" && (
               /* 手工资料表只收集当前排课和冲突检查真正需要的字段，避免加入没有明确用途的资料。 */
-              <form onSubmit={addRecord} className="border-b border-blue-100 bg-blue-50/60 p-4">
+              <form
+                key={editingTeacher ? `${editingTeacher.id}:${editingTeacher.revision}` : editingGroup ? `${editingGroup.id}:${editingGroup.revision}` : editingRoom ? `${editingRoom.id}:${editingRoom.revision}` : `new:${view}`}
+                onSubmit={addRecord}
+                className="border-b border-blue-100 bg-blue-50/60 p-4"
+              >
                 <p className="mb-3 text-sm font-bold text-blue-950">{editingTeacher ? `Edit ${editingTeacher.name}` : editingGroup ? `Edit ${editingGroup.code}` : editingRoom ? `Edit ${editingRoom.code}` : `New ${view.slice(0, -1)}`}</p>
+                {/* fieldset 会一次冻结当前表单的输入、复选框和提交按钮；保存期间不仅按钮不能再按，
+                    也不能继续修改一份已经发往服务器的草稿，避免响应回来时画面与实际保存值不同。 */}
+                <fieldset disabled={managementMutationKey !== null} className="min-w-0 disabled:cursor-wait disabled:opacity-60">
                 {view === "Teachers" && (
                   <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]">
-                    <input name="name" required defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="name" required maxLength={TEACHER_NAME_MAX_LENGTH} defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="staffType" defaultValue={editingTeacher?.staffType ?? "FT"} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select>
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Teachers" ? "Saving..." : editingTeacher ? "Save changes" : "Save teacher"}</button>
                   </div>
                 )}
                 {view === "Student groups" && (
                   <div className="grid gap-3 sm:grid-cols-[1fr_120px_130px_auto]">
-                    <input name="code" required defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="code" required maxLength={STUDENT_GROUP_CODE_MAX_LENGTH} defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="year" defaultValue={editingGroup?.year ?? 1} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select>
-                    <input name="program" required defaultValue={editingGroup?.program} placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="program" required maxLength={STUDENT_GROUP_PROGRAM_MAX_LENGTH} defaultValue={editingGroup?.program} placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Student groups" ? "Saving..." : editingGroup ? "Save changes" : "Save group"}</button>
                   </div>
                 )}
                 {view === "Rooms" && (
                   /* 教室新增和编辑共用表单；编辑时回填原容量和设施，避免只改地址却意外清除设备标记。 */
                   <div className="grid gap-3 lg:grid-cols-[1fr_110px_auto_auto_auto_auto]">
-                    <input name="room" required defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
-                    <input name="capacity" required min="1" defaultValue={editingRoom?.capacity} type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="room" required maxLength={ROOM_CODE_MAX_LENGTH} defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input name="capacity" required min="1" max={ROOM_CAPACITY_MAXIMUM} defaultValue={editingRoom?.capacity} type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <label className="flex items-center gap-2 text-sm"><input name="lab" defaultChecked={editingRoom?.features.includes("Lab")} type="checkbox" /> Lab</label>
                     <label className="flex items-center gap-2 text-sm"><input name="projector" defaultChecked={editingRoom?.features.includes("Multi projector")} type="checkbox" /> Projector</label>
                     <label className="flex items-center gap-2 text-sm"><input name="smart" defaultChecked={editingRoom?.features.includes("Smart classroom")} type="checkbox" /> Smart</label>
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Rooms" ? "Saving..." : editingRoom ? "Save changes" : "Save room"}</button>
                   </div>
                 )}
+                </fieldset>
               </form>
             )}
 
@@ -3684,7 +3935,37 @@ export default function Home() {
                       <td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td>
                       <td className="px-5 py-4 text-slate-600">{teacher.sections}</td>
                       <td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td>
-                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button disabled={managementMutationKey !== null} onClick={() => { setEditingTeacher(teacher); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button><button disabled={managementMutationKey !== null} onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50" type="button">{managementMutationKey === `teacher-status:${teacher.id}` ? "Saving..." : teacher.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
+                      <td className="px-5 py-4 text-right">
+                        <div className="flex justify-end gap-3">
+                          {/* 两个入口都登记真实 DOM 节点；冲突刷新完成后会按原动作恢复焦点。 */}
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Teachers", teacher.id, "edit");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => { setEditingTeacher(teacher); setShowForm(true); }}
+                            className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Teachers", teacher.id, "status");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => toggleTeacher(teacher)}
+                            className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            {managementMutationKey === `teacher-status:${teacher.id}` ? "Saving..." : teacher.status === "Active" ? "Deactivate" : "Activate"}
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3695,7 +3976,21 @@ export default function Home() {
                   <tbody>{filteredGroups.map((group) => (
                     <tr className="border-t border-slate-100" key={group.id}>
                       <td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td>
-                      <td className="px-5 py-4 text-right"><button disabled={managementMutationKey !== null} onClick={() => { setEditingGroup(group); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button></td>
+                      <td className="px-5 py-4 text-right">
+                        <button
+                          ref={(button) => {
+                            const key = masterRecordButtonKey("Student groups", group.id, "edit");
+                            if (button) masterRecordButtonRefs.current.set(key, button);
+                            else masterRecordButtonRefs.current.delete(key);
+                          }}
+                          disabled={managementMutationKey !== null}
+                          onClick={() => { setEditingGroup(group); setShowForm(true); }}
+                          className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50"
+                          type="button"
+                        >
+                          Edit
+                        </button>
+                      </td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3708,7 +4003,36 @@ export default function Home() {
                       <td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td>
                       <td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td>
                       <td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td>
-                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button disabled={managementMutationKey !== null} onClick={() => { setEditingRoom(room); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button><button disabled={managementMutationKey !== null} onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50" type="button">{managementMutationKey === `room-status:${room.id}` ? "Saving..." : room.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
+                      <td className="px-5 py-4 text-right">
+                        <div className="flex justify-end gap-3">
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Rooms", room.id, "edit");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => { setEditingRoom(room); setShowForm(true); }}
+                            className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Rooms", room.id, "status");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => toggleRoom(room)}
+                            className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            {managementMutationKey === `room-status:${room.id}` ? "Saving..." : room.status === "Active" ? "Deactivate" : "Activate"}
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3754,11 +4078,11 @@ export default function Home() {
               <div className="border-t border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                   <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
-                  <button disabled={managementMutationKey !== null} onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">Close</button>
+                  <button ref={sectionsCloseButtonRef} disabled={managementMutationKey !== null} onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button" aria-label={`Close ${selectedCourse.code} sections`}>Close</button>
                 </div>
                 {/* 修正班次数量时保留低编号班次；仍含排课或班级关联的班次，服务端会拒绝删除。 */}
-                <form key={`${selectedCourse.id}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
-                  <label className="text-xs font-semibold text-amber-950">Total sections<input name="sectionCount" required min="1" max="999" defaultValue={sections.length} disabled={managementMutationKey !== null} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                <form key={`${selectedCourse.id}:${selectedCourse.revision}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <label className="text-xs font-semibold text-amber-950">Total sections<input ref={sectionCountInputRef} name="sectionCount" required min="1" max="999" defaultValue={sections.length} disabled={managementMutationKey !== null} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
                   <button disabled={managementMutationKey !== null} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900 disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === `section-count:${selectedCourse.id}` ? "Updating..." : "Update count"}</button>
                   <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
                 </form>
@@ -3776,7 +4100,17 @@ export default function Home() {
                     /* revision 放进 key 后，并发冲突重新载入时会重建表单，确保 defaultValue 与 defaultChecked 不残留旧资料。 */
                     <form key={`${section.id}:${section.revision}`} onSubmit={(event) => saveSection(event, section)} className="rounded-xl border border-slate-200 bg-white p-3">
                       <div className="grid gap-3 md:grid-cols-[130px_1fr_auto]">
-                        <p className="pt-2 font-bold text-slate-900">{section.label}</p>
+                        <p
+                          ref={(target) => {
+                            if (target) sectionAssignmentFocusRefs.current.set(section.id, target);
+                            else sectionAssignmentFocusRefs.current.delete(section.id);
+                          }}
+                          className="pt-2 font-bold text-slate-900 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+                          tabIndex={-1}
+                          aria-label={`${section.label} assignments`}
+                        >
+                          {section.label}
+                        </p>
                         {/* 旧班次可保留当前停用教师，但只有 Active 教师会出现在可改选名单中。 */}
                         <TeacherSelect teachers={teachers} selectedTeacherId={section.teacherId} selectedTeacherName={section.teacherName} ariaLabel={`Teacher for ${section.label}`} disabled={managementMutationKey !== null} />
                         <button disabled={savingSectionId !== null || managementMutationKey !== null} className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit" aria-label={`Save ${section.label} assignments`}>

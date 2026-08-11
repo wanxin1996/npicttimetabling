@@ -1,24 +1,24 @@
 import { createUnavailableWindow, deleteUnavailableWindow, listUnavailableWindows, MasterDataInputError } from "@/lib/database";
+import { safeDatabaseFailureResponse } from "@/lib/database-response";
+import { readJsonObject } from "@/lib/request-json";
 
 // 不可用规则保存在本地 SQLite 中，并在每次排课时参与警告计算。
 export const runtime = "nodejs";
 
 export function GET() {
   // 教师和年级禁排时段一起返回，供同一个规则管理页面展示。
-  return Response.json(listUnavailableWindows());
+  try {
+    return Response.json(listUnavailableWindows());
+  } catch (error) {
+    return safeDatabaseFailureResponse(error, "Unavailable window list failed", "Unavailable windows could not be loaded. Try again.");
+  }
 }
 
 export async function POST(request: Request) {
   // 两种规则共用星期和时间验证；ownerId 根据类型表示教师 ID 或年级字符串。
-  let parsedBody: unknown;
-  try {
-    parsedBody = await request.json();
-  } catch {
-    return Response.json({ error: "Choose a valid owner, weekday and time range." }, { status: 400 });
-  }
-  const body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
-    ? parsedBody as Record<string, unknown>
-    : {};
+  const parsed = await readJsonObject(request, "Choose a valid owner, weekday and time range.");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   // 先逐项缩窄 unknown 字段，再构造数据库输入；这样 TypeScript 与运行时都不会把字符串数字等错误格式悄悄转换成合法时段。
   const kind = body.kind;
   const ownerId = body.ownerId;
@@ -45,8 +45,7 @@ export async function POST(request: Request) {
     return Response.json({ id: createUnavailableWindow(input) }, { status: 201 });
   } catch (error) {
     if (error instanceof MasterDataInputError) return Response.json({ error: error.message }, { status: 400 });
-    console.error("Unavailable window creation failed", error);
-    return Response.json({ error: "The unavailable window could not be saved. Try again." }, { status: 500 });
+    return safeDatabaseFailureResponse(error, "Unavailable window creation failed", "The unavailable window could not be saved. Try again.");
   }
 }
 
@@ -60,7 +59,6 @@ export async function DELETE(request: Request) {
     if (!deleteUnavailableWindow(id, kind)) return Response.json({ error: "Unavailable window not found." }, { status: 404 });
     return Response.json({ ok: true });
   } catch (error) {
-    console.error("Unavailable window deletion failed", error);
-    return Response.json({ error: "The unavailable window could not be removed. Try again." }, { status: 500 });
+    return safeDatabaseFailureResponse(error, "Unavailable window deletion failed", "The unavailable window could not be removed. Try again.");
   }
 }

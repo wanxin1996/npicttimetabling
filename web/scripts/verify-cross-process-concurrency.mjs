@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import * as XLSX from "xlsx";
 
 // 这项回归会启动两个真正的 production standalone 进程。两个进程使用不同端口，
 // 但明确指向同一个操作系统临时 SQLite；任何请求都不会连接老师的正式数据库。
@@ -278,6 +279,24 @@ async function requestApi(server, pathname, options = {}) {
   return { response, body };
 }
 
+function teachingMembersImportForm(rows, filename = "cross-process-teaching-members.xlsx") {
+  // 使用真实 SheetJS 工作簿和 multipart FormData 进入 production 导入路由；屏障测试
+  // 不直接写数据库，才能同时覆盖解析、业务事务和聚合读锁之间的真实交错。
+  const workbook = XLSX.utils.book_new();
+  const worksheet = XLSX.utils.json_to_sheet(rows, {
+    header: ["Mod", "Catalog", "Lecturer", "Staff Type", "# of grps teaching"],
+  });
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Teaching Members");
+  const bytes = XLSX.write(workbook, { type: "buffer", bookType: "xlsx", compression: true });
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    filename,
+  );
+  return form;
+}
+
 function cookieFrom(response, description) {
   // 只在内存保存 Set-Cookie 第一段，不输出随机会话令牌或其他安全属性。
   const setCookie = response.headers.get("set-cookie") || "";
@@ -510,31 +529,107 @@ function assertCandidateSnapshot(body, fixture, expectedCapacity) {
   }
 }
 
+async function verifyConcurrentMasterDataAndSectionResize(serverA, serverB, fixture) {
+  // 两个独立 standalone 同时提交同一教师 revision，只能恰好一个成功；赢家提交后，
+  // 两个进程必须读取同一版本，旧请求收到稳定 MASTER_DATA_CHANGED 而非静默覆盖。
+  const teacherAttempts = [
+    { server: serverA, cookie: fixture.schedulerACookie, name: "CROSS CAS TEACHER A", staffType: "FT" },
+    { server: serverB, cookie: fixture.schedulerBCookie, name: "CROSS CAS TEACHER B", staffType: "PT" },
+  ];
+  const teacherResults = await Promise.all(teacherAttempts.map(async (attempt) => ({
+    attempt,
+    result: await requestApi(attempt.server, `/api/teachers/${fixture.candidateTeacher.id}`, {
+      method: "PATCH",
+      cookie: attempt.cookie,
+      expectedStatus: [200, 409],
+      json: { name: attempt.name, staffType: attempt.staffType, revision: fixture.candidateTeacher.revision },
+    }),
+  })));
+  assert.deepEqual(teacherResults.map(({ result }) => result.response.status).sort(), [200, 409]);
+  const teacherWinner = teacherResults.find(({ result }) => result.response.status === 200);
+  const teacherLoser = teacherResults.find(({ result }) => result.response.status === 409);
+  assert.equal(teacherWinner.result.body.revision, fixture.candidateTeacher.revision + 1);
+  assert.equal(teacherLoser.result.body.code, "MASTER_DATA_CHANGED");
+  const [teachersFromA, teachersFromB] = await Promise.all([
+    requestApi(serverA, "/api/teachers", { cookie: fixture.schedulerACookie }),
+    requestApi(serverB, "/api/teachers", { cookie: fixture.schedulerBCookie }),
+  ]);
+  const winningTeacherA = teachersFromA.body.find((teacher) => teacher.id === fixture.candidateTeacher.id);
+  const winningTeacherB = teachersFromB.body.find((teacher) => teacher.id === fixture.candidateTeacher.id);
+  assert.deepEqual(winningTeacherA, winningTeacherB);
+  assert.equal(winningTeacherA.name, teacherWinner.attempt.name);
+  const restoredTeacher = await requestApi(serverA, `/api/teachers/${fixture.candidateTeacher.id}`, {
+    method: "PATCH",
+    cookie: fixture.schedulerACookie,
+    json: { name: fixture.candidateTeacher.name, staffType: fixture.candidateTeacher.staffType, revision: winningTeacherA.revision },
+  });
+  fixture.candidateTeacher.revision = restoredTeacher.body.revision;
+
+  // 班次数量和 Course Setup 共用课程 revision。跨进程同时从2班扩到不同数量时，
+  // 只能提交一种完整尾部拓扑；随后用赢家 revision 恢复2班，保持既有01/02稳定 ID。
+  const originalSectionIds = fixture.sections.map((section) => section.id);
+  const resizeAttempts = [
+    { server: serverA, cookie: fixture.schedulerACookie, sectionCount: 3 },
+    { server: serverB, cookie: fixture.schedulerBCookie, sectionCount: 4 },
+  ];
+  const resizeResults = await Promise.all(resizeAttempts.map(async (attempt) => ({
+    attempt,
+    result: await requestApi(attempt.server, `/api/courses/${fixture.courseId}/sections`, {
+      method: "PATCH",
+      cookie: attempt.cookie,
+      expectedStatus: [200, 409],
+      json: { sectionCount: attempt.sectionCount, revision: fixture.setupRevision },
+    }),
+  })));
+  assert.deepEqual(resizeResults.map(({ result }) => result.response.status).sort(), [200, 409]);
+  const resizeWinner = resizeResults.find(({ result }) => result.response.status === 200);
+  const resizeLoser = resizeResults.find(({ result }) => result.response.status === 409);
+  assert.equal(resizeWinner.result.body.revision, fixture.setupRevision + 1);
+  assert.equal(resizeLoser.result.body.code, "COURSE_SETUP_CHANGED");
+  const winningSections = (await requestApi(serverB, `/api/courses/${fixture.courseId}/sections`, { cookie: fixture.schedulerBCookie })).body;
+  assert.equal(winningSections.length, resizeWinner.attempt.sectionCount);
+  assert.deepEqual(winningSections.slice(0, 2).map((section) => section.id), originalSectionIds);
+  const restoredSections = await requestApi(serverA, `/api/courses/${fixture.courseId}/sections`, {
+    method: "PATCH",
+    cookie: fixture.schedulerACookie,
+    json: { sectionCount: 2, revision: resizeWinner.result.body.revision },
+  });
+  fixture.setupRevision = restoredSections.body.revision;
+  assert.deepEqual(
+    (await requestApi(serverB, `/api/courses/${fixture.courseId}/sections`, { cookie: fixture.schedulerBCookie })).body.map((section) => section.id),
+    originalSectionIds,
+  );
+  report("主资料与班次数量 CAS 在两个 standalone 间只允许一个赢家");
+}
+
 async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
   const candidatePath = `/api/course-sections/${fixture.candidateSectionId}/candidates?occurrence=1`;
-  const roomPayload = (capacity) => ({
+  const roomPayload = (capacity, revision) => ({
     code: fixture.candidateRoom.code,
     capacity,
     hasLab: false,
     hasMultiProjector: false,
     isSmartClassroom: false,
+    revision,
   });
 
   // 先分别证明夹具的完整旧状态和完整新状态，避免竞态断言只因候选功能本身坏掉而假绿。
   const oldBaseline = await requestApi(serverA, candidatePath, { cookie: fixture.schedulerACookie });
   assertCandidateSnapshot(oldBaseline.body, fixture, 20);
-  await requestApi(serverB, `/api/rooms/${fixture.candidateRoom.id}`, {
+  const grownRoom = await requestApi(serverB, `/api/rooms/${fixture.candidateRoom.id}`, {
     method: "PATCH",
     cookie: fixture.schedulerBCookie,
-    json: roomPayload(40),
+    json: roomPayload(40, fixture.candidateRoom.revision),
   });
+  fixture.candidateRoom.revision = grownRoom.body.revision;
   const newBaseline = await requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie });
   assertCandidateSnapshot(newBaseline.body, fixture, 40);
-  await requestApi(serverA, `/api/rooms/${fixture.candidateRoom.id}`, {
+  const resetRoom = await requestApi(serverA, `/api/rooms/${fixture.candidateRoom.id}`, {
     method: "PATCH",
     cookie: fixture.schedulerACookie,
-    json: roomPayload(20),
+    json: roomPayload(20, fixture.candidateRoom.revision),
   });
+  fixture.candidateRoom.revision = resetRoom.body.revision;
   const resetBaseline = await requestApi(serverB, candidatePath, { cookie: fixture.schedulerBCookie });
   assertCandidateSnapshot(resetBaseline.body, fixture, 20);
 
@@ -591,7 +686,7 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
     pendingRoomUpdate = requestApi(serverB, `/api/rooms/${fixture.candidateRoom.id}`, {
       method: "PATCH",
       cookie: fixture.schedulerBCookie,
-      json: roomPayload(40),
+      json: roomPayload(40, fixture.candidateRoom.revision),
     });
     pendingRoomUpdate.then(
       () => { roomUpdateSettled = true; },
@@ -608,6 +703,7 @@ async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
       }),
     ]);
     assert.equal(roomUpdate.body.ok, true);
+    fixture.candidateRoom.revision = roomUpdate.body.revision;
     assert(Date.now() - writerStartedAt < 2_000, "Room update took too long after Candidate captured its snapshot.");
     assert.equal(roomUpdateSettled, true);
     assert.equal(candidateSettled, false, "Candidate request left its calculation barrier before the writer committed.");
@@ -768,6 +864,417 @@ async function verifyCandidateFailureBoundaries(serverA, fixture) {
     observer.close();
   }
   report("Candidate 的真实 BUSY 503 与内部故障500均固定、安全且零写入");
+}
+
+async function verifyDataManagementWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
+  const workspacePath = "/api/data-management/workspace";
+  const oldWorkspace = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  for (const key of ["teachers", "groups", "rooms", "courses"]) {
+    assert(Array.isArray(oldWorkspace.body[key]), `Data workspace ${key} must be an array.`);
+  }
+  const oldTeacher = oldWorkspace.body.teachers.find((teacher) => teacher.id === fixture.dataWorkspaceTeacher.id);
+  const oldCourse = oldWorkspace.body.courses.find((course) => course.id === fixture.dataWorkspaceCourse.id);
+  assert.equal(oldTeacher.staffType, "PT");
+  assert.equal(oldTeacher.sections, 0);
+  assert.equal(oldCourse.catalog, "Cross workspace old catalog");
+  assert.equal(oldCourse.configuredSections, 1);
+  assert.equal(oldCourse.allocatedSections, 0);
+  assert.equal(oldCourse.allocationVarianceCount, 0);
+
+  const snapshotNonce = randomBytes(16).toString("hex");
+  const importNonce = randomBytes(16).toString("hex");
+  const snapshotControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: snapshotNonce,
+    teacherId: fixture.dataWorkspaceTeacher.id,
+    expectedStaffType: "PT",
+    expectedSections: 0,
+  };
+  const importControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: importNonce,
+    courseId: fixture.dataWorkspaceCourse.id,
+  };
+  const files = {
+    snapshotArm: path.join(authRaceControlDirectory, "data-workspace-arm-A.json"),
+    snapshotTemporary: path.join(authRaceControlDirectory, `data-workspace-arm-A-${snapshotNonce}.tmp`),
+    snapshotReady: path.join(authRaceControlDirectory, `data-workspace-ready-A-${snapshotNonce}.json`),
+    snapshotRelease: path.join(authRaceControlDirectory, `data-workspace-release-${snapshotNonce}.txt`),
+    importArm: path.join(authRaceControlDirectory, "data-workspace-import-arm-B.json"),
+    importTemporary: path.join(authRaceControlDirectory, `data-workspace-import-arm-B-${importNonce}.tmp`),
+    importReady: path.join(authRaceControlDirectory, `data-workspace-import-ready-B-${importNonce}.json`),
+    importRelease: path.join(authRaceControlDirectory, `data-workspace-import-release-${importNonce}.txt`),
+  };
+  activeRaceReleases.set(files.snapshotRelease, snapshotNonce);
+  activeRaceReleases.set(files.importRelease, importNonce);
+  await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
+  await rename(files.snapshotTemporary, files.snapshotArm);
+
+  let workspaceSettled = false;
+  let importSettled = false;
+  let pendingImport;
+  const pendingWorkspace = requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  pendingWorkspace.then(
+    () => { workspaceSettled = true; },
+    () => { workspaceSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      files.snapshotReady,
+      snapshotControl,
+      () => workspaceSettled,
+      "Data-management workspace snapshot consistency",
+      "the materialized old teachers query",
+    );
+    await writeFile(files.importTemporary, JSON.stringify(importControl), { flag: "wx", mode: 0o600 });
+    await rename(files.importTemporary, files.importArm);
+    pendingImport = requestApi(serverB, "/api/imports/teaching-members", {
+      method: "POST",
+      cookie: fixture.schedulerBCookie,
+      body: teachingMembersImportForm([{
+        Mod: fixture.dataWorkspaceCourse.code,
+        Catalog: "Cross workspace new catalog",
+        Lecturer: fixture.dataWorkspaceTeacher.name,
+        "Staff Type": "FT",
+        "# of grps teaching": 2,
+      }]),
+    });
+    pendingImport.then(
+      () => { importSettled = true; },
+      () => { importSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      files.importReady,
+      importControl,
+      () => importSettled,
+      "Data-management workspace import",
+      "the applied Teaching Members transaction",
+    );
+
+    // B 的全部业务写入已完成。只释放测试暂停点后，它必须在正式 COMMIT 等待 A 的
+    // DEFERRED 读锁；否则 A 后续 courses 查询就可能读取导入后的新版本。
+    await releaseRaceBarrier(files.importRelease, importNonce);
+    await waitForPendingRollbackJournalWriter("Data-management workspace import");
+    assert.equal(importSettled, false, "The import committed while the old data workspace snapshot still held a read transaction.");
+    assert.equal(workspaceSettled, false, "The data workspace left its snapshot barrier before the import reached COMMIT.");
+
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
+    const [raceWorkspace, imported] = await Promise.all([pendingWorkspace, pendingImport]);
+    assert.deepEqual(raceWorkspace.body, oldWorkspace.body);
+    assert.deepEqual(
+      {
+        courses: imported.body.courses,
+        teachers: imported.body.teachers,
+        sections: imported.body.sections,
+      },
+      { courses: 1, teachers: 1, sections: 2 },
+    );
+
+    const [latestA, latestB] = await Promise.all([
+      requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, workspacePath, { cookie: fixture.schedulerBCookie }),
+    ]);
+    assert.deepEqual(latestA.body, latestB.body);
+    const newTeacher = latestA.body.teachers.find((teacher) => teacher.id === fixture.dataWorkspaceTeacher.id);
+    const newCourse = latestA.body.courses.find((course) => course.id === fixture.dataWorkspaceCourse.id);
+    assert.equal(newTeacher.staffType, "FT");
+    assert.equal(newTeacher.sections, 2);
+    assert.equal(newCourse.catalog, "Cross workspace new catalog");
+    assert.equal(newCourse.configuredSections, 2);
+    assert.equal(newCourse.allocatedSections, 2);
+    assert.equal(newCourse.allocationVarianceCount, 1);
+    assert.equal(newCourse.revision, oldCourse.revision + 1);
+    fixture.dataWorkspaceTeacher = newTeacher;
+    fixture.dataWorkspaceCourse = newCourse;
+  } finally {
+    await releaseRaceBarrier(files.importRelease, importNonce).catch(() => undefined);
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce).catch(() => undefined);
+    activeRaceReleases.delete(files.importRelease);
+    activeRaceReleases.delete(files.snapshotRelease);
+    await Promise.allSettled([pendingWorkspace, pendingImport].filter(Boolean));
+    await removeRaceFiles(files);
+  }
+  report("资料管理聚合跨进程只返回完整旧版或完整新版，不混合教师与课程摘要");
+}
+
+async function verifyCourseWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
+  const workspacePath = `/api/courses/${fixture.dataWorkspaceCourse.id}/workspace`;
+  const oldWorkspace = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  assert.equal(oldWorkspace.body.currentCourse.id, fixture.dataWorkspaceCourse.id);
+  assert.equal(oldWorkspace.body.currentCourse.allocationVarianceCount, 1);
+  assert.equal(oldWorkspace.body.sections.length, 2);
+  const importedSection = oldWorkspace.body.sections.find(
+    (section) => section.teacherId === fixture.dataWorkspaceTeacher.id,
+  );
+  assert(importedSection, "The imported course must contain one automatically assigned section.");
+  assert.deepEqual(oldWorkspace.body.allocationVariances, [{
+    teacherId: fixture.dataWorkspaceTeacher.id,
+    teacherName: fixture.dataWorkspaceTeacher.name,
+    expectedSections: 2,
+    actualSections: 1,
+  }]);
+
+  const snapshotNonce = randomBytes(16).toString("hex");
+  const writeNonce = randomBytes(16).toString("hex");
+  const snapshotControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: snapshotNonce,
+    courseId: fixture.dataWorkspaceCourse.id,
+    sectionId: importedSection.id,
+    expectedTeacherId: fixture.dataWorkspaceTeacher.id,
+  };
+  const writeControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: writeNonce,
+    teacherId: fixture.dataWorkspaceReplacementTeacher.id,
+    sectionId: importedSection.id,
+    revision: importedSection.revision,
+  };
+  const files = {
+    snapshotArm: path.join(authRaceControlDirectory, "course-workspace-arm-A.json"),
+    snapshotTemporary: path.join(authRaceControlDirectory, `course-workspace-arm-A-${snapshotNonce}.tmp`),
+    snapshotReady: path.join(authRaceControlDirectory, `course-workspace-ready-A-${snapshotNonce}.json`),
+    snapshotRelease: path.join(authRaceControlDirectory, `course-workspace-release-${snapshotNonce}.txt`),
+    writeArm: path.join(authRaceControlDirectory, "course-workspace-section-write-arm-B.json"),
+    writeTemporary: path.join(authRaceControlDirectory, `course-workspace-section-write-arm-B-${writeNonce}.tmp`),
+    writeReady: path.join(authRaceControlDirectory, `course-workspace-section-write-ready-B-${writeNonce}.json`),
+    writeRelease: path.join(authRaceControlDirectory, `course-workspace-section-write-release-${writeNonce}.txt`),
+  };
+  activeRaceReleases.set(files.snapshotRelease, snapshotNonce);
+  activeRaceReleases.set(files.writeRelease, writeNonce);
+  await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
+  await rename(files.snapshotTemporary, files.snapshotArm);
+
+  let workspaceSettled = false;
+  let sectionWriteSettled = false;
+  let pendingSectionWrite;
+  const pendingWorkspace = requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  pendingWorkspace.then(
+    () => { workspaceSettled = true; },
+    () => { workspaceSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      files.snapshotReady,
+      snapshotControl,
+      () => workspaceSettled,
+      "Course workspace snapshot consistency",
+      "the materialized old sections query",
+    );
+    await writeFile(files.writeTemporary, JSON.stringify(writeControl), { flag: "wx", mode: 0o600 });
+    await rename(files.writeTemporary, files.writeArm);
+    pendingSectionWrite = requestApi(serverB, `/api/course-sections/${importedSection.id}`, {
+      method: "PATCH",
+      cookie: fixture.schedulerBCookie,
+      json: {
+        teacherId: fixture.dataWorkspaceReplacementTeacher.id,
+        studentGroupIds: importedSection.studentGroupIds,
+        revision: importedSection.revision,
+      },
+    });
+    pendingSectionWrite.then(
+      () => { sectionWriteSettled = true; },
+      () => { sectionWriteSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      files.writeReady,
+      writeControl,
+      () => sectionWriteSettled,
+      "Course workspace section update",
+      "the applied section CAS update",
+    );
+    await releaseRaceBarrier(files.writeRelease, writeNonce);
+    await waitForPendingRollbackJournalWriter("Course workspace section update");
+    assert.equal(sectionWriteSettled, false, "The section update committed while the old course workspace snapshot still held a read transaction.");
+    assert.equal(workspaceSettled, false, "The course workspace left its snapshot barrier before the section update reached COMMIT.");
+
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
+    const [raceWorkspace, updated] = await Promise.all([pendingWorkspace, pendingSectionWrite]);
+    assert.deepEqual(raceWorkspace.body, oldWorkspace.body);
+    assert.equal(updated.body.revision, importedSection.revision + 1);
+
+    const [latestA, latestB] = await Promise.all([
+      requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, workspacePath, { cookie: fixture.schedulerBCookie }),
+    ]);
+    assert.deepEqual(latestA.body, latestB.body);
+    const replacedSection = latestA.body.sections.find((section) => section.id === importedSection.id);
+    assert.equal(replacedSection.teacherId, fixture.dataWorkspaceReplacementTeacher.id);
+    assert.equal(replacedSection.revision, importedSection.revision + 1);
+    assert.equal(latestA.body.currentCourse.allocationVarianceCount, 2);
+    const varianceByTeacher = new Map(
+      latestA.body.allocationVariances.map((variance) => [variance.teacherId, variance]),
+    );
+    assert.deepEqual(varianceByTeacher.get(fixture.dataWorkspaceTeacher.id), {
+      teacherId: fixture.dataWorkspaceTeacher.id,
+      teacherName: fixture.dataWorkspaceTeacher.name,
+      expectedSections: 2,
+      actualSections: 0,
+    });
+    assert.deepEqual(varianceByTeacher.get(fixture.dataWorkspaceReplacementTeacher.id), {
+      teacherId: fixture.dataWorkspaceReplacementTeacher.id,
+      teacherName: fixture.dataWorkspaceReplacementTeacher.name,
+      expectedSections: 0,
+      actualSections: 1,
+    });
+  } finally {
+    await releaseRaceBarrier(files.writeRelease, writeNonce).catch(() => undefined);
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce).catch(() => undefined);
+    activeRaceReleases.delete(files.writeRelease);
+    activeRaceReleases.delete(files.snapshotRelease);
+    await Promise.allSettled([pendingWorkspace, pendingSectionWrite].filter(Boolean));
+    await removeRaceFiles(files);
+  }
+  report("课程详情聚合跨进程保持 currentCourse、班次与分配差异同一快照");
+}
+
+async function armManagementWorkspaceEntryFault(kind, fixture, fault) {
+  // 两个 production 聚合各有独立首读 marker；control 仍绑定本轮 run token、A 进程
+  // 与随机 nonce。课程详情额外绑定稳定 course ID，防止其他详情请求误消费。
+  const nonce = randomBytes(16).toString("hex");
+  const prefix = kind === "data" ? "data-workspace" : "course-workspace";
+  const control = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce,
+    fault,
+    ...(kind === "course" ? { courseId: fixture.dataWorkspaceCourse.id } : {}),
+  };
+  const files = {
+    arm: path.join(authRaceControlDirectory, `${prefix}-entry-arm-A.json`),
+    temporary: path.join(authRaceControlDirectory, `${prefix}-entry-arm-A-${nonce}.tmp`),
+    ready: path.join(authRaceControlDirectory, `${prefix}-entry-ready-A-${nonce}.json`),
+    release: path.join(authRaceControlDirectory, `${prefix}-entry-release-${nonce}.txt`),
+  };
+  await writeFile(files.temporary, JSON.stringify(control), { flag: "wx", mode: 0o600 });
+  await rename(files.temporary, files.arm);
+  return { control, files };
+}
+
+async function verifyManagementWorkspaceFailureBoundaries(serverA, fixture) {
+  const cases = [
+    {
+      kind: "data",
+      pathname: "/api/data-management/workspace",
+      fallbackError: "The master-data workspace could not be loaded. Try again.",
+    },
+    {
+      kind: "course",
+      pathname: `/api/courses/${fixture.dataWorkspaceCourse.id}/workspace`,
+      fallbackError: "The course sections workspace could not be loaded. Try again.",
+    },
+  ];
+  const baselines = new Map();
+  for (const testCase of cases) {
+    baselines.set(
+      testCase.kind,
+      (await requestApi(serverA, testCase.pathname, { cookie: fixture.schedulerACookie })).body,
+    );
+  }
+  const expectedDatabase = readFullBusinessSnapshot();
+  const observer = new Database(testDatabasePath, { readonly: true });
+  const initialDataVersion = observer.pragma("data_version", { simple: true });
+  try {
+    // 普通 Error 含敏感哨兵；两条路由都只能返回自己的固定 safe500，不能把 SQL、
+    // 文件路径或堆栈回显给浏览器。失败前后14表逐字段与 data_version 均保持不变。
+    for (const testCase of cases) {
+      const fault = await armManagementWorkspaceEntryFault(testCase.kind, fixture, "internal");
+      try {
+        const response = await requestApi(serverA, testCase.pathname, {
+          cookie: fixture.schedulerACookie,
+          expectedStatus: 500,
+        });
+        assert.deepEqual(JSON.parse(await readFile(fault.files.ready, "utf8")), fault.control);
+        assert.deepEqual(response.body, { error: testCase.fallbackError });
+        assert.equal(response.response.headers.get("retry-after"), null);
+        assert(!/secret|sqlite|select|private|table|column|stack|path/i
+          .test(JSON.stringify(response.body)));
+      } finally {
+        await removeRaceFiles(fault.files);
+      }
+      assert.deepEqual(readFullBusinessSnapshot(), expectedDatabase);
+      assert.equal(observer.pragma("data_version", { simple: true }), initialDataVersion);
+      assert.deepEqual(
+        (await requestApi(serverA, testCase.pathname, { cookie: fixture.schedulerACookie })).body,
+        baselines.get(testCase.kind),
+      );
+    }
+
+    // BUSY 必须发生在认证完成、DEFERRED 首读之前：preload 先报告 ready，第三连接再取
+    // EXCLUSIVE。SQLite 默认五秒超时后两路都返回同一503/Retry-After，并可立即恢复。
+    for (const testCase of cases) {
+      const fault = await armManagementWorkspaceEntryFault(testCase.kind, fixture, "busy");
+      activeRaceReleases.set(fault.files.release, fault.control.nonce);
+      let requestSettled = false;
+      const pending = requestApi(serverA, testCase.pathname, {
+        cookie: fixture.schedulerACookie,
+        expectedStatus: 503,
+      });
+      pending.then(
+        () => { requestSettled = true; },
+        () => { requestSettled = true; },
+      );
+      const blocker = new Database(testDatabasePath);
+      let holdsExclusiveLock = false;
+      try {
+        await waitForRaceReady(
+          serverA,
+          fault.files.ready,
+          fault.control,
+          () => requestSettled,
+          `${testCase.kind} workspace BUSY boundary`,
+          "the pre-SELECT workspace entry",
+        );
+        assert.equal(blocker.pragma("journal_mode", { simple: true }), "delete");
+        assert.equal(blocker.pragma("busy_timeout", { simple: true }), 5_000);
+        blocker.exec("BEGIN EXCLUSIVE");
+        holdsExclusiveLock = true;
+        const releasedAt = Date.now();
+        await releaseRaceBarrier(fault.files.release, fault.control.nonce);
+        const response = await pending;
+        const waitedMilliseconds = Date.now() - releasedAt;
+        assert(waitedMilliseconds >= 4_000 && waitedMilliseconds < 15_000,
+          `${testCase.kind} workspace BUSY response used an unexpected wait of ${waitedMilliseconds} ms.`);
+        assert.deepEqual(response.body, {
+          error: "Another scheduler is updating timetable data. Try again in a moment.",
+        });
+        assert.equal(response.response.headers.get("retry-after"), "1");
+        assert(!/sqlite|database|\bbusy\b|\blocked\b|constraint|select |\btable\b|column|stack|\/private\//i
+          .test(JSON.stringify(response.body)));
+      } finally {
+        if (holdsExclusiveLock) {
+          try { blocker.exec("ROLLBACK"); } catch { /* close 仍会释放测试锁。 */ }
+        }
+        blocker.close();
+        await releaseRaceBarrier(fault.files.release, fault.control.nonce).catch(() => undefined);
+        activeRaceReleases.delete(fault.files.release);
+        await pending.catch(() => undefined);
+        await removeRaceFiles(fault.files);
+      }
+      assert.deepEqual(readFullBusinessSnapshot(), expectedDatabase);
+      assert.equal(observer.pragma("data_version", { simple: true }), initialDataVersion);
+      assert.deepEqual(
+        (await requestApi(serverA, testCase.pathname, { cookie: fixture.schedulerACookie })).body,
+        baselines.get(testCase.kind),
+      );
+    }
+  } finally {
+    observer.close();
+  }
+  report("两套管理聚合的真实 BUSY503 与未知500均安全、零写入且释放后恢复");
 }
 
 async function verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
@@ -1310,7 +1817,7 @@ async function verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture) {
     requestApi(serverB, "/api/cycle", { cookie: fixture.schedulerBCookie }),
   ]);
   assert.equal(statusA.body.currentToken, statusB.body.currentToken);
-  assert.equal(statusA.body.courses, 1);
+  assert.equal(statusA.body.courses, snapshotBeforeStart.courses.length);
 
   const startResults = await runWhileBothWritersAreBlocked(
     "Concurrent Cycle Start",
@@ -1736,17 +2243,30 @@ function startExternalTeacherWriter(id, name) {
 
 async function verifyAtomicFullSystemRestore(serverA, serverB) {
   // 放大一份仍然完全合法的 cycle snapshot，让测试能观察 restore 的“先锁、后 safety”顺序。
-  // 大文本只存在本轮 mkdtemp 数据库，不进入仓库或老师正式资料。
-  const padding = "R".repeat(14 * 1024 * 1024);
+  // 不能再用一条超长 catalog：严格 Cycle 契约会正确拒绝它。这里改为许多彼此唯一、
+  // 每字段都在 production 上限内的历史课程；大资料仍只存在本轮 mkdtemp 数据库。
   const inflationDatabase = new Database(testDatabasePath);
   try {
     const backup = inflationDatabase.prepare("SELECT id, snapshot_json FROM schedule_backups").get();
     assert(backup, "Full restore concurrency fixture needs one emergency cycle backup.");
     const snapshot = JSON.parse(backup.snapshot_json);
     assert(snapshot.courses.length > 0);
-    snapshot.courses[0].catalog = padding;
+    const template = snapshot.courses[0];
+    const catalog = "R".repeat(256);
+    for (let index = 0; index < 20_000; index += 1) {
+      const suffix = index.toString(36).toUpperCase().padStart(8, "0");
+      snapshot.courses.push({
+        ...template,
+        id: `padding-course-${suffix}`.padEnd(128, "x"),
+        code: `PAD_${suffix}`.padEnd(32, "X"),
+        catalog,
+      });
+    }
+    const serializedSnapshot = JSON.stringify(snapshot);
+    assert(serializedSnapshot.length > 10 * 1024 * 1024 && serializedSnapshot.length < 18 * 1024 * 1024,
+      `The legal restore fixture used an unexpected ${serializedSnapshot.length}-byte snapshot.`);
     inflationDatabase.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?")
-      .run(JSON.stringify(snapshot), backup.id);
+      .run(serializedSnapshot, backup.id);
   } finally {
     inflationDatabase.close();
   }
@@ -1886,8 +2406,10 @@ function verifyFinalDatabase() {
   try {
     assert.deepEqual(db.pragma("integrity_check"), [{ integrity_check: "ok" }]);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
-    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM courses").get().count, 1);
-    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM course_sections").get().count, 2);
+    // 候选竞态课程与管理聚合竞态课程都经过 Cycle/完整恢复后保留；后者含一个
+    // 手工班次和一个导入班次，因此最终明确为两门课程、四个班次。
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM courses").get().count, 2);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM course_sections").get().count, 4);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM scheduled_lessons").get().count, 1);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM schedule_backups").get().count, 1);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM auth_sessions").get().count, 0);
@@ -1996,6 +2518,10 @@ async function run() {
   // 管理员已提前建立；接下来创建账号、独立会话和课程 fixture。
   const fixture = await initializeFixtureAfterAdministrator(serverA, serverB);
 
+  await verifyConcurrentMasterDataAndSectionResize(serverA, serverB, fixture);
+  await verifyDataManagementWorkspaceSnapshotConsistency(serverA, serverB, fixture);
+  await verifyCourseWorkspaceSnapshotConsistency(serverA, serverB, fixture);
+  await verifyManagementWorkspaceFailureBoundaries(serverA, fixture);
   await verifyCandidateSnapshotConsistency(serverA, serverB, fixture);
   await verifyCandidateFailureBoundaries(serverA, fixture);
   await verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture);
@@ -2067,6 +2593,32 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
     },
   })).body;
 
+  // 管理聚合竞态使用独立资料：一门手工课程先只有未分配01班，Teaching Members
+  // 导入随后把同一教师由 PT 改为 FT，并新增自动02班。这样一笔真实事务会同时改变
+  // teachers 与 courses 摘要；第二位教师则供课程详情竞态执行手工改派。
+  const dataWorkspaceTeacher = (await requestApi(serverA, "/api/teachers", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: { name: "CROSS DATA WORKSPACE TEACHER", staffType: "PT" },
+  })).body;
+  const dataWorkspaceReplacementTeacher = (await requestApi(serverA, "/api/teachers", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: { name: "CROSS DATA REPLACEMENT", staffType: "FT" },
+  })).body;
+  const dataWorkspaceCourse = (await requestApi(serverA, "/api/courses", {
+    method: "POST",
+    cookie: schedulerA.cookie,
+    expectedStatus: 201,
+    json: {
+      code: "CROSS_DATA_WORKSPACE",
+      catalog: "Cross workspace old catalog",
+      sectionCount: 1,
+    },
+  })).body;
+
   const course = (await requestApi(serverA, "/api/courses", {
     method: "POST",
     cookie: schedulerA.cookie,
@@ -2118,6 +2670,9 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
     candidateGroup,
     candidateRoom,
     candidateSectionId: sections[1].id,
+    dataWorkspaceTeacher,
+    dataWorkspaceReplacementTeacher,
+    dataWorkspaceCourse,
     schedulerACookie: schedulerA.cookie,
     schedulerBCookie: schedulerB.cookie,
   };

@@ -8,7 +8,12 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import * as XLSX from "xlsx";
 import { reconcileLessonDraft } from "../src/lib/lesson-draft-reconciliation.mjs";
-import { parseTeachingMembersWorksheet } from "../src/lib/teaching-members-workbook.mjs";
+import {
+  maximumTeachingMembersCompressionRatio,
+  maximumTeachingMembersUncompressedBytes,
+  maximumTeachingMembersZipEntries,
+  parseTeachingMembersWorksheet,
+} from "../src/lib/teaching-members-workbook.mjs";
 
 // 这项回归使用刚生成的 standalone production build，而不是开发服务器。
 // 因此测试结果同时覆盖 Next.js 路由编译、身份代理和真实 SQLite 写入路径。
@@ -315,6 +320,24 @@ function workbookBuffer(sheetEntries) {
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx", compression: true });
 }
 
+function zipDirectoryFixture(workbookBytes) {
+  // 这些 offset 只用于构造恶意 ZIP 元数据测试样本；production 的目录检查仍由共用
+  // parseTeachingMembersWorksheet 执行，测试不会复制或替代真正的资源判定逻辑。
+  const bytes = Buffer.from(workbookBytes);
+  let directoryEndOffset = -1;
+  for (let offset = bytes.length - 22; offset >= Math.max(0, bytes.length - 65_557); offset -= 1) {
+    if (bytes.readUInt32LE(offset) !== 0x06054b50) continue;
+    if (offset + 22 + bytes.readUInt16LE(offset + 20) === bytes.length) {
+      directoryEndOffset = offset;
+      break;
+    }
+  }
+  assert(directoryEndOffset >= 0, "The test workbook did not contain a normal ZIP directory.");
+  const firstEntryOffset = bytes.readUInt32LE(directoryEndOffset + 16);
+  assert.equal(bytes.readUInt32LE(firstEntryOffset), 0x02014b50);
+  return { bytes, directoryEndOffset, firstEntryOffset };
+}
+
 function teachingRowsWorksheet(rows) {
   // 固定表头顺序与 Teaching Allocation 导出保持一致；即使某一列全部为空，
   // 测试工作簿仍会真实包含该必填表头。
@@ -328,6 +351,24 @@ async function uploadWorkbook(bytes, filename, expectedStatus) {
   const formData = new FormData();
   formData.append("file", new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
   return requestApi("/api/imports/teaching-members", { method: "POST", body: formData, expectedStatus });
+}
+
+function readTeachingImportFixtureState(courseCodes, teacherNames) {
+  // 只截取本组 Excel fixture 的完整行资料；ID、revision、updated_at、allocation 和
+  // section 都保留，能够区分真正 no-op 与“删除后用相同表面数量重建”。
+  return executeTestDatabase((db) => {
+    const courses = courseCodes
+      .map((code) => db.prepare("SELECT * FROM courses WHERE code = ?").get(code))
+      .filter(Boolean)
+      .sort((left, right) => left.code.localeCompare(right.code));
+    const teachers = teacherNames
+      .map((name) => db.prepare("SELECT * FROM teachers WHERE name = ?").get(name))
+      .filter(Boolean)
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const allocations = courses.flatMap((course) => db.prepare("SELECT * FROM teaching_allocations WHERE course_id = ? ORDER BY teacher_id").all(course.id));
+    const sections = courses.flatMap((course) => db.prepare("SELECT * FROM course_sections WHERE course_id = ? ORDER BY sequence").all(course.id));
+    return { courses, teachers, allocations, sections };
+  });
 }
 
 async function verifyAuthentication() {
@@ -522,7 +563,7 @@ async function verifyWorkbookBoundaries() {
   const parsedTargetWorkbook = parseTeachingMembersWorksheet(targetWorkbook);
   assert.deepEqual(parsedTargetWorkbook.parsedWorksheetNames, ["Teaching Members"]);
   const targetImport = await uploadWorkbook(targetWorkbook, "target-only.xlsx", 200);
-  assert.deepEqual(targetImport.body, { courses: 1, teachers: 1, allocations: 1, sections: 1, ignoredZeroRows: 0 });
+  assert.deepEqual(targetImport.body, { courses: 1, teachers: 1, allocations: 1, sections: 1, zeroAllocationRows: 0, ignoredZeroRows: 0 });
 
   // 合法 XLSX 若缺少约定工作表或缺少必要表头，也必须在写数据库前清楚拒绝。
   // 两个请求共用完整业务快照，证明解析器重构没有把格式错误变成半完成导入。
@@ -545,6 +586,26 @@ async function verifyWorkbookBoundaries() {
   assert.match(missingColumns.body.error, /missing required columns/i);
   assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidTemplates);
 
+  // 课程、Catalog 和教师文字必须在进入数据库前执行原生字符串、长度与控制字符检查。
+  // 前两行若被 NUL 复合键拼接会得到相同 key，因而也直接覆盖旧实现的碰撞风险。
+  const snapshotBeforeInvalidText = readBusinessSnapshot();
+  const invalidTextRows = [
+    { Mod: "AUTO\u0000COLLISION", Catalog: "Must not import", Lecturer: "TEXT TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: "AUTO", Catalog: "Must not import", Lecturer: "COLLISION\u0000TEXT TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: 12345, Catalog: "Must not import", Lecturer: "NATIVE TEXT TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: "AUTO_LONG_LECTURER", Catalog: "Must not import", Lecturer: "L".repeat(129), "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: "AUTO_LONG_CATALOG", Catalog: "C".repeat(257), Lecturer: "CATALOG TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: "AUTO_CONTROL_CATALOG", Catalog: "LINE\nBREAK", Lecturer: "CATALOG CONTROL TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+  ];
+  const invalidText = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet(invalidTextRows)]]),
+    "invalid-teaching-text.xlsx",
+    400,
+  );
+  assert.match(invalidText.body.error, /plain string|control characters/i);
+  assert(!JSON.stringify(invalidText.body).includes("L".repeat(129)));
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidText);
+
   // 5,000 条资料是允许边界。只让第一行产生一项分配，其余使用合法的零分配，
   // 可以覆盖全部行数而不会建立数千门无意义测试课程。
   const boundaryRows = Array.from({ length: 5_000 }, (_, index) => ({
@@ -560,6 +621,7 @@ async function verifyWorkbookBoundaries() {
     200,
   );
   assert.equal(exactLimit.body.ignoredZeroRows, 4_999);
+  assert.equal(exactLimit.body.zeroAllocationRows, 4_999);
   assert.equal(exactLimit.body.sections, 1);
 
   // 再增加一条资料必须在任何数据库写入前返回 400；之后读取课程数量确认
@@ -623,6 +685,37 @@ async function verifyWorkbookBoundaries() {
     expectedStatus: 413,
   });
   assert.match(oversized.body.error, /20 MB or smaller/);
+
+  // 三份文件只篡改 ZIP 中央目录元数据：压缩内容本身保持很小。若预检被删掉，
+  // SheetJS 才会接触彼此矛盾或声明巨量解压内容的条目；当前必须在数据库写入前 400。
+  const tooManyEntries = zipDirectoryFixture(targetWorkbook);
+  tooManyEntries.bytes.writeUInt16LE(maximumTeachingMembersZipEntries + 1, tooManyEntries.directoryEndOffset + 8);
+  tooManyEntries.bytes.writeUInt16LE(maximumTeachingMembersZipEntries + 1, tooManyEntries.directoryEndOffset + 10);
+  const rejectedEntryCount = await uploadWorkbook(tooManyEntries.bytes, "too-many-zip-entries.xlsx", 400);
+  assert.match(rejectedEntryCount.body.error, /2,048 ZIP entries or fewer/i);
+
+  const excessiveExpansion = zipDirectoryFixture(targetWorkbook);
+  excessiveExpansion.bytes.writeUInt32LE(maximumTeachingMembersUncompressedBytes + 1, excessiveExpansion.firstEntryOffset + 24);
+  const rejectedExpansion = await uploadWorkbook(excessiveExpansion.bytes, "excessive-uncompressed-size.xlsx", 400);
+  assert.match(rejectedExpansion.body.error, /128 MB safety limit/i);
+
+  const excessiveRatio = zipDirectoryFixture(targetWorkbook);
+  const firstCompressedBytes = excessiveRatio.bytes.readUInt32LE(excessiveRatio.firstEntryOffset + 20);
+  assert(firstCompressedBytes > 0, "The ZIP ratio fixture requires a compressed first entry.");
+  const declaredUncompressedBytes = firstCompressedBytes * maximumTeachingMembersCompressionRatio + 1;
+  assert(declaredUncompressedBytes < maximumTeachingMembersUncompressedBytes);
+  excessiveRatio.bytes.writeUInt32LE(declaredUncompressedBytes, excessiveRatio.firstEntryOffset + 24);
+  const rejectedRatio = await uploadWorkbook(excessiveRatio.bytes, "excessive-compression-ratio.xlsx", 400);
+  assert.match(rejectedRatio.body.error, /200:1 compression-ratio safety limit/i);
+
+  // 目录和本地 header 一起谎报 1 byte，声明值会通过总量／比率检查；实际 Deflate
+  // 验证仍必须在 2 bytes 输出处停止，证明资源门槛不只是相信攻击者提供的数字。
+  const understatedExpansion = zipDirectoryFixture(targetWorkbook);
+  const localHeaderOffset = understatedExpansion.bytes.readUInt32LE(understatedExpansion.firstEntryOffset + 42);
+  understatedExpansion.bytes.writeUInt32LE(1, understatedExpansion.firstEntryOffset + 24);
+  understatedExpansion.bytes.writeUInt32LE(1, localHeaderOffset + 22);
+  const rejectedUnderstatement = await uploadWorkbook(understatedExpansion.bytes, "understated-uncompressed-size.xlsx", 400);
+  assert.match(rejectedUnderstatement.body.error, /could not be decompressed within its safety limits/i);
   assert.deepEqual(readBusinessSnapshot(), snapshotBeforeTransportErrors);
 
   // 原型字段烟测确认应用路径不会修改 Object.prototype。它是纵深回归，
@@ -636,7 +729,372 @@ async function verifyWorkbookBoundaries() {
   ).sheetRows[0];
   assert.equal(Object.getPrototypeOf(prototypeRow), Object.prototype);
   assert.equal(Object.prototype.polluted, undefined);
-  report("Excel 版本、目标表隔离、行数、multipart、文件大小和原型烟测");
+  report("Excel 版本、目标表隔离、文字边界、行数、ZIP 解压资源、multipart、文件大小和原型烟测");
+}
+
+async function verifyTeachingGroupCountBoundaries() {
+  // 旧实现经 Number() 会把空白、false 和科学记数字符串分别变成 0／0／100。
+  // 每个样本都走 production API，并在整组结束后比较完整业务快照证明零写入。
+  const snapshotBeforeInvalidCounts = readBusinessSnapshot();
+  const invalidCounts = [
+    ["blank", null],
+    ["whitespace", "   "],
+    ["boolean-false", false],
+    ["boolean-true", true],
+    ["scientific-text", "1e2"],
+    ["scientific-zero-text", "0e0"],
+    ["fraction", 1.5],
+    ["negative", -1],
+    ["over-row-limit", 1_000],
+    ["unsafe-integer", Number.MAX_SAFE_INTEGER + 1],
+  ];
+  for (const [label, groupCount] of invalidCounts) {
+    const result = await uploadWorkbook(
+      workbookBuffer([["Teaching Members", teachingRowsWorksheet([{
+        Mod: `AUTO_INVALID_${String(label).toUpperCase().replaceAll("-", "_")}`,
+        Catalog: "Must never import",
+        Lecturer: "AUTO INVALID COUNT",
+        "Staff Type": "FT",
+        "# of grps teaching": groupCount,
+      }])]]),
+      `${label}-group-count.xlsx`,
+      400,
+    );
+    assert.match(result.body.error, /Row 2.*0 to 999/i);
+  }
+
+  // 单行都合法仍不代表整门课程或整份工作簿安全。两组聚合边界必须在任何
+  // SQLite 写入和班次展开前拒绝，避免少量行制造数千至数百万次循环。
+  const courseOverflow = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { Mod: "AUTO_COURSE_OVERFLOW", Catalog: "Must never import", Lecturer: "AUTO LIMIT A", "Staff Type": "FT", "# of grps teaching": 500 },
+      { Mod: "AUTO_COURSE_OVERFLOW", Catalog: "Must never import", Lecturer: "AUTO LIMIT B", "Staff Type": "PT", "# of grps teaching": 500 },
+    ])]]),
+    "course-aggregate-overflow.xlsx",
+    400,
+  );
+  assert.match(courseOverflow.body.error, /AUTO_COURSE_OVERFLOW exceeds the 999-group course limit/i);
+
+  const workbookOverflowRows = Array.from({ length: 6 }, (_, index) => ({
+    Mod: `AUTO_WORKBOOK_LIMIT_${index + 1}`,
+    Catalog: "Must never import",
+    Lecturer: `AUTO WORKBOOK LIMIT ${index + 1}`,
+    "Staff Type": "FT",
+    "# of grps teaching": index < 5 ? 999 : 6,
+  }));
+  const workbookOverflow = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet(workbookOverflowRows)]]),
+    "workbook-group-overflow.xlsx",
+    400,
+  );
+  assert.match(workbookOverflow.body.error, /5,000-group safety limit/i);
+
+  // 同一自然键不能靠表格行顺序决定最终主资料。Staff Type 或 Catalog 冲突都必须
+  // 在打开写事务前 400，不能让 Map 的“最后一行获胜”掩盖输入矛盾。
+  const conflictingStaffType = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { Mod: "AUTO_CONFLICT_STAFF_A", Catalog: "Consistent A", Lecturer: "AUTO CONFLICT STAFF", "Staff Type": "FT", "# of grps teaching": 0 },
+      { Mod: "AUTO_CONFLICT_STAFF_B", Catalog: "Consistent B", Lecturer: "AUTO CONFLICT STAFF", "Staff Type": "PT", "# of grps teaching": 0 },
+    ])]]),
+    "conflicting-staff-type.xlsx",
+    400,
+  );
+  assert.match(conflictingStaffType.body.error, /AUTO CONFLICT STAFF has conflicting Staff Type/i);
+  const conflictingCatalog = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { Mod: "AUTO_CONFLICT_CATALOG", Catalog: "First catalog", Lecturer: "AUTO CATALOG A", "Staff Type": "FT", "# of grps teaching": 0 },
+      { Mod: "AUTO_CONFLICT_CATALOG", Catalog: "Different catalog", Lecturer: "AUTO CATALOG B", "Staff Type": "FT", "# of grps teaching": 0 },
+    ])]]),
+    "conflicting-catalog.xlsx",
+    400,
+  );
+  assert.match(conflictingCatalog.body.error, /AUTO_CONFLICT_CATALOG has conflicting Catalog/i);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidCounts);
+
+  // 999 是单行／单课程的合法闭区间上限。随后用数值 0 清空，既验证上限可用，
+  // 也避免这 999 个临时班次影响后续 CRUD fixture 的可读性和运行规模。
+  const acceptedBoundary = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([{
+      Mod: "AUTO_COUNT_999",
+      Catalog: "Accepted group boundary",
+      Lecturer: "AUTO COUNT BOUNDARY",
+      "Staff Type": "FT",
+      "# of grps teaching": 999,
+    }])]]),
+    "accepted-999-groups.xlsx",
+    200,
+  );
+  assert.equal(acceptedBoundary.body.sections, 999);
+  const maximumState = readTeachingImportFixtureState(["AUTO_COUNT_999"], ["AUTO COUNT BOUNDARY"]);
+  assert.equal(maximumState.allocations[0].assigned_group_count, 999);
+  assert.equal(maximumState.sections.length, 999);
+  const clearedBoundary = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([{
+      Mod: "AUTO_COUNT_999",
+      Catalog: "Accepted group boundary",
+      Lecturer: "AUTO COUNT BOUNDARY",
+      "Staff Type": "FT",
+      "# of grps teaching": 0,
+    }])]]),
+    "clear-999-with-numeric-zero.xlsx",
+    200,
+  );
+  assert.deepEqual(clearedBoundary.body, { courses: 1, teachers: 1, allocations: 0, sections: 0, zeroAllocationRows: 1, ignoredZeroRows: 1 });
+  const clearedMaximumState = readTeachingImportFixtureState(["AUTO_COUNT_999"], ["AUTO COUNT BOUNDARY"]);
+  assert.equal(clearedMaximumState.courses[0].id, maximumState.courses[0].id);
+  assert.equal(clearedMaximumState.teachers[0].id, maximumState.teachers[0].id);
+  assert.deepEqual(clearedMaximumState.allocations, []);
+  assert.deepEqual(clearedMaximumState.sections, []);
+  report("Teaching group count 严格类型、0–999／课程／工作簿上限与数值零清除");
+}
+
+async function verifyTeachingExplicitZeroAndNoOp() {
+  // 全零工作簿若没有一个 Mod 命中既有课程，就没有可执行的清除动作；必须 400 且连
+  // 教师名单也不写。若同批另有正数新课程，零值未知 Mod 仍不建空课程，但教师行
+  // 继续作为完整 roster 维护。
+  const snapshotBeforeUnmatchedZero = readBusinessSnapshot();
+  const unmatchedZero = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { Mod: "AUTO_UNKNOWN_ZERO_A", Catalog: "Must not create", Lecturer: "AUTO UNKNOWN ZERO A", "Staff Type": "FT", "# of grps teaching": 0 },
+      { Mod: "AUTO_UNKNOWN_ZERO_B", Catalog: "Must not create", Lecturer: "AUTO UNKNOWN ZERO B", "Staff Type": "PT", "# of grps teaching": "0" },
+    ])]]),
+    "all-zero-without-existing-course.xlsx",
+    400,
+  );
+  assert.match(unmatchedZero.body.error, /No existing courses matched the zero-allocation rows/i);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeUnmatchedZero);
+
+  const mixedZeroResult = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { Mod: "AUTO_ZERO_POSITIVE_ACTION", Catalog: "Positive action", Lecturer: "AUTO ZERO ACTION", "Staff Type": "FT", "# of grps teaching": 1 },
+      { Mod: "AUTO_ZERO_NEW_MUST_NOT_EXIST", Catalog: "Must not create", Lecturer: "AUTO ZERO ROSTER ONLY", "Staff Type": "PT", "# of grps teaching": 0 },
+    ])]]),
+    "positive-with-unknown-zero.xlsx",
+    200,
+  );
+  assert.deepEqual(mixedZeroResult.body, { courses: 1, teachers: 2, allocations: 1, sections: 1, zeroAllocationRows: 1, ignoredZeroRows: 1 });
+  executeTestDatabase((db) => {
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM courses WHERE code = ?").get("AUTO_ZERO_NEW_MUST_NOT_EXIST").count, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM teachers WHERE name = ?").get("AUTO ZERO ROSTER ONLY").count, 1);
+  });
+
+  // 三门课程先由同一位教师建立；其中两门稍后用 0 清除，Companion 故意不在
+  // 第二份工作簿出现，用来证明“未提课程不变”而不是全库替换。
+  const baselineRows = [
+    { Mod: "AUTO_ZERO_TEXT", Catalog: "Text zero clear", Lecturer: "AUTO ZERO TEACHER", "Staff Type": "FT", "# of grps teaching": 2 },
+    { Mod: "AUTO_ZERO_NUMBER", Catalog: "Numeric zero clear", Lecturer: "AUTO ZERO TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+    { Mod: "AUTO_ZERO_COMPANION", Catalog: "Must stay untouched", Lecturer: "AUTO ZERO TEACHER", "Staff Type": "FT", "# of grps teaching": 1 },
+  ];
+  const baselineWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet(baselineRows)]]);
+  await uploadWorkbook(baselineWorkbook, "zero-and-noop-baseline.xlsx", 200);
+  const baselineCourses = (await requestApi("/api/courses")).body;
+  const configuredCourse = baselineCourses.find((course) => course.code === "AUTO_ZERO_TEXT");
+  assert(configuredCourse, "The explicit-zero fixture course was not created.");
+  await requestApi(`/api/courses/${configuredCourse.id}`, {
+    method: "PATCH",
+    json: {
+      revision: configuredCourse.revision,
+      durationHours: 3,
+      sessionsPerWeek: 2,
+      primaryYear: 2,
+      minimumRoomCapacity: 40,
+      requiresLab: true,
+      requiresMultiProjector: true,
+      requiresSmartClassroom: false,
+      separateSectionsAcrossDays: true,
+      weekStart: 2,
+      weekEnd: 8,
+    },
+  });
+
+  const fixtureCourses = ["AUTO_ZERO_TEXT", "AUTO_ZERO_NUMBER", "AUTO_ZERO_COMPANION"];
+  const stateBeforeSameImport = readTeachingImportFixtureState(fixtureCourses, ["AUTO ZERO TEACHER"]);
+  // SQLite 的 CURRENT_TIMESTAMP 精确到秒；跨过一秒后仍逐字段相同，才能证明教师、
+  // 课程和 allocation 没有执行一次表面无害但实际写入的 UPDATE／重建。
+  await delay(1_100);
+  await uploadWorkbook(baselineWorkbook, "zero-and-noop-identical.xlsx", 200);
+  const stateAfterSameImport = readTeachingImportFixtureState(fixtureCourses, ["AUTO ZERO TEACHER"]);
+  assert.deepEqual(stateAfterSameImport, stateBeforeSameImport);
+
+  // 在表头后加入真实物理空行，再同时使用文字 "0" 和数值 0。空行必须跳过，
+  // 两个明确零值必须生效；全零工作簿本身也是合法的清除操作。
+  const zeroWorksheet = XLSX.utils.aoa_to_sheet([
+    ["Mod", "Catalog", "Lecturer", "Staff Type", "# of grps teaching"],
+    [null, null, null, null, null],
+    ["AUTO_ZERO_TEXT", "Text zero clear", "AUTO ZERO TEACHER", "FT", "0"],
+    ["AUTO_ZERO_NUMBER", "Numeric zero clear", "AUTO ZERO TEACHER", "FT", 0],
+  ]);
+  const zeroResult = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", zeroWorksheet]]),
+    "explicit-text-and-number-zero.xlsx",
+    200,
+  );
+  assert.deepEqual(zeroResult.body, { courses: 2, teachers: 1, allocations: 0, sections: 0, zeroAllocationRows: 2, ignoredZeroRows: 2 });
+
+  const stateAfterZero = readTeachingImportFixtureState(fixtureCourses, ["AUTO ZERO TEACHER"]);
+  const beforeByCode = new Map(stateBeforeSameImport.courses.map((course) => [course.code, course]));
+  const afterByCode = new Map(stateAfterZero.courses.map((course) => [course.code, course]));
+  for (const courseCode of fixtureCourses) assert.equal(afterByCode.get(courseCode).id, beforeByCode.get(courseCode).id);
+  assert.equal(stateAfterZero.teachers[0].id, stateBeforeSameImport.teachers[0].id);
+  // 清除 allocation 和自动班次是真实课程拓扑变化；每门被清除课程整批只提高一次
+  // revision。未出现在工作簿中的 Companion 必须连 revision 也保持原值。
+  assert.equal(afterByCode.get("AUTO_ZERO_TEXT").revision, beforeByCode.get("AUTO_ZERO_TEXT").revision + 1);
+  assert.equal(afterByCode.get("AUTO_ZERO_NUMBER").revision, beforeByCode.get("AUTO_ZERO_NUMBER").revision + 1);
+  assert.equal(afterByCode.get("AUTO_ZERO_COMPANION").revision, beforeByCode.get("AUTO_ZERO_COMPANION").revision);
+  const configuredAfterZero = afterByCode.get("AUTO_ZERO_TEXT");
+  assert.equal(configuredAfterZero.duration_hours, 3);
+  assert.equal(configuredAfterZero.sessions_per_week, 2);
+  assert.equal(configuredAfterZero.primary_year, 2);
+  assert.equal(configuredAfterZero.minimum_room_capacity, 40);
+  assert.equal(configuredAfterZero.requires_lab, 1);
+  assert.equal(configuredAfterZero.requires_multi_projector, 1);
+  assert.equal(configuredAfterZero.separate_sections_across_days, 1);
+  assert.equal(configuredAfterZero.week_start, 2);
+  assert.equal(configuredAfterZero.week_end, 8);
+
+  const companionId = afterByCode.get("AUTO_ZERO_COMPANION").id;
+  assert.deepEqual(
+    stateAfterZero.allocations.filter((allocation) => allocation.course_id !== companionId),
+    [],
+  );
+  assert.deepEqual(
+    stateAfterZero.sections.filter((section) => section.course_id !== companionId),
+    [],
+  );
+  assert.deepEqual(
+    stateAfterZero.allocations.filter((allocation) => allocation.course_id === companionId),
+    stateBeforeSameImport.allocations.filter((allocation) => allocation.course_id === companionId),
+  );
+  assert.deepEqual(
+    stateAfterZero.sections.filter((section) => section.course_id === companionId),
+    stateBeforeSameImport.sections.filter((section) => section.course_id === companionId),
+  );
+  report("显式文字／数值零、整行空白、稳定 ID、单次 revision 与未提课程保持");
+}
+
+async function verifyTeachingImportRevisionsAndSourceKeys() {
+  // 新课程从 revision 1 开始。后续一次导入即使同时改变 Catalog、allocation 和班次
+  // 拓扑，也只能提高一次；完全相同的重导则不写任何版本或 timestamp。
+  const baselineRows = [{
+    Mod: "AUTO_IMPORT_REVISION",
+    Catalog: "Revision baseline",
+    Lecturer: "AUTO REVISION SOURCE A",
+    "Staff Type": "FT",
+    "# of grps teaching": 1,
+  }];
+  const baselineWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet(baselineRows)]]);
+  await uploadWorkbook(baselineWorkbook, "import-revision-baseline.xlsx", 200);
+  let course = (await requestApi("/api/courses")).body.find((item) => item.code === "AUTO_IMPORT_REVISION");
+  assert(course, "The import revision fixture course was not created.");
+  assert.equal(course.revision, 1);
+  const stateBeforeSameImport = readBusinessSnapshot();
+  await delay(1_100);
+  await uploadWorkbook(baselineWorkbook, "import-revision-noop.xlsx", 200);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeSameImport);
+
+  const expandedRows = [{ ...baselineRows[0], Catalog: "Revision change", "# of grps teaching": 2 }];
+  await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet(expandedRows)]]),
+    "import-revision-expanded.xlsx",
+    200,
+  );
+  course = (await requestApi("/api/courses")).body.find((item) => item.id === course.id);
+  assert.equal(course.revision, 2, "Catalog + allocation + section growth must consume one course revision.");
+  assert.equal(course.catalog, "Revision change", "Catalog display case should be preserved.");
+  const expandedSections = (await requestApi(`/api/courses/${course.id}/sections`)).body;
+  assert.equal(expandedSections.length, 2);
+
+  // 把相同数量改给另一位 Excel 教师会同时替换 allocation 并自动改派两个班次；
+  // 课程仍只提高一次，低编号 section ID 保持稳定，各 section 自己提高一次 revision。
+  const reassignedRows = [{
+    ...expandedRows[0],
+    Lecturer: "AUTO REVISION SOURCE B",
+    "Staff Type": "PT",
+  }];
+  const reassignedWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet(reassignedRows)]]);
+  await uploadWorkbook(reassignedWorkbook, "import-revision-reassigned.xlsx", 200);
+  course = (await requestApi("/api/courses")).body.find((item) => item.id === course.id);
+  assert.equal(course.revision, 3, "Allocation replacement and automatic reassignment must consume one course revision.");
+  const reassignedTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.name === "AUTO REVISION SOURCE B");
+  const reassignedSections = (await requestApi(`/api/courses/${course.id}/sections`)).body;
+  assert(reassignedTeacher, "The reassigned source teacher was not created.");
+  assert.deepEqual(reassignedSections.map((section) => section.id), expandedSections.map((section) => section.id));
+  for (let index = 0; index < reassignedSections.length; index += 1) {
+    assert.equal(reassignedSections[index].teacherId, reassignedTeacher.id);
+    assert.equal(reassignedSections[index].revision, expandedSections[index].revision + 1);
+  }
+
+  // 人工改显示名后，隐藏来源键仍应让同一 Lecturer 命中原 ID；Excel 不得改回姓名或
+  // Active 状态。人工新增占用该来源名必须409，避免下一次导入产生双重身份。
+  const renamedTeacher = await requestApi(`/api/teachers/${reassignedTeacher.id}`, {
+    method: "PATCH",
+    json: { name: "AUTO REVISION DISPLAY NAME", staffType: "PT", revision: reassignedTeacher.revision },
+  });
+  assert.equal(renamedTeacher.body.revision, reassignedTeacher.revision + 1);
+  await requestApi("/api/teachers", {
+    method: "POST",
+    expectedStatus: 409,
+    json: { name: "AUTO REVISION SOURCE B", staffType: "FT" },
+  });
+  const courseRevisionBeforeSourceNoOp = course.revision;
+  await uploadWorkbook(reassignedWorkbook, "import-stable-source-after-rename.xlsx", 200);
+  let sourceTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.id === reassignedTeacher.id);
+  course = (await requestApi("/api/courses")).body.find((item) => item.id === course.id);
+  assert.equal(sourceTeacher.name, "AUTO REVISION DISPLAY NAME");
+  assert.equal(sourceTeacher.revision, renamedTeacher.body.revision);
+  assert.equal(course.revision, courseRevisionBeforeSourceNoOp);
+  const sourceKey = executeTestDatabase((db) => db.prepare("SELECT teaching_members_key FROM teachers WHERE id = ?").get(sourceTeacher.id).teaching_members_key);
+  assert.equal(sourceKey, "AUTO REVISION SOURCE B");
+
+  // Staff Type 仍由 Excel 权威维护；它的真实变化只提高教师 revision，不改变课程
+  // allocation 或拓扑，因此课程 revision 保持不变，人工显示名称也继续保留。
+  const staffChangedRows = [{ ...reassignedRows[0], "Staff Type": "FT" }];
+  await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet(staffChangedRows)]]),
+    "import-source-staff-change.xlsx",
+    200,
+  );
+  sourceTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.id === sourceTeacher.id);
+  const courseAfterStaffChange = (await requestApi("/api/courses")).body.find((item) => item.id === course.id);
+  assert.equal(sourceTeacher.name, "AUTO REVISION DISPLAY NAME");
+  assert.equal(sourceTeacher.staffType, "FT");
+  assert.equal(sourceTeacher.revision, renamedTeacher.body.revision + 1);
+  assert.equal(courseAfterStaffChange.revision, courseRevisionBeforeSourceNoOp);
+
+  // 旧数据库首次遇到同名人工教师时只认领隐藏来源键，不改变网页资料，也不消耗 revision。
+  const claimTeacher = (await requestApi("/api/teachers", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { name: "AUTO SOURCE CLAIM", staffType: "FT" },
+  })).body;
+  await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([{
+      Mod: "AUTO_SOURCE_CLAIM_COURSE",
+      Catalog: "Source claim",
+      Lecturer: "AUTO SOURCE CLAIM",
+      "Staff Type": "FT",
+      "# of grps teaching": 1,
+    }])]]),
+    "import-source-claim.xlsx",
+    200,
+  );
+  const claimedTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.id === claimTeacher.id);
+  assert.equal(claimedTeacher.revision, claimTeacher.revision);
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT teaching_members_key FROM teachers WHERE id = ?").get(claimTeacher.id).teaching_members_key), "AUTO SOURCE CLAIM");
+
+  // 模拟历史损坏库中“来源键指向 A、当前姓名指向 B”的歧义。导入必须整批409且零写入；
+  // 测完立即删除故意异常夹具，避免污染后续完整备份不变量检查。
+  const conflictingTeacherId = randomUUID();
+  executeTestDatabase((db) => db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(conflictingTeacherId, "AUTO REVISION SOURCE B", "FT"));
+  try {
+    const beforeAmbiguousImport = readBusinessSnapshot();
+    const ambiguous = await uploadWorkbook(reassignedWorkbook, "import-ambiguous-source.xlsx", 409);
+    assert.match(ambiguous.body.error, /source.*current name|matches one teacher/i);
+    assert.deepEqual(readBusinessSnapshot(), beforeAmbiguousImport);
+  } finally {
+    executeTestDatabase((db) => db.prepare("DELETE FROM teachers WHERE id = ?").run(conflictingTeacherId));
+  }
+  report("Teaching import 单次课程 revision、稳定教师来源键、Staff Type 与歧义保护");
 }
 
 async function verifyTeachingAllocationReimport() {
@@ -656,6 +1114,7 @@ async function verifyTeachingAllocationReimport() {
   const allocationTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.name === "AUTO ALLOCATION TEACHER");
   assert(importedCourse && allocationTeacher, "The re-import fixture course or teacher was not created.");
   const initialSections = (await requestApi(`/api/courses/${importedCourse.id}/sections`)).body;
+  const initialAllocation = executeTestDatabase((db) => db.prepare("SELECT * FROM teaching_allocations WHERE course_id = ? AND teacher_id = ?").get(importedCourse.id, allocationTeacher.id));
   assert.equal(initialSections.length, 2);
 
   // 第二班改为人工教师并加入学生班级；这会清除其 Excel 来源标记。相同工作簿重导
@@ -677,7 +1136,10 @@ async function verifyTeachingAllocationReimport() {
   await uploadWorkbook(allocationWorkbook, "reimport-same.xlsx", 200);
   const stableCourse = (await requestApi("/api/courses")).body.find((course) => course.code === "AUTO_REIMPORT");
   const stableSections = (await requestApi(`/api/courses/${importedCourse.id}/sections`)).body;
+  const stableAllocation = executeTestDatabase((db) => db.prepare("SELECT * FROM teaching_allocations WHERE course_id = ? AND teacher_id = ?").get(importedCourse.id, allocationTeacher.id));
   assert.equal(stableCourse.id, importedCourse.id);
+  assert.equal(stableCourse.revision, importedCourse.revision);
+  assert.deepEqual(stableAllocation, initialAllocation);
   assert.deepEqual(stableSections.map((section) => section.id), initialSections.map((section) => section.id));
   assert.equal(stableSections[0].revision, initialSections[0].revision);
   assert.equal(stableSections[1].revision, manuallyMaintainedSection.revision);
@@ -691,10 +1153,61 @@ async function verifyTeachingAllocationReimport() {
   const protectedShrink = await uploadWorkbook(shrinkWorkbook, "reimport-protected-shrink.xlsx", 409);
   assert.match(protectedShrink.body.error, /manually maintained teacher or student group/i);
   assert.deepEqual(readBusinessSnapshot(), snapshotBeforeProtectedShrink);
+  const protectedZeroWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+    { ...allocationRows[0], "# of grps teaching": "0" },
+    {
+      Mod: "AUTO_ZERO_PROTECTED_COMPANION",
+      Catalog: "Must roll back with protected zero",
+      Lecturer: "AUTO ZERO PROTECTED COMPANION",
+      "Staff Type": "FT",
+      "# of grps teaching": 1,
+    },
+  ])]]);
+  const protectedZero = await uploadWorkbook(protectedZeroWorkbook, "reimport-protected-zero.xlsx", 409);
+  assert.match(protectedZero.body.error, /manually maintained teacher or student group/i);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeProtectedShrink);
+
+  // 旧版／异常资料可能同时保留非空 allocation source，却已有不同 teacher。它不能因
+  // source 非 null 被误认成自动尾班并删除；只读快照和 companion 证明整批 409 回滚。
+  const legacyRows = [{
+    Mod: "AUTO_LEGACY_SOURCE",
+    Catalog: "Legacy source mismatch",
+    Lecturer: "AUTO LEGACY SOURCE",
+    "Staff Type": "FT",
+    "# of grps teaching": 2,
+  }];
+  await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet(legacyRows)]]),
+    "legacy-source-baseline.xlsx",
+    200,
+  );
+  const legacyCourse = (await requestApi("/api/courses")).body.find((course) => course.code === "AUTO_LEGACY_SOURCE");
+  assert(legacyCourse, "The legacy source fixture course was not created.");
+  const legacySections = (await requestApi(`/api/courses/${legacyCourse.id}/sections`)).body;
+  assert.equal(legacySections.length, 2);
+  executeTestDatabase((db) => db.prepare("UPDATE course_sections SET teacher_id = ?, revision = revision + 1 WHERE id = ?").run(manualTeacher.id, legacySections[1].id));
+  const snapshotBeforeLegacyShrink = readBusinessSnapshot();
+  const legacyShrink = await uploadWorkbook(
+    workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+      { ...legacyRows[0], "# of grps teaching": 1 },
+      { Mod: "AUTO_LEGACY_COMPANION", Catalog: "Must roll back", Lecturer: "AUTO LEGACY COMPANION", "Staff Type": "PT", "# of grps teaching": 1 },
+    ])]]),
+    "legacy-source-protected-shrink.xlsx",
+    409,
+  );
+  assert.match(legacyShrink.body.error, /manually maintained teacher or student group/i);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeLegacyShrink);
+  // 这条不一致只为覆盖旧资料保护分支；验证完恢复成合法自动来源，避免故意异常的
+  // fixture 污染后续完整备份业务不变量检查。
+  executeTestDatabase((db) => db.prepare("UPDATE course_sections SET teacher_id = allocation_teacher_id, revision = revision + 1 WHERE id = ?").run(legacySections[1].id));
 
   // 停用 Excel 原教师后，原第一班仍可 grandfather 并保持相同 ID/revision；但把数量
   // 增加到三班会建立新分配，因此必须 409 且整次回滚。
-  await requestApi(`/api/teachers/${allocationTeacher.id}`, { method: "PATCH", json: { isActive: false } });
+  const inactiveAllocationTeacher = await requestApi(`/api/teachers/${allocationTeacher.id}`, {
+    method: "PATCH",
+    json: { isActive: false, revision: allocationTeacher.revision },
+  });
+  allocationTeacher.revision = inactiveAllocationTeacher.body.revision;
   await uploadWorkbook(allocationWorkbook, "reimport-inactive-grandfather.xlsx", 200);
   const inactiveTeacherAfterImport = (await requestApi("/api/teachers")).body.find((teacher) => teacher.id === allocationTeacher.id);
   const sectionsAfterInactiveGrandfather = (await requestApi(`/api/courses/${importedCourse.id}/sections`)).body;
@@ -747,7 +1260,67 @@ async function verifyTeachingAllocationReimport() {
   const scheduledReimport = await uploadWorkbook(scheduledConflictWorkbook, "reimport-scheduled-course.xlsx", 409);
   assert.match(scheduledReimport.body.error, /has been scheduled/i);
   assert.deepEqual(readBusinessSnapshot(), snapshotBeforeScheduledReimport);
-  report("Teaching allocation 稳定 ID、手工分配、缩减、停用教师和已排课程重导保护");
+  const scheduledZeroWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet([
+    { ...allocationRows[0], "# of grps teaching": 0 },
+    {
+      Mod: "AUTO_SCHEDULED_ZERO_COMPANION",
+      Catalog: "Must roll back with scheduled zero",
+      Lecturer: "AUTO SCHEDULED ZERO COMPANION",
+      "Staff Type": "PT",
+      "# of grps teaching": 1,
+    },
+  ])]]);
+  const scheduledZero = await uploadWorkbook(scheduledZeroWorkbook, "reimport-scheduled-zero.xlsx", 409);
+  assert.match(scheduledZero.body.error, /has been scheduled/i);
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeScheduledReimport);
+  report("Teaching allocation 稳定 ID、手工分配、缩减／零值、停用教师和已排课程重导保护");
+}
+
+async function verifyTeachingImportFailureBoundaries() {
+  const failureWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet([{
+    Mod: "AUTO_IMPORT_FAILURE",
+    Catalog: "Must never partially commit",
+    Lecturer: "AUTO IMPORT FAILURE",
+    "Staff Type": "FT",
+    "# of grps teaching": 1,
+  }])]]);
+
+  // 真实 BEFORE INSERT trigger 让教师和课程 SQL 已执行后才失败。Route 必须返回固定
+  // 500，事务则撤销全部前序写入；浏览器不能看到 trigger、表名、SQL 或私有路径。
+  const snapshotBeforeInternalFailure = readBusinessSnapshot();
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER teaching_import_test_failure
+    BEFORE INSERT ON teaching_allocations
+    BEGIN
+      SELECT RAISE(ABORT, 'SECRET teaching_allocations SQL /private/tmp/import.db');
+    END;
+  `));
+  let internalFailure;
+  try {
+    internalFailure = await uploadWorkbook(failureWorkbook, "triggered-import-failure.xlsx", 500);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS teaching_import_test_failure"));
+  }
+  assert.deepEqual(internalFailure.body, { error: "Teaching allocations could not be saved. Please try again." });
+  assert(!/secret|teaching_allocations|sqlite|sql|\/private\/tmp|trigger|stack/i.test(JSON.stringify(internalFailure.body)));
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInternalFailure);
+
+  // RESERVED writer 允许认证 proxy 正常读取 session，但会让 Route 自己的 BEGIN IMMEDIATE
+  // 在真实 busy timeout 后失败。503／Retry-After 与零变化由 production HTTP 直接证明。
+  const snapshotBeforeBusyFailure = readBusinessSnapshot();
+  const lockDatabase = new Database(testDatabasePath);
+  let busyFailure;
+  try {
+    lockDatabase.exec("BEGIN IMMEDIATE");
+    busyFailure = await uploadWorkbook(failureWorkbook, "busy-import.xlsx", 503);
+  } finally {
+    if (lockDatabase.inTransaction) lockDatabase.exec("ROLLBACK");
+    lockDatabase.close();
+  }
+  assert.deepEqual(busyFailure.body, { error: "Another scheduler is updating timetable data. Try again in a moment." });
+  assert.equal(busyFailure.response.headers.get("retry-after"), "1");
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeBusyFailure);
+  report("Teaching allocation 真实 500／BUSY 503 安全 JSON 与事务回滚");
 }
 
 async function verifyCrudAndRevisions() {
@@ -764,6 +1337,8 @@ async function verifyCrudAndRevisions() {
     json: { name: "auto teacher b", staffType: "PT" },
   })).body;
   assert.equal(teacherA.name, "AUTO TEACHER A");
+  assert.equal(teacherA.revision, 1);
+  assert.equal(teacherB.revision, 1);
   await requestApi("/api/teachers", {
     method: "POST",
     expectedStatus: 409,
@@ -778,6 +1353,7 @@ async function verifyCrudAndRevisions() {
     json: { code: "aaa_2", year: 2, program: "aaa" },
   })).body;
   assert.equal(studentGroup.code, "AAA_2");
+  assert.equal(studentGroup.revision, 1);
   await requestApi("/api/student-groups", {
     method: "POST",
     expectedStatus: 409,
@@ -789,17 +1365,77 @@ async function verifyCrudAndRevisions() {
     json: { code: "31-05-10", capacity: 20, hasLab: false, hasMultiProjector: false, isSmartClassroom: true },
   })).body;
   assert(room.features.includes("Multi projector"), "Smart classroom did not imply multi projector.");
+  assert.equal(room.revision, 1);
   await requestApi("/api/rooms", {
     method: "POST",
     expectedStatus: 409,
     json: { code: "31-05-10", capacity: 20, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
   });
+
+  // 三类基础资料都只接受 JSON 原生类型和统一上限；同值 PATCH 是真正 no-op，
+  // 不改变 updated_at、warning 或 revision，也不会让其他账号的表单无故失效。
+  const masterSnapshotBeforeNoOp = readBusinessSnapshot();
+  const teacherNoOp = await requestApi(`/api/teachers/${teacherA.id}`, {
+    method: "PATCH",
+    json: { name: teacherA.name, staffType: teacherA.staffType, revision: teacherA.revision },
+  });
+  const groupNoOp = await requestApi(`/api/student-groups/${studentGroup.id}`, {
+    method: "PATCH",
+    json: { code: studentGroup.code, year: studentGroup.year, program: studentGroup.program, revision: studentGroup.revision },
+  });
+  const roomNoOp = await requestApi(`/api/rooms/${room.id}`, {
+    method: "PATCH",
+    json: {
+      code: room.code,
+      capacity: room.capacity,
+      hasLab: room.features.includes("Lab"),
+      hasMultiProjector: room.features.includes("Multi projector"),
+      isSmartClassroom: room.features.includes("Smart classroom"),
+      revision: room.revision,
+    },
+  });
+  assert.deepEqual(teacherNoOp.body, { ok: true, revision: teacherA.revision, changed: false });
+  assert.deepEqual(groupNoOp.body, { ok: true, revision: studentGroup.revision, changed: false });
+  assert.deepEqual(roomNoOp.body, { ok: true, revision: room.revision, changed: false });
+  assert.deepEqual(readBusinessSnapshot(), masterSnapshotBeforeNoOp);
+  await requestApi("/api/teachers", { method: "POST", expectedStatus: 400, json: { name: 123, staffType: "FT" } });
+  await requestApi("/api/teachers", { method: "POST", expectedStatus: 400, json: { name: "T".repeat(129), staffType: "FT" } });
+  await requestApi("/api/student-groups", { method: "POST", expectedStatus: 400, json: { code: "NATIVE", year: "2", program: "TEST" } });
+  await requestApi("/api/rooms", { method: "POST", expectedStatus: 400, json: { code: "99-99-99", capacity: 1_000_000, hasLab: false, hasMultiProjector: false, isSmartClassroom: false } });
+  await requestApi(`/api/teachers/${teacherA.id}`, {
+    method: "PATCH",
+    expectedStatus: 400,
+    json: { isActive: false, name: teacherA.name, staffType: teacherA.staffType, revision: teacherA.revision },
+  });
+  await requestApi(`/api/rooms/${room.id}`, {
+    method: "PATCH",
+    expectedStatus: 400,
+    json: { isActive: false, code: room.code, capacity: room.capacity, hasLab: false, hasMultiProjector: true, isSmartClassroom: true, revision: room.revision },
+  });
+  const snapshotBeforeInvalidManualCourses = readBusinessSnapshot();
+  const invalidManualCourses = [
+    { code: 123, catalog: null, sectionCount: 1 },
+    { code: "A".repeat(65), catalog: null, sectionCount: 1 },
+    { code: "AUTO\nCONTROL", catalog: null, sectionCount: 1 },
+    { code: "AUTO_BAD_CATALOG", catalog: 123, sectionCount: 1 },
+    { code: "AUTO_LONG_CATALOG", catalog: "C".repeat(257), sectionCount: 1 },
+    { code: "AUTO_CONTROL_CATALOG", catalog: "Bad\nCatalog", sectionCount: 1 },
+    { code: "AUTO_STRING_COUNT", catalog: null, sectionCount: "2" },
+    { code: "AUTO_FRACTION_COUNT", catalog: null, sectionCount: 1.5 },
+    { code: "AUTO_LARGE_COUNT", catalog: null, sectionCount: 1_000 },
+    { code: "AUTO_UNSAFE_COUNT", catalog: null, sectionCount: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+  for (const json of invalidManualCourses) {
+    await requestApi("/api/courses", { method: "POST", expectedStatus: 400, json });
+  }
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidManualCourses);
   const course = (await requestApi("/api/courses", {
     method: "POST",
     expectedStatus: 201,
-    json: { code: "auto_crud", catalog: "CRUD regression", sectionCount: 2 },
+    json: { code: "auto_crud", catalog: "  CRUD regression  ", sectionCount: 2 },
   })).body;
   assert.equal(course.code, "AUTO_CRUD");
+  assert.equal(course.catalog, "CRUD regression");
   await requestApi("/api/courses", {
     method: "POST",
     expectedStatus: 409,
@@ -848,6 +1484,30 @@ async function verifyCrudAndRevisions() {
     expectedStatus: 400,
     json: { teacherId: teacherA.id, studentGroupIds: [randomUUID()], revision: firstAssignment.body.revision },
   });
+  const assignmentSnapshotBeforeStrictInput = readBusinessSnapshot();
+  const invalidAssignments = [
+    { teacherId: "", studentGroupIds: [studentGroup.id], revision: firstAssignment.body.revision },
+    { teacherId: `${teacherA.id}\n`, studentGroupIds: [studentGroup.id], revision: firstAssignment.body.revision },
+    { teacherId: teacherA.id, studentGroupIds: [studentGroup.id, studentGroup.id], revision: firstAssignment.body.revision },
+    { teacherId: teacherA.id, studentGroupIds: [""], revision: firstAssignment.body.revision },
+    { teacherId: teacherA.id, studentGroupIds: ["G".repeat(129)], revision: firstAssignment.body.revision },
+    { teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+  for (const json of invalidAssignments) {
+    await requestApi(`/api/course-sections/${section.id}`, { method: "PATCH", expectedStatus: 400, json });
+  }
+  await requestApi(`/api/course-sections/${section.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      teacherId: teacherA.id,
+      studentGroupIds: [studentGroup.id],
+      revision: firstAssignment.body.revision,
+      padding: "x".repeat(70 * 1_024),
+    }),
+    expectedStatus: 413,
+  });
+  assert.deepEqual(readBusinessSnapshot(), assignmentSnapshotBeforeStrictInput);
   let sectionAfterRejectedAssignments = (await requestApi(`/api/courses/${course.id}/sections`)).body[0];
   assert.equal(sectionAfterRejectedAssignments.teacherId, teacherA.id);
   assert.deepEqual(sectionAfterRejectedAssignments.studentGroupIds, [studentGroup.id]);
@@ -870,7 +1530,26 @@ async function verifyCrudAndRevisions() {
 
   // 班次数量增加后会建立新尾部班次；未分配、未排课的尾部班次可以安全删除，
   // 低编号班次 ID、教师和学生班级必须保持不变。
-  await requestApi(`/api/courses/${course.id}/sections`, { method: "PATCH", json: { sectionCount: 3 } });
+  const revisionBeforeGrowth = courseRevision;
+  const grownCourse = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 3, revision: courseRevision },
+  });
+  courseRevision = grownCourse.body.revision;
+  assert.deepEqual(grownCourse.body, { ok: true, revision: revisionBeforeGrowth + 1, changed: true });
+  const staleGrowth = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { sectionCount: 4, revision: revisionBeforeGrowth },
+  });
+  assert.equal(staleGrowth.body.code, "COURSE_SETUP_CHANGED");
+  const resizeNoOpSnapshot = readBusinessSnapshot();
+  const resizeNoOp = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 3, revision: courseRevision },
+  });
+  assert.deepEqual(resizeNoOp.body, { ok: true, revision: courseRevision, changed: false });
+  assert.deepEqual(readBusinessSnapshot(), resizeNoOpSnapshot);
   const grownSections = (await requestApi(`/api/courses/${course.id}/sections`)).body;
   assert.equal(grownSections.length, 3);
   const tailSection = grownSections[2];
@@ -881,7 +1560,7 @@ async function verifyCrudAndRevisions() {
   const protectedResize = await requestApi(`/api/courses/${course.id}/sections`, {
     method: "PATCH",
     expectedStatus: 409,
-    json: { sectionCount: 2 },
+    json: { sectionCount: 2, revision: courseRevision },
   });
   assert.match(protectedResize.body.error, /has a teacher/i);
   const sectionsAfterProtectedResize = (await requestApi(`/api/courses/${course.id}/sections`)).body;
@@ -893,7 +1572,11 @@ async function verifyCrudAndRevisions() {
     method: "PATCH",
     json: { teacherId: null, studentGroupIds: [], revision: protectedTail.body.revision },
   });
-  await requestApi(`/api/courses/${course.id}/sections`, { method: "PATCH", json: { sectionCount: 2 } });
+  const shrunkCourse = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 2, revision: courseRevision },
+  });
+  courseRevision = shrunkCourse.body.revision;
   sections = (await requestApi(`/api/courses/${course.id}/sections`)).body;
   assert.equal(sections.length, 2);
   assert.equal(sections[0].id, section.id);
@@ -919,6 +1602,19 @@ async function verifyCrudAndRevisions() {
 
   // 同一每周课次首次放置只能成功一次；重复请求要返回稳定业务 code，
   // 不能泄露 SQLite UNIQUE 约束文字。
+  const snapshotBeforeInvalidPlacements = readBusinessSnapshot();
+  const invalidPlacements = [
+    { sectionId: "", occurrence: 1, dayOfWeek: 1, startHour: 9, roomId: room.id },
+    { sectionId: section.id, occurrence: "1", dayOfWeek: 1, startHour: 9, roomId: room.id },
+    { sectionId: section.id, occurrence: 1, dayOfWeek: 1.5, startHour: 9, roomId: room.id },
+    { sectionId: section.id, occurrence: 1, dayOfWeek: 1, startHour: 9.5, roomId: room.id },
+    { sectionId: section.id, occurrence: 1, dayOfWeek: 1, startHour: 9, roomId: "" },
+    { sectionId: section.id, occurrence: 1, dayOfWeek: 1, startHour: 9, roomId: "R".repeat(129) },
+  ];
+  for (const json of invalidPlacements) {
+    await requestApi("/api/schedule/lessons", { method: "POST", expectedStatus: 400, json });
+  }
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidPlacements);
   const lessonOne = (await requestApi("/api/schedule/lessons", {
     method: "POST",
     expectedStatus: 201,
@@ -956,6 +1652,19 @@ async function verifyCrudAndRevisions() {
     },
   })).body;
   assert.equal(movedLesson.revision, lessonOne.revision + 1);
+  const snapshotBeforeInvalidLessonUpdates = readBusinessSnapshot();
+  const invalidLessonUpdates = [
+    { dayOfWeek: 2.5, startHour: 10, roomId: room.id, teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: movedLesson.revision },
+    { dayOfWeek: 2, startHour: 10.5, roomId: room.id, teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: movedLesson.revision },
+    { dayOfWeek: 2, startHour: 10, roomId: "", teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: movedLesson.revision },
+    { dayOfWeek: 2, startHour: 10, roomId: room.id, teacherId: "", studentGroupIds: [studentGroup.id], revision: movedLesson.revision },
+    { dayOfWeek: 2, startHour: 10, roomId: room.id, teacherId: teacherA.id, studentGroupIds: [studentGroup.id, studentGroup.id], revision: movedLesson.revision },
+    { dayOfWeek: 2, startHour: 10, roomId: room.id, teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+  for (const json of invalidLessonUpdates) {
+    await requestApi(`/api/schedule/lessons/${lessonOne.id}`, { method: "PATCH", expectedStatus: 400, json });
+  }
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeInvalidLessonUpdates);
   const beforeStaleLessonMutations = readBusinessSnapshot();
   const staleLessonPatch = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
     method: "PATCH",
@@ -986,7 +1695,11 @@ async function verifyCrudAndRevisions() {
     expectedStatus: 201,
     json: { code: "33-07-30", capacity: 40, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
   })).body;
-  await requestApi(`/api/rooms/${inactiveRoom.id}`, { method: "PATCH", json: { isActive: false } });
+  const inactiveRoomStatus = await requestApi(`/api/rooms/${inactiveRoom.id}`, {
+    method: "PATCH",
+    json: { isActive: false, revision: inactiveRoom.revision },
+  });
+  inactiveRoom.revision = inactiveRoomStatus.body.revision;
   const missingRoom = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
     method: "PATCH",
     expectedStatus: 400,
@@ -1007,18 +1720,44 @@ async function verifyCrudAndRevisions() {
   assert.equal(lessonAfterRejectedRooms.revision, movedLesson.revision);
 
   // 基础资料改名仍保留 ID；时间表必须立即读取新教师、班级和教室名称。
-  await requestApi(`/api/teachers/${teacherA.id}`, {
+  const teacherRevisionBeforeRename = teacherA.revision;
+  const renamedTeacher = await requestApi(`/api/teachers/${teacherA.id}`, {
     method: "PATCH",
-    json: { name: "auto teacher renamed", staffType: "PT" },
+    json: { name: "auto teacher renamed", staffType: "PT", revision: teacherA.revision },
   });
-  await requestApi(`/api/student-groups/${studentGroup.id}`, {
+  teacherA.revision = renamedTeacher.body.revision;
+  const staleTeacher = await requestApi(`/api/teachers/${teacherA.id}`, {
     method: "PATCH",
-    json: { code: "aaa_02", year: 1, program: "aaa" },
+    expectedStatus: 409,
+    json: { name: "AUTO STALE TEACHER", staffType: "FT", revision: teacherRevisionBeforeRename },
   });
-  await requestApi(`/api/rooms/${room.id}`, {
+  assert.equal(staleTeacher.body.code, "MASTER_DATA_CHANGED");
+
+  const groupRevisionBeforeRename = studentGroup.revision;
+  const renamedGroup = await requestApi(`/api/student-groups/${studentGroup.id}`, {
     method: "PATCH",
-    json: { code: "32-06-20", capacity: 50, hasLab: true, hasMultiProjector: true, isSmartClassroom: false },
+    json: { code: "aaa_02", year: 1, program: "aaa", revision: studentGroup.revision },
   });
+  studentGroup.revision = renamedGroup.body.revision;
+  const staleGroup = await requestApi(`/api/student-groups/${studentGroup.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { code: "AAA_STALE", year: 3, program: "STALE", revision: groupRevisionBeforeRename },
+  });
+  assert.equal(staleGroup.body.code, "MASTER_DATA_CHANGED");
+
+  const roomRevisionBeforeRename = room.revision;
+  const renamedRoom = await requestApi(`/api/rooms/${room.id}`, {
+    method: "PATCH",
+    json: { code: "32-06-20", capacity: 50, hasLab: true, hasMultiProjector: true, isSmartClassroom: false, revision: room.revision },
+  });
+  room.revision = renamedRoom.body.revision;
+  const staleRoom = await requestApi(`/api/rooms/${room.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { code: "98-98-98", capacity: 20, hasLab: false, hasMultiProjector: false, isSmartClassroom: false, revision: roomRevisionBeforeRename },
+  });
+  assert.equal(staleRoom.body.code, "MASTER_DATA_CHANGED");
   let timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
   let currentLessonOne = timetable.find((lesson) => lesson.id === lessonOne.id);
   assert.equal(currentLessonOne.teacherName, "AUTO TEACHER RENAMED");
@@ -1026,11 +1765,14 @@ async function verifyCrudAndRevisions() {
   assert.equal(currentLessonOne.roomCode, "32-06-20");
 
   // 停用教师和教室不能清空既有引用；warning 必须出现，重新启用后精确消失。
-  await requestApi(`/api/teachers/${teacherA.id}`, { method: "PATCH", json: { isActive: false } });
+  const teacherDisabled = await requestApi(`/api/teachers/${teacherA.id}`, { method: "PATCH", json: { isActive: false, revision: teacherA.revision } });
+  teacherA.revision = teacherDisabled.body.revision;
   timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
   assert(timetable.find((lesson) => lesson.id === lessonOne.id).warnings.includes("Teacher is inactive"));
-  await requestApi(`/api/teachers/${teacherA.id}`, { method: "PATCH", json: { isActive: true } });
-  await requestApi(`/api/rooms/${room.id}`, { method: "PATCH", json: { isActive: false } });
+  const teacherEnabled = await requestApi(`/api/teachers/${teacherA.id}`, { method: "PATCH", json: { isActive: true, revision: teacherA.revision } });
+  teacherA.revision = teacherEnabled.body.revision;
+  const roomDisabled = await requestApi(`/api/rooms/${room.id}`, { method: "PATCH", json: { isActive: false, revision: room.revision } });
+  room.revision = roomDisabled.body.revision;
   timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
   currentLessonOne = timetable.find((lesson) => lesson.id === lessonOne.id);
   assert(currentLessonOne.warnings.includes("Room is unavailable"));
@@ -1045,7 +1787,8 @@ async function verifyCrudAndRevisions() {
   assert.equal(movedWithInactiveRoom.roomCode, "32-06-20");
   assert.equal(movedWithInactiveRoom.startHour, 11);
   assert(movedWithInactiveRoom.warnings.includes("Room is unavailable"));
-  await requestApi(`/api/rooms/${room.id}`, { method: "PATCH", json: { isActive: true } });
+  const roomEnabled = await requestApi(`/api/rooms/${room.id}`, { method: "PATCH", json: { isActive: true, revision: room.revision } });
+  room.revision = roomEnabled.body.revision;
   timetable = (await requestApi("/api/schedule/lessons?year=1")).body;
   currentLessonOne = timetable.find((lesson) => lesson.id === lessonOne.id);
   assert(!currentLessonOne.warnings.includes("Teacher is inactive"));
@@ -1076,6 +1819,14 @@ async function verifyCrudAndRevisions() {
   });
   await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, durationHours: [3] }, expectedStatus: 400 });
   await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, sessionsPerWeek: true }, expectedStatus: 400 });
+  await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, minimumRoomCapacity: 1_000_000 }, expectedStatus: 400 });
+  await requestApi(`/api/courses/${course.id}`, { method: "PATCH", json: { ...baselineCourseSetup, weekStart: 1, weekEnd: 53 }, expectedStatus: 400 });
+  await requestApi(`/api/courses/${course.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...baselineCourseSetup, padding: "x".repeat(70 * 1_024) }),
+    expectedStatus: 413,
+  });
   assert.deepEqual(readBusinessSnapshot(), stateBeforeInvalidCourseSetup);
 
   // 相同设置重复保存属于真正的 no-op：课程、课次、warning、updated_at 和所有 revision
@@ -1338,7 +2089,7 @@ async function verifyCrudAndRevisions() {
   await requestApi(`/api/courses/${course.id}/sections`, {
     method: "PATCH",
     expectedStatus: 409,
-    json: { sectionCount: 1 },
+    json: { sectionCount: 1, revision: courseRevision },
   });
   await requestApi(`/api/schedule/lessons/${concurrentWinner.id}?revision=${concurrentWinner.revision}`, { method: "DELETE" });
   const unscheduled = (await requestApi("/api/schedule/unscheduled?year=1")).body;
@@ -1363,8 +2114,17 @@ async function verifyCrudAndRevisions() {
   const scheduledOccurrenceKeys = new Set(workspace.lessons.map((lesson) => `${lesson.sectionId}:${lesson.occurrence}`));
   assert(workspace.unscheduledSections.every((section) => !scheduledOccurrenceKeys.has(section.id)));
   await requestApi("/api/schedule/workspace?year=4", { expectedStatus: 400 });
+  for (const pathname of ["/api/schedule/lessons", "/api/schedule/unscheduled", "/api/schedule/workspace"]) {
+    for (const invalidYear of ["", "01", "1e0", "%2B1"]) {
+      await requestApi(`${pathname}?year=${invalidYear}`, { expectedStatus: 400 });
+    }
+  }
 
-  await requestApi(`/api/courses/${course.id}/sections`, { method: "PATCH", json: { sectionCount: 1 } });
+  const finalResize = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 1, revision: courseRevision },
+  });
+  courseRevision = finalResize.body.revision;
   assert.equal((await requestApi(`/api/courses/${course.id}/sections`)).body.length, 1);
   report("教师、班级、教室、课程、班次、排课和多人 revision CRUD");
 
@@ -1377,6 +2137,131 @@ async function verifyCrudAndRevisions() {
     sectionId: section.id,
     lessonId: lessonOne.id,
   };
+}
+
+async function verifyManagementSnapshots(ids) {
+  // Management 页面会同时消费四组基础资料；一次 workspace 请求必须与四个既有
+  // 清单接口表达完全相同的已提交版本。先验证身份边界，避免新聚合路由意外绕过
+  // 全站 proxy，让未登录访客读取教师、班级、教室或课程资料。
+  await requestApi("/api/data-management/workspace", { authenticated: false, expectedStatus: 401 });
+  await requestApi(`/api/courses/${ids.courseId}/workspace`, { authenticated: false, expectedStatus: 401 });
+
+  const snapshotBeforeSuccessfulReads = readBusinessSnapshot();
+  const managementWorkspace = await requestApi("/api/data-management/workspace");
+  assert.deepEqual(Object.keys(managementWorkspace.body).sort(), ["courses", "groups", "rooms", "teachers"]);
+  const [teachers, groups, rooms, courses] = await Promise.all([
+    requestApi("/api/teachers"),
+    requestApi("/api/student-groups"),
+    requestApi("/api/rooms"),
+    requestApi("/api/courses"),
+  ]);
+  assert.deepEqual(managementWorkspace.body.teachers, teachers.body);
+  assert.deepEqual(managementWorkspace.body.groups, groups.body);
+  assert.deepEqual(managementWorkspace.body.rooms, rooms.body);
+  assert.deepEqual(managementWorkspace.body.courses, courses.body);
+
+  async function assertCourseWorkspaceMatchesExistingApis(course) {
+    const workspace = await requestApi(`/api/courses/${course.id}/workspace`);
+    assert.deepEqual(Object.keys(workspace.body).sort(), ["allocationVariances", "currentCourse", "sections"]);
+    const [sections, allocationVariances] = await Promise.all([
+      requestApi(`/api/courses/${course.id}/sections`),
+      requestApi(`/api/courses/${course.id}/allocation`),
+    ]);
+    assert.deepEqual(workspace.body.currentCourse, course);
+    assert.deepEqual(workspace.body.sections, sections.body);
+    assert.deepEqual(workspace.body.allocationVariances, allocationVariances.body);
+    return workspace.body;
+  }
+
+  // AUTO_CRUD 是纯人工课程：它已有教师、学生班级和排课关系，却从未建立
+  // teaching_allocations。聚合接口必须沿用既有 variance 语义并返回空数组，不能把
+  // 人工指派误报成“超出 Excel baseline”。
+  const manualCourse = courses.body.find((course) => course.id === ids.courseId);
+  assert(manualCourse, "The manual course fixture was not present in the management snapshot.");
+  const manualWorkspace = await assertCourseWorkspaceMatchesExistingApis(manualCourse);
+  assert(manualWorkspace.sections.some((section) => section.teacherId !== null));
+  assert.deepEqual(manualWorkspace.allocationVariances, []);
+
+  // 稳定来源键回归中的课程已把 Excel baseline 从 Source A 换成 Source B，之后只
+  // 人工修改了教师显示名。两节自动班仍必须关联同一稳定教师 ID，且 baseline 与
+  // actual 相等，因此 workspace 不应产生虚假 variance。
+  const sourceCourse = courses.body.find((course) => course.code === "AUTO_IMPORT_REVISION");
+  const sourceTeacher = teachers.body.find((teacher) => teacher.name === "AUTO REVISION DISPLAY NAME");
+  assert(sourceCourse && sourceTeacher, "The imported source-key workspace fixtures were not found.");
+  const sourceWorkspace = await assertCourseWorkspaceMatchesExistingApis(sourceCourse);
+  assert.equal(sourceWorkspace.sections.length, 2);
+  assert(sourceWorkspace.sections.every((section) => section.teacherId === sourceTeacher.id));
+  assert.deepEqual(sourceWorkspace.allocationVariances, []);
+
+  // AUTO_REIMPORT 刻意保留一班 Excel baseline 教师，并把另一班人工换给替代教师。
+  // 聚合结果必须同时呈现“baseline 少一班”和“替代教师多一班”，且 section 关联与
+  // variance 中的教师 ID 一致，不能在多个 SELECT 之间拼出不可能的组合。
+  const substitutedCourse = courses.body.find((course) => course.code === "AUTO_REIMPORT");
+  const baselineTeacher = teachers.body.find((teacher) => teacher.name === "AUTO ALLOCATION TEACHER");
+  const substituteTeacher = teachers.body.find((teacher) => teacher.name === "AUTO MANUAL TEACHER");
+  assert(substitutedCourse && baselineTeacher && substituteTeacher, "The imported substitution workspace fixtures were not found.");
+  const substitutedWorkspace = await assertCourseWorkspaceMatchesExistingApis(substitutedCourse);
+  assert.equal(substitutedWorkspace.sections.length, 2);
+  assert(substitutedWorkspace.sections.some((section) => section.teacherId === baselineTeacher.id));
+  assert(substitutedWorkspace.sections.some((section) => section.teacherId === substituteTeacher.id));
+  assert.deepEqual(
+    substitutedWorkspace.allocationVariances.find((variance) => variance.teacherId === baselineTeacher.id),
+    {
+      teacherId: baselineTeacher.id,
+      teacherName: baselineTeacher.name,
+      expectedSections: 2,
+      actualSections: 1,
+    },
+  );
+  assert.deepEqual(
+    substitutedWorkspace.allocationVariances.find((variance) => variance.teacherId === substituteTeacher.id),
+    {
+      teacherId: substituteTeacher.id,
+      teacherName: substituteTeacher.name,
+      expectedSections: 0,
+      actualSections: 1,
+    },
+  );
+
+  // 不存在的课程是稳定404，而不是 currentCourse:null 的半对象；精确 JSON 合同让
+  // 页面能区分“用户选择已过期”与服务器内部故障。
+  const missingCourse = await requestApi(`/api/courses/${randomUUID()}/workspace`, { expectedStatus: 404 });
+  assert.deepEqual(missingCourse.body, { error: "Course not found." });
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeSuccessfulReads);
+
+  async function expectSafeWorkspaceReadFailure(pathname, hideSql, restoreSql) {
+    const beforeFailure = readBusinessSnapshot();
+    executeTestDatabase((db) => db.exec(hideSql));
+    let failed;
+    try {
+      failed = await requestApi(pathname, { expectedStatus: 500 });
+    } finally {
+      executeTestDatabase((db) => db.exec(restoreSql));
+    }
+    assert.deepEqual(Object.keys(failed.body), ["error"]);
+    assert.equal(typeof failed.body.error, "string");
+    assert(failed.body.error.length > 0 && failed.body.error.length <= 200);
+    assert(
+      !/sqlite|database|select\b|from\b|join\b|pragma|no such|table|column|constraint|trigger|\.db\b|\/(?:api|users|private|tmp)\//i
+        .test(JSON.stringify(failed.body)),
+      `${pathname} leaked SQL, schema or filesystem details.`,
+    );
+    assert.deepEqual(readBusinessSnapshot(), beforeFailure, `${pathname} changed business data after a read failure.`);
+  }
+
+  // 临时隐藏聚合查询必需的表，制造真实、未知 SQLite 故障。路由只能返回固定安全
+  // 500；恢复表名后的完整业务快照必须逐字段相同，证明 GET 没有夹带初始化或修复写入。
+  await expectSafeWorkspaceReadFailure(
+    "/api/data-management/workspace",
+    "ALTER TABLE rooms RENAME TO rooms_management_workspace_hidden",
+    "ALTER TABLE rooms_management_workspace_hidden RENAME TO rooms",
+  );
+  await expectSafeWorkspaceReadFailure(
+    `/api/courses/${substitutedCourse.id}/workspace`,
+    "ALTER TABLE teaching_allocations RENAME TO teaching_allocations_course_workspace_hidden",
+    "ALTER TABLE teaching_allocations_course_workspace_hidden RENAME TO teaching_allocations",
+  );
+  report("Management／Course workspace 聚合一致性、导入关联、身份边界与安全500");
 }
 
 async function verifyAtomicMasterDataWarnings(ids) {
@@ -1394,6 +2279,13 @@ async function verifyAtomicMasterDataWarnings(ids) {
   const rules = (await requestApi("/api/rule-settings")).body;
   const lunchBreakRule = rules.find((rule) => rule.key === "lunch_break");
   assert(lunchBreakRule, "The lunch_break rule fixture was not found.");
+  // 故障请求必须带当前 revision，才能真正进入 warning 重算阶段；若省略版本，
+  // 只会在路由验证处400，无法证明主资料和 warning 的事务回滚边界。
+  const atomicTeacher = (await requestApi("/api/teachers")).body.find((record) => record.id === ids.teacherId);
+  const atomicGroup = (await requestApi("/api/student-groups")).body.find((record) => record.id === ids.studentGroupId);
+  const atomicRoom = (await requestApi("/api/rooms")).body.find((record) => record.id === ids.roomId);
+  const atomicCourse = (await requestApi("/api/courses")).body.find((record) => record.id === ids.courseId);
+  assert(atomicTeacher && atomicGroup && atomicRoom && atomicCourse, "Atomic master-data fixtures could not be loaded.");
 
   // 每条失败请求都使用完整业务快照验证“零变化”，并检查浏览器响应只包含安全业务文字。
   // 若未来有人把事务拆开，这些断言会直接看到编号、状态、时段或 warning 的半完成写入。
@@ -1416,17 +2308,25 @@ async function verifyAtomicMasterDataWarnings(ids) {
     db.exec(`CREATE TRIGGER zz_fail_master_warning_refresh BEFORE UPDATE OF warnings_json ON scheduled_lessons WHEN NEW.id = ${lessonIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced master warning refresh failure'); END;`);
   });
   try {
+    await expectAtomicFailure(`/api/teachers/${ids.teacherId}`, "The teacher could not be updated. Try again.", {
+      method: "PATCH",
+      json: { name: "AUTO TEACHER ATOMIC FAIL", staffType: atomicTeacher.staffType, revision: atomicTeacher.revision },
+    });
+    await expectAtomicFailure(`/api/teachers/${ids.teacherId}`, "Teacher status could not be updated. Try again.", {
+      method: "PATCH",
+      json: { isActive: false, revision: atomicTeacher.revision },
+    });
     await expectAtomicFailure(`/api/student-groups/${ids.studentGroupId}`, "The student group could not be updated. Try again.", {
       method: "PATCH",
-      json: { code: "AAA_ATOMIC_FAIL", year: 3, program: "ATOMIC" },
+      json: { code: "AAA_ATOMIC_FAIL", year: 3, program: "ATOMIC", revision: atomicGroup.revision },
     });
     await expectAtomicFailure(`/api/rooms/${ids.roomId}`, "The room could not be updated. Try again.", {
       method: "PATCH",
-      json: { code: "34-08-40", capacity: 60, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
+      json: { code: "34-08-40", capacity: 60, hasLab: false, hasMultiProjector: false, isSmartClassroom: false, revision: atomicRoom.revision },
     });
     await expectAtomicFailure(`/api/rooms/${ids.roomId}`, "The room status could not be updated. Try again.", {
       method: "PATCH",
-      json: { isActive: false },
+      json: { isActive: false, revision: atomicRoom.revision },
     });
     await expectAtomicFailure("/api/rule-settings", "The rule setting could not be updated. Try again.", {
       method: "PATCH",
@@ -1520,7 +2420,7 @@ async function verifyAtomicMasterDataWarnings(ids) {
   try {
     await expectAtomicFailure(`/api/courses/${ids.courseId}/sections`, "Section count could not be changed. Try again.", {
       method: "PATCH",
-      json: { sectionCount: 2 },
+      json: { sectionCount: 2, revision: atomicCourse.revision },
     });
   } finally {
     executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_section_resize"));
@@ -1562,6 +2462,7 @@ async function verifyAtomicMasterDataWarnings(ids) {
   // request.json() 的语法异常穿过 Next.js 形成 HTML 或未受控 500。
   const jsonRoutes = [
     ["/api/teachers", "POST"],
+    [`/api/teachers/${ids.teacherId}`, "PATCH"],
     ["/api/courses", "POST"],
     [`/api/courses/${ids.courseId}/sections`, "PATCH"],
     ["/api/auth/accounts", "POST"],
@@ -1766,6 +2667,105 @@ async function verifySystemBackupAcrossColumnOrders() {
   assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
   assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
 
+  // 上传文件不一定保留 production 的 UNIQUE 索引，所以不能只靠 live schema 推断来源键
+  // 唯一。另一个跨行危险形状是 A 的当前姓名等于 B 的来源键：文件本身可通过所有
+  // 单行 CHECK，却会令下一次 Teaching Members 导入同时命中两位教师。两种文件都必须
+  // 在复制任何 live 资料前稳定 400，并保持当前会话与业务快照不变。
+  const invalidTeacherSourceFixtures = [
+    {
+      filename: "duplicate-teacher-source.sqlite",
+      mutate(db) {
+        db.exec("DROP INDEX IF EXISTS teachers_teaching_members_key_key");
+        db.prepare("INSERT INTO teachers (id, name, staff_type, teaching_members_key) VALUES (?, ?, 'FT', ?)")
+          .run(randomUUID(), "BACKUP DUPLICATE OWNER A", "BACKUP DUPLICATE SOURCE");
+        db.prepare("INSERT INTO teachers (id, name, staff_type, teaching_members_key) VALUES (?, ?, 'PT', ?)")
+          .run(randomUUID(), "BACKUP DUPLICATE OWNER B", "BACKUP DUPLICATE SOURCE");
+      },
+    },
+    {
+      filename: "split-teacher-source.sqlite",
+      mutate(db) {
+        db.prepare("INSERT INTO teachers (id, name, staff_type, teaching_members_key) VALUES (?, ?, 'FT', ?)")
+          .run(randomUUID(), "BACKUP SOURCE OWNER", "BACKUP CURRENT NAME");
+        db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, 'PT')")
+          .run(randomUUID(), "BACKUP CURRENT NAME");
+      },
+    },
+  ];
+  for (const fixture of invalidTeacherSourceFixtures) {
+    const fixturePath = path.join(temporaryDirectory, fixture.filename);
+    await writeFile(fixturePath, await readFile(reorderedBackupPath), { mode: 0o600 });
+    const fixtureDatabase = new Database(fixturePath);
+    try {
+      fixture.mutate(fixtureDatabase);
+      assert.deepEqual(fixtureDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      assert.deepEqual(fixtureDatabase.pragma("foreign_key_check"), []);
+    } finally {
+      fixtureDatabase.close();
+    }
+    await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(fixturePath), fixture.filename, expectedCurrentToken),
+      expectedStatus: 400,
+    });
+    assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+    assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+  }
+
+  // 每条 allocation 单独都是合法的600，但同一课程两条合计1200，超过课程最多999班。
+  // 上传库可以绕过 route 的工作簿合计检查，因此完整备份 invariant 必须按 course 再求和；
+  // 此夹具不建立 section，确保拒绝原因不会被 section 连续性或引用错误提前掩盖。
+  const aggregateAllocationPath = path.join(temporaryDirectory, "oversized-course-allocation-sum.sqlite");
+  await writeFile(aggregateAllocationPath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const aggregateAllocationDatabase = new Database(aggregateAllocationPath);
+  try {
+    aggregateAllocationDatabase.pragma("foreign_keys = ON");
+    const teacherIds = aggregateAllocationDatabase.prepare("SELECT id FROM teachers ORDER BY id LIMIT 2").all();
+    assert.equal(teacherIds.length, 2, "The full-backup allocation-sum fixture needs two valid teachers.");
+    const oversizedCourseId = randomUUID();
+    aggregateAllocationDatabase.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, 'BACKUP_SUM_1200', 'Aggregate allocation boundary')")
+      .run(oversizedCourseId);
+    const insertAllocation = aggregateAllocationDatabase.prepare(`INSERT INTO teaching_allocations
+      (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, 600)`);
+    insertAllocation.run(randomUUID(), oversizedCourseId, teacherIds[0].id);
+    insertAllocation.run(randomUUID(), oversizedCourseId, teacherIds[1].id);
+    assert.deepEqual(aggregateAllocationDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(aggregateAllocationDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    aggregateAllocationDatabase.close();
+  }
+  await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(aggregateAllocationPath), "oversized-course-allocation-sum.sqlite", expectedCurrentToken),
+    expectedStatus: 400,
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
+  // teaching_allocations.id 没有任何外键引用，129字符仍能通过 SQLite integrity/FK，
+  // 因而可精确证明完整备份使用 JS opaque-resource-id 契约，而非只检查非空 TEXT。
+  // 上传拒绝后 live 14表与当前管理员会话必须逐字段不变。
+  const oversizedAllocationIdPath = path.join(temporaryDirectory, "oversized-allocation-id.sqlite");
+  await writeFile(oversizedAllocationIdPath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const oversizedAllocationIdDatabase = new Database(oversizedAllocationIdPath);
+  try {
+    const allocation = oversizedAllocationIdDatabase.prepare("SELECT id FROM teaching_allocations ORDER BY id LIMIT 1").get();
+    assert(allocation, "The full-backup opaque allocation-ID fixture needs one allocation.");
+    oversizedAllocationIdDatabase.prepare("UPDATE teaching_allocations SET id = ? WHERE id = ?")
+      .run("X".repeat(129), allocation.id);
+    assert.deepEqual(oversizedAllocationIdDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(oversizedAllocationIdDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    oversizedAllocationIdDatabase.close();
+  }
+  await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(oversizedAllocationIdPath), "oversized-allocation-id.sqlite", expectedCurrentToken),
+    expectedStatus: 400,
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
   // 紧急周期 JSON 也属于完整系统备份的一部分。五个空数组在 SQLite 看来是合法 TEXT，
   // 但绝不是 Start 可能生成的可恢复周期；必须在上传校验阶段拒绝。
   const invalidCyclePath = path.join(temporaryDirectory, "invalid-cycle-snapshot.sqlite");
@@ -1783,6 +2783,29 @@ async function verifySystemBackupAcrossColumnOrders() {
     expectedStatus: 400,
   });
   assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+
+  // 快照内的课程文字也必须使用生产 API 的长度与控制字符规则。SQLite TEXT 本身会
+  // 接受换行；完整恢复必须在复制 live 资料前把这份恶意周期 JSON 当成 400。
+  const unsafeCyclePath = path.join(temporaryDirectory, "unsafe-cycle-text.sqlite");
+  await writeFile(unsafeCyclePath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const unsafeCycleDatabase = new Database(unsafeCyclePath);
+  try {
+    const unsafeCycleSnapshot = structuredClone(cyclePayloadFromSnapshot(stateAfterMarker));
+    assert(unsafeCycleSnapshot.courses.length > 0, "The strict cycle-text fixture needs a course.");
+    unsafeCycleSnapshot.courses[0].code = `${unsafeCycleSnapshot.courses[0].code}\nCONTROL`;
+    unsafeCycleDatabase.prepare("DELETE FROM schedule_backups").run();
+    unsafeCycleDatabase.prepare("INSERT INTO schedule_backups (id, snapshot_json) VALUES (?, ?)")
+      .run(randomUUID(), JSON.stringify(unsafeCycleSnapshot));
+  } finally {
+    unsafeCycleDatabase.close();
+  }
+  await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(unsafeCyclePath), "unsafe-cycle-text.sqlite", expectedCurrentToken),
+    expectedStatus: 400,
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
 
   // auth_sessions 不参与 current/target token，因为正常登录退出不应让确认过期；因此还要
   // 防止人工 AFTER DELETE trigger 重插一个格式、FK 都合法的会话并绕过“退出所有人”。
@@ -2084,6 +3107,91 @@ async function verifyAtomicCycleActions(ids) {
   assert.deepEqual(readBusinessSnapshot(), stateWithHiddenLessonBackup);
   executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(validBackupJson, backupId));
 
+  async function expectIndependentlyInvalidCycleSnapshot(snapshot, fixtureName) {
+    // 每个恶意字段都从同一份合法 JSON 独立派生，并在断言后恢复原文；这样新增的
+    // guard 若被删除，测试不会因上一个仍损坏的字段继续409而产生假绿。
+    executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?")
+      .run(JSON.stringify(snapshot), backupId));
+    const stateWithInvalidSnapshot = readBusinessSnapshot();
+    const rejected = await requestApi("/api/cycle", {
+      method: "POST",
+      cookie: schedulerCookie,
+      expectedStatus: 409,
+      json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: started.body.currentToken, backupId },
+    });
+    assert.deepEqual(rejected.body, { error: "The emergency backup is not valid." }, fixtureName);
+    assert.deepEqual(readBusinessSnapshot(), stateWithInvalidSnapshot, `${fixtureName} changed the current cycle.`);
+    executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?")
+      .run(validBackupJson, backupId));
+  }
+
+  // Catalog 是保留大小写的说明文字，但仍不允许换行等控制字符。只改一个 catalog，
+  // 其余课程和全部引用保持合法，精确证明 Cycle parser 复用文本控制字符边界。
+  const controlCatalogSnapshot = JSON.parse(validBackupJson);
+  assert(controlCatalogSnapshot.courses.length > 0, "The cycle catalog fixture needs one course.");
+  controlCatalogSnapshot.courses[0].catalog = "Unsafe\nCatalog";
+  await expectIndependentlyInvalidCycleSnapshot(controlCatalogSnapshot, "Cycle catalog control-character fixture");
+
+  // allocation.id 不被其他数组引用，改成129字符不会制造 dangling FK；因此409只能来自
+  // opaque resource ID 自身的长度校验，而不是引用完整性 guard 的副作用。
+  const invalidOpaqueIdSnapshot = JSON.parse(validBackupJson);
+  assert(invalidOpaqueIdSnapshot.allocations.length > 0, "The cycle opaque-ID fixture needs one allocation.");
+  invalidOpaqueIdSnapshot.allocations[0].id = "X".repeat(129);
+  await expectIndependentlyInvalidCycleSnapshot(invalidOpaqueIdSnapshot, "Cycle opaque resource-ID fixture");
+
+  // 不能只把现有 section 改成1000，否则连续性缺口也会拒绝并掩盖999上限。这里为
+  // 同一课程构造从1到1000连续、唯一且无额外引用的 sections；若移除数量／sequence
+  // 上限而保留连续性检查，这份夹具就会错误通过，从而让回归准确失败。
+  const oversizedSectionSnapshot = JSON.parse(validBackupJson);
+  const sectionCourse = oversizedSectionSnapshot.courses
+    .map((course) => ({
+      course,
+      sections: oversizedSectionSnapshot.sections
+        .filter((section) => section.course_id === course.id)
+        .sort((left, right) => left.sequence - right.sequence),
+    }))
+    .find(({ sections }) => sections.length > 0);
+  assert(sectionCourse, "The cycle section-limit fixture needs one course with existing sections.");
+  assert(sectionCourse.sections.every((section, index) => section.sequence === index + 1));
+  for (let sequence = sectionCourse.sections.length + 1; sequence <= 1_000; sequence += 1) {
+    oversizedSectionSnapshot.sections.push({
+      id: `cycle-overflow-section-${sequence}`,
+      course_id: sectionCourse.course.id,
+      sequence,
+      teacher_id: null,
+      allocation_teacher_id: null,
+      revision: 1,
+    });
+  }
+  await expectIndependentlyInvalidCycleSnapshot(oversizedSectionSnapshot, "Cycle 1,000-section fixture");
+
+  // 每条 allocation 即使各自不超过 999，同一课程合计也不能超过课程可建立的班次上限。
+  // 人工写入的旧库 JSON 绕过 schema CHECK 后，Cycle Restore 仍须在删除当前周期前拒绝。
+  const oversizedAllocationSnapshot = JSON.parse(validBackupJson);
+  const baseAllocation = oversizedAllocationSnapshot.allocations[0];
+  assert(baseAllocation, "The aggregate-allocation fixture needs at least one teaching allocation.");
+  const alternateTeacher = stateAfterStart.teachers.find((teacher) => teacher.id !== baseAllocation.teacher_id);
+  assert(alternateTeacher, "The aggregate-allocation fixture needs a second teacher.");
+  baseAllocation.assigned_group_count = 600;
+  oversizedAllocationSnapshot.allocations.push({
+    ...baseAllocation,
+    id: randomUUID(),
+    teacher_id: alternateTeacher.id,
+    assigned_group_count: 600,
+  });
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?")
+    .run(JSON.stringify(oversizedAllocationSnapshot), backupId));
+  const stateWithOversizedAllocationBackup = readBusinessSnapshot();
+  const oversizedAllocationBackup = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: started.body.currentToken, backupId },
+  });
+  assert.deepEqual(oversizedAllocationBackup.body, { error: "The emergency backup is not valid." });
+  assert.deepEqual(readBusinessSnapshot(), stateWithOversizedAllocationBackup);
+  executeTestDatabase((db) => db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(validBackupJson, backupId));
+
   // 在空活动区建立两门替换课程；R0 之后新增第二门，旧 R0 Restore 必须保留两门，
   // 防止旧页面无提示覆盖另一位老师刚保存的周期工作。
   await requestApi("/api/courses", {
@@ -2213,8 +3321,8 @@ async function verifyAtomicCycleActions(ids) {
   // Restore，证明前一个 409 没有损坏快照，且测试不会把空周期泄漏给无关断言。
   executeTestDatabase((db) => db.prepare(`INSERT INTO rooms (
     id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom,
-    is_active, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    is_active, created_at, updated_at, revision
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     deletedRoom.id,
     deletedRoom.code,
     deletedRoom.block,
@@ -2225,6 +3333,7 @@ async function verifyAtomicCycleActions(ids) {
     deletedRoom.is_active,
     deletedRoom.created_at,
     deletedRoom.updated_at,
+    deletedRoom.revision,
   ));
   const repairedCycleStatus = await requestApi("/api/cycle");
   const repairedCycle = await requestApi("/api/cycle", {
@@ -2344,8 +3453,13 @@ async function run() {
   await verifyAuthentication();
   await verifyPostSetupRestartWithoutToken(databasePath);
   await verifyWorkbookBoundaries();
+  await verifyTeachingGroupCountBoundaries();
+  await verifyTeachingExplicitZeroAndNoOp();
+  await verifyTeachingImportRevisionsAndSourceKeys();
   await verifyTeachingAllocationReimport();
+  await verifyTeachingImportFailureBoundaries();
   const relationshipIds = await verifyCrudAndRevisions();
+  await verifyManagementSnapshots(relationshipIds);
   await verifyAtomicMasterDataWarnings(relationshipIds);
   await verifySystemBackupAcrossColumnOrders();
   await verifyAtomicCycleActions(relationshipIds);

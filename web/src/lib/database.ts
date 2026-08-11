@@ -15,11 +15,29 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { administratorSetupConfigurationAvailable } from "./auth-input";
+import {
+  COURSE_CATALOG_MAX_LENGTH,
+  COURSE_CODE_MAX_LENGTH,
+  isOpaqueResourceId,
+  isPositiveSafeInteger,
+  normalizeOptionalText,
+  normalizeRequiredUppercaseText,
+  parseManualCourseInput,
+  parseCourseSectionAssignmentInput,
+  parseScheduledLessonPlacementInput,
+  parseScheduledLessonUpdateInput,
+  ROOM_CAPACITY_MAXIMUM,
+  ROOM_CODE_MAX_LENGTH,
+  STUDENT_GROUP_CODE_MAX_LENGTH,
+  STUDENT_GROUP_PROGRAM_MAX_LENGTH,
+  TEACHER_NAME_MAX_LENGTH,
+} from "./master-data-input";
 
 // 下面这些类型描述数据库发送给浏览器的简化数据结构。
 // 字段名刻意使用业务人员容易理解的名称，避免前端代码直接依赖 SQLite 的底层列名。
 export type TeacherRecord = {
   id: string;
+  revision: number;
   name: string;
   staffType: "FT" | "PT";
   status: "Active" | "Inactive";
@@ -28,6 +46,7 @@ export type TeacherRecord = {
 
 export type StudentGroupRecord = {
   id: string;
+  revision: number;
   code: string;
   year: number;
   program: string;
@@ -35,6 +54,7 @@ export type StudentGroupRecord = {
 
 export type RoomRecord = {
   id: string;
+  revision: number;
   code: string;
   capacity: number;
   features: string[];
@@ -97,8 +117,16 @@ export type TeachingMembersImportSummary = {
   teachers: number;
   allocations: number;
   sections: number;
+  zeroAllocationRows: number;
+  // 旧浏览器暂时读取这个名称；值与 zeroAllocationRows 相同，待 UI 迁移后可删除。
   ignoredZeroRows: number;
 };
+
+// Teaching Members 的数量上限也由数据库入口再次执行。即使未来新增另一个上传入口，
+// 也不能绕过 Route Handler 后用异常数字建立数百万个班次。
+export const maximumTeachingGroupsPerRow = 999;
+export const maximumTeachingGroupsPerCourse = 999;
+export const maximumTeachingGroupsPerWorkbook = 5_000;
 
 export type CourseSectionRecord = {
   id: string;
@@ -108,6 +136,21 @@ export type CourseSectionRecord = {
   studentGroupIds: string[];
   studentGroupCodes: string[];
   revision: number;
+};
+
+export type DataManagementWorkspaceRecord = {
+  // 四张资料清单会在同一个 SQLite 快照内读取；前端不得再自行拼接不同提交时刻。
+  teachers: TeacherRecord[];
+  groups: StudentGroupRecord[];
+  rooms: RoomRecord[];
+  courses: CourseRecord[];
+};
+
+export type CourseSectionsWorkspaceRecord = {
+  // currentCourse 与班次、分配差异共享同一 revision 基准，打开面板时不会立即持有旧课程版本。
+  currentCourse: CourseRecord;
+  sections: CourseSectionRecord[];
+  allocationVariances: AllocationVarianceRecord[];
 };
 
 export type ScheduledLessonRecord = {
@@ -233,7 +276,7 @@ const globalForDatabase = globalThis as unknown as {
 // 这个数字只在 initializeTables 的表、列或索引定义发生变化时增加。
 // 开发热重载会保留全局 SQLite 连接，但会重新载入本文件；版本不同就补做一次迁移，
 // 同一版本的普通 API 请求则直接复用连接，不再每次解析整组 CREATE／ALTER 语句。
-const runtimeSchemaVersion = 2026081101;
+const runtimeSchemaVersion = 2026081102;
 
 function databaseFilePath() {
   // 数据库路径统一从这里取得，确保正式数据库和恢复前自动生成的安全副本
@@ -335,19 +378,41 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
       area: "teachers",
       sql: `SELECT 1 FROM teachers WHERE
         typeof(id) <> 'text' OR trim(id) = '' OR
-        typeof(name) <> 'text' OR trim(name) = '' OR
+        typeof(name) <> 'text' OR length(trim(name)) NOT BETWEEN 1 AND ${TEACHER_NAME_MAX_LENGTH} OR
         staff_type NOT IN ('FT', 'PT') OR
         typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
+        (teaching_members_key IS NOT NULL AND
+          (typeof(teaching_members_key) <> 'text' OR
+           length(teaching_members_key) NOT BETWEEN 1 AND ${TEACHER_NAME_MAX_LENGTH} OR
+           teaching_members_key <> trim(teaching_members_key) OR
+           teaching_members_key <> upper(teaching_members_key))) OR
         typeof(created_at) <> 'text' OR trim(created_at) = '' OR
         typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "teacher Teaching Members identities",
+      sql: `SELECT 1 FROM teachers current_names
+        JOIN teachers source_owners
+          ON source_owners.teaching_members_key = current_names.name
+         AND source_owners.id <> current_names.id
+        LIMIT 1`,
+    },
+    {
+      area: "teacher Teaching Members source uniqueness",
+      // 上传的 SQLite 文件可能复制出相同列结构但没有 live 数据库的唯一索引，
+      // 因此完整恢复不能只依赖当前进程中的 index，还要直接审核来源值本身。
+      sql: `SELECT 1 FROM teachers WHERE teaching_members_key IS NOT NULL
+        GROUP BY teaching_members_key HAVING COUNT(*) > 1 LIMIT 1`,
     },
     {
       area: "student groups",
       sql: `SELECT 1 FROM student_groups WHERE
         typeof(id) <> 'text' OR trim(id) = '' OR
-        typeof(code) <> 'text' OR trim(code) = '' OR
+        typeof(code) <> 'text' OR length(trim(code)) NOT BETWEEN 1 AND ${STUDENT_GROUP_CODE_MAX_LENGTH} OR
         typeof(year) <> 'integer' OR year NOT IN (1, 2, 3) OR
-        typeof(program) <> 'text' OR trim(program) = '' OR
+        typeof(program) <> 'text' OR length(trim(program)) NOT BETWEEN 1 AND ${STUDENT_GROUP_PROGRAM_MAX_LENGTH} OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
         typeof(created_at) <> 'text' OR trim(created_at) = '' OR
         typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
     },
@@ -355,12 +420,13 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
       area: "rooms",
       sql: `SELECT 1 FROM rooms WHERE
         typeof(id) <> 'text' OR trim(id) = '' OR
-        typeof(code) <> 'text' OR trim(code) = '' OR
-        typeof(capacity) <> 'integer' OR capacity <= 0 OR
+        typeof(code) <> 'text' OR length(trim(code)) NOT BETWEEN 1 AND ${ROOM_CODE_MAX_LENGTH} OR
+        typeof(capacity) <> 'integer' OR capacity NOT BETWEEN 1 AND ${ROOM_CAPACITY_MAXIMUM} OR
         typeof(has_multi_projector) <> 'integer' OR has_multi_projector NOT IN (0, 1) OR
         typeof(is_lab) <> 'integer' OR is_lab NOT IN (0, 1) OR
         typeof(is_smart_classroom) <> 'integer' OR is_smart_classroom NOT IN (0, 1) OR
         typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
         (is_smart_classroom = 1 AND has_multi_projector <> 1) OR
         typeof(created_at) <> 'text' OR trim(created_at) = '' OR
         typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
@@ -369,14 +435,17 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
       area: "courses",
       sql: `SELECT 1 FROM courses WHERE
         typeof(id) <> 'text' OR trim(id) = '' OR
-        typeof(code) <> 'text' OR trim(code) = '' OR
+        typeof(code) <> 'text' OR length(trim(code)) NOT BETWEEN 1 AND ${COURSE_CODE_MAX_LENGTH} OR
+        (catalog IS NOT NULL AND
+          (typeof(catalog) <> 'text' OR length(catalog) > ${COURSE_CATALOG_MAX_LENGTH})) OR
         (duration_hours IS NOT NULL AND
           (typeof(duration_hours) <> 'integer' OR duration_hours NOT BETWEEN 2 AND 4)) OR
         typeof(sessions_per_week) <> 'integer' OR sessions_per_week NOT IN (1, 2) OR
         (primary_year IS NOT NULL AND
           (typeof(primary_year) <> 'integer' OR primary_year NOT IN (1, 2, 3))) OR
         (minimum_room_capacity IS NOT NULL AND
-          (typeof(minimum_room_capacity) <> 'integer' OR minimum_room_capacity <= 0)) OR
+          (typeof(minimum_room_capacity) <> 'integer' OR
+           minimum_room_capacity NOT BETWEEN 1 AND ${ROOM_CAPACITY_MAXIMUM})) OR
         typeof(requires_lab) <> 'integer' OR requires_lab NOT IN (0, 1) OR
         typeof(requires_multi_projector) <> 'integer' OR requires_multi_projector NOT IN (0, 1) OR
         typeof(requires_smart_classroom) <> 'integer' OR requires_smart_classroom NOT IN (0, 1) OR
@@ -398,7 +467,17 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
         typeof(id) <> 'text' OR trim(id) = '' OR
         typeof(course_id) <> 'text' OR trim(course_id) = '' OR
         typeof(teacher_id) <> 'text' OR trim(teacher_id) = '' OR
-        typeof(assigned_group_count) <> 'integer' OR assigned_group_count <= 0 LIMIT 1`,
+        typeof(assigned_group_count) <> 'integer' OR
+        assigned_group_count NOT BETWEEN 1 AND ${maximumTeachingGroupsPerRow} LIMIT 1`,
+    },
+    {
+      area: "course teaching-allocation totals",
+      // 单行都不超过 999 仍可能由两位教师合计成 1,200。完整恢复必须执行与
+      // Teaching Members import、Cycle snapshot 相同的每课程总上限，不能只审每行。
+      sql: `SELECT 1 FROM teaching_allocations
+        GROUP BY course_id
+        HAVING SUM(assigned_group_count) > ${maximumTeachingGroupsPerCourse}
+        LIMIT 1`,
     },
     {
       area: "course sections",
@@ -412,7 +491,8 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
     {
       area: "section sequence",
       sql: `SELECT 1 FROM course_sections GROUP BY course_id
-        HAVING MIN(sequence) <> 1 OR MAX(sequence) <> COUNT(*) LIMIT 1`,
+        HAVING MIN(sequence) <> 1 OR MAX(sequence) <> COUNT(*) OR
+          COUNT(*) > ${maximumTeachingGroupsPerCourse} LIMIT 1`,
     },
     {
       area: "scheduled lessons",
@@ -484,6 +564,55 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
 
   for (const check of rowChecks) {
     if (db.prepare(check.sql).get()) throw new Error(`${stage} failed ${check.area} business checks.`);
+  }
+
+  // SQLite 的 trim/length 对内嵌 NUL、部分 Unicode 控制字符和 JavaScript 字符长度的
+  // 处理与 API 输入契约并不完全相同。完整备份中的每个业务资源主键都必须再走同一套
+  // opaque-id 规范化器（非空、原样 trim、无控制字符、最多 128 字符）。外键列已经由
+  // foreign_key_check 指向这些已验证主键，故无需重复扫描；rule_key、session token 等
+  // 封闭业务键也各有自己的专用校验，不能误当成任意 opaque resource id。
+  const opaqueResourceIdChecks: Array<{ area: string; sql: string }> = [
+    { area: "teacher ids", sql: "SELECT id AS value FROM teachers" },
+    { area: "student-group ids", sql: "SELECT id AS value FROM student_groups" },
+    { area: "room ids", sql: "SELECT id AS value FROM rooms" },
+    { area: "course ids", sql: "SELECT id AS value FROM courses" },
+    { area: "teaching-allocation ids", sql: "SELECT id AS value FROM teaching_allocations" },
+    { area: "course-section ids", sql: "SELECT id AS value FROM course_sections" },
+    { area: "scheduled-lesson ids", sql: "SELECT id AS value FROM scheduled_lessons" },
+    { area: "teacher-window ids", sql: "SELECT id AS value FROM teacher_unavailable_windows" },
+    { area: "year-window ids", sql: "SELECT id AS value FROM year_blocked_windows" },
+    { area: "account ids", sql: "SELECT id AS value FROM app_users" },
+    { area: "cycle-backup ids", sql: "SELECT id AS value FROM schedule_backups" },
+  ];
+  for (const check of opaqueResourceIdChecks) {
+    const values = db.prepare(check.sql).all() as Array<{ value: unknown }>;
+    if (values.some(({ value }) => !isOpaqueResourceId(value))) {
+      throw new Error(`${stage} failed ${check.area} resource-id checks.`);
+    }
+  }
+
+  // SQLite 的 length/upper 无法可靠识别所有 Unicode 与内嵌 NUL。恢复前再使用与 API
+  // 完全相同的 JavaScript 规范化器检查文字，阻止控制字符或未规范化自然键进入 live 数据库。
+  const uppercaseTextChecks: Array<{ area: string; maximumLength: number; sql: string }> = [
+    { area: "teacher names", maximumLength: TEACHER_NAME_MAX_LENGTH, sql: "SELECT name AS value FROM teachers" },
+    { area: "teacher Teaching Members sources", maximumLength: TEACHER_NAME_MAX_LENGTH, sql: "SELECT teaching_members_key AS value FROM teachers WHERE teaching_members_key IS NOT NULL" },
+    { area: "student-group codes", maximumLength: STUDENT_GROUP_CODE_MAX_LENGTH, sql: "SELECT code AS value FROM student_groups" },
+    { area: "student-group programmes", maximumLength: STUDENT_GROUP_PROGRAM_MAX_LENGTH, sql: "SELECT program AS value FROM student_groups" },
+    { area: "room codes", maximumLength: ROOM_CODE_MAX_LENGTH, sql: "SELECT code AS value FROM rooms" },
+    { area: "course codes", maximumLength: COURSE_CODE_MAX_LENGTH, sql: "SELECT code AS value FROM courses" },
+  ];
+  for (const check of uppercaseTextChecks) {
+    const values = db.prepare(check.sql).all() as Array<{ value: unknown }>;
+    if (values.some(({ value }) => normalizeRequiredUppercaseText(value, check.maximumLength) !== value)) {
+      throw new Error(`${stage} failed ${check.area} text checks.`);
+    }
+  }
+  const catalogs = db.prepare("SELECT catalog AS value FROM courses WHERE catalog IS NOT NULL").all() as Array<{ value: unknown }>;
+  if (catalogs.some(({ value }) => {
+    const normalized = normalizeOptionalText(value, COURSE_CATALOG_MAX_LENGTH);
+    return !normalized.ok || normalized.value !== value;
+  })) {
+    throw new Error(`${stage} failed course catalog text checks.`);
   }
 
   // 规则列表是封闭集合；缺一条会让旧实现尝试在恢复提交后补写默认值，正是
@@ -915,9 +1044,11 @@ function initializeTables(db: DatabaseInstance) {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
       staff_type TEXT NOT NULL CHECK (staff_type IN ('FT', 'PT')),
-      is_active INTEGER NOT NULL DEFAULT 1,
+      is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+      teaching_members_key TEXT
     );
     CREATE TABLE IF NOT EXISTS student_groups (
       id TEXT PRIMARY KEY,
@@ -925,53 +1056,55 @@ function initializeTables(db: DatabaseInstance) {
       year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
       program TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
     );
     CREATE TABLE IF NOT EXISTS rooms (
       id TEXT PRIMARY KEY,
       code TEXT NOT NULL UNIQUE,
       block TEXT,
-      capacity INTEGER NOT NULL CHECK (capacity > 0),
-      has_multi_projector INTEGER NOT NULL DEFAULT 0,
-      is_lab INTEGER NOT NULL DEFAULT 0,
-      is_smart_classroom INTEGER NOT NULL DEFAULT 0,
-      is_active INTEGER NOT NULL DEFAULT 1,
+      capacity INTEGER NOT NULL CHECK (capacity BETWEEN 1 AND ${ROOM_CAPACITY_MAXIMUM}),
+      has_multi_projector INTEGER NOT NULL DEFAULT 0 CHECK (has_multi_projector IN (0, 1)),
+      is_lab INTEGER NOT NULL DEFAULT 0 CHECK (is_lab IN (0, 1)),
+      is_smart_classroom INTEGER NOT NULL DEFAULT 0 CHECK (is_smart_classroom IN (0, 1)),
+      is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
     );
     CREATE TABLE IF NOT EXISTS courses (
       id TEXT PRIMARY KEY,
       code TEXT NOT NULL UNIQUE,
       catalog TEXT,
-      duration_hours INTEGER,
-      sessions_per_week INTEGER NOT NULL DEFAULT 1 CHECK (sessions_per_week > 0),
+      duration_hours INTEGER CHECK (duration_hours IS NULL OR duration_hours BETWEEN 2 AND 4),
+      sessions_per_week INTEGER NOT NULL DEFAULT 1 CHECK (sessions_per_week IN (1, 2)),
       primary_year INTEGER CHECK (primary_year IN (1, 2, 3)),
-      minimum_room_capacity INTEGER,
-      requires_lab INTEGER NOT NULL DEFAULT 0,
-      requires_multi_projector INTEGER NOT NULL DEFAULT 0,
-      requires_smart_classroom INTEGER NOT NULL DEFAULT 0,
-      separate_sections_across_days INTEGER NOT NULL DEFAULT 0,
+      minimum_room_capacity INTEGER CHECK (minimum_room_capacity IS NULL OR minimum_room_capacity BETWEEN 1 AND ${ROOM_CAPACITY_MAXIMUM}),
+      requires_lab INTEGER NOT NULL DEFAULT 0 CHECK (requires_lab IN (0, 1)),
+      requires_multi_projector INTEGER NOT NULL DEFAULT 0 CHECK (requires_multi_projector IN (0, 1)),
+      requires_smart_classroom INTEGER NOT NULL DEFAULT 0 CHECK (requires_smart_classroom IN (0, 1)),
+      separate_sections_across_days INTEGER NOT NULL DEFAULT 0 CHECK (separate_sections_across_days IN (0, 1)),
       week_pattern TEXT NOT NULL DEFAULT 'ALL' CHECK (week_pattern IN ('ALL', 'W1_4', 'W5_8')),
-      week_start INTEGER CHECK (week_start IS NULL OR week_start >= 1),
-      week_end INTEGER CHECK (week_end IS NULL OR week_end >= 1),
+      week_start INTEGER CHECK (week_start IS NULL OR week_start BETWEEN 1 AND 52),
+      week_end INTEGER CHECK (week_end IS NULL OR week_end BETWEEN 1 AND 52),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      revision INTEGER NOT NULL DEFAULT 1
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
     );
     CREATE TABLE IF NOT EXISTS teaching_allocations (
       id TEXT PRIMARY KEY,
       course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
       teacher_id TEXT NOT NULL REFERENCES teachers(id) ON DELETE RESTRICT,
-      assigned_group_count INTEGER NOT NULL CHECK (assigned_group_count > 0),
+      assigned_group_count INTEGER NOT NULL CHECK (assigned_group_count BETWEEN 1 AND ${maximumTeachingGroupsPerRow}),
       UNIQUE(course_id, teacher_id)
     );
     CREATE TABLE IF NOT EXISTS course_sections (
       id TEXT PRIMARY KEY,
       course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      sequence INTEGER NOT NULL CHECK (sequence > 0),
+      sequence INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND ${maximumTeachingGroupsPerCourse}),
       teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
       allocation_teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
-      revision INTEGER NOT NULL DEFAULT 1,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
       UNIQUE(course_id, sequence)
     );
     CREATE TABLE IF NOT EXISTS section_student_groups (
@@ -985,10 +1118,10 @@ function initializeTables(db: DatabaseInstance) {
       occurrence INTEGER NOT NULL DEFAULT 1,
       day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 5),
       start_hour INTEGER NOT NULL CHECK (start_hour BETWEEN 8 AND 17),
-      duration_hours INTEGER NOT NULL CHECK (duration_hours BETWEEN 1 AND 4),
+      duration_hours INTEGER NOT NULL CHECK (duration_hours BETWEEN 2 AND 4),
       room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
       warnings_json TEXT NOT NULL DEFAULT '[]',
-      revision INTEGER NOT NULL DEFAULT 1,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
       UNIQUE(section_id, occurrence)
     );
     CREATE TABLE IF NOT EXISTS teacher_unavailable_windows (
@@ -1037,6 +1170,23 @@ function initializeTables(db: DatabaseInstance) {
 
   // 表已经存在后，重复执行 CREATE TABLE 不会自动补上新列。
   // 因此这里检查旧版本地数据库，并用安全的小型迁移方式升级原型表结构。
+  const teacherColumns = db.prepare("PRAGMA table_info(teachers)").all() as Array<{ name: string }>;
+  if (!teacherColumns.some((column) => column.name === "revision")) {
+    // 所有旧教师从 revision 1 开始；来源键留空，下一次 Teaching Members 导入
+    // 可以通过当前同名且尚未认领的记录安全绑定，而不会凭空猜测历史来源。
+    db.exec("ALTER TABLE teachers ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!teacherColumns.some((column) => column.name === "teaching_members_key")) {
+    db.exec("ALTER TABLE teachers ADD COLUMN teaching_members_key TEXT");
+  }
+  const studentGroupColumns = db.prepare("PRAGMA table_info(student_groups)").all() as Array<{ name: string }>;
+  if (!studentGroupColumns.some((column) => column.name === "revision")) {
+    db.exec("ALTER TABLE student_groups ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+  }
+  const roomColumns = db.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>;
+  if (!roomColumns.some((column) => column.name === "revision")) {
+    db.exec("ALTER TABLE rooms ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+  }
   const courseColumns = db.prepare("PRAGMA table_info(courses)").all() as Array<{ name: string }>;
   if (!courseColumns.some((column) => column.name === "primary_year")) {
     db.exec("ALTER TABLE courses ADD COLUMN primary_year INTEGER CHECK (primary_year IN (1, 2, 3))");
@@ -1086,6 +1236,8 @@ function initializeTables(db: DatabaseInstance) {
   // 复合索引名称写出完整列清单，避免旧版本曾建立同名前缀索引时，IF NOT EXISTS
   // 静默保留旧形状。开发热重载和旧数据库升级都可以安全重复执行这一组语句。
   db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS teachers_teaching_members_key_key
+      ON teachers (teaching_members_key);
     CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx
       ON auth_sessions (user_id);
     CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx
@@ -1343,54 +1495,109 @@ export function resetAppUserPassword(userId: string, newPassword: string) {
 export function listTeachers(): TeacherRecord[] {
   // 在教师资料旁统计从教学分配表导入的班次数量，让资料页无需额外计算，
   // 就能直接显示每位教师预计承担多少个班次。
-  const rows = database().prepare(`
-    SELECT teachers.id, teachers.name, teachers.staff_type, teachers.is_active,
+  const rows = masterDataDatabase().prepare(`
+    /* timetabling:data-workspace-teachers */
+    SELECT teachers.id, teachers.revision, teachers.name, teachers.staff_type, teachers.is_active,
       COALESCE(SUM(teaching_allocations.assigned_group_count), 0) AS sections
     FROM teachers
     LEFT JOIN teaching_allocations ON teaching_allocations.teacher_id = teachers.id
     GROUP BY teachers.id
     ORDER BY teachers.staff_type DESC, teachers.name ASC
-  `).all() as Array<{ id: string; name: string; staff_type: "FT" | "PT"; is_active: number; sections: number }>;
-  return rows.map((row) => ({ id: row.id, name: row.name, staffType: row.staff_type, status: activeStatus(row.is_active), sections: row.sections }));
+  `).all() as Array<{ id: string; revision: number; name: string; staff_type: "FT" | "PT"; is_active: number; sections: number }>;
+  return rows.map((row) => ({ id: row.id, revision: row.revision, name: row.name, staffType: row.staff_type, status: activeStatus(row.is_active), sections: row.sections }));
 }
 
 export function createTeacher(name: string, staffType: "FT" | "PT"): TeacherRecord {
   // 使用 UUID 生成稳定主键，使本地新增资料不必依赖数据库自增序号。
+  assertTeacherDetails(name, staffType);
   const id = crypto.randomUUID();
+  const db = masterDataDatabase();
+  const create = db.transaction(() => {
+    // 人工新增的显示名称不能占用另一位教师已经认领的 Excel 来源键；否则下次导入
+    // 同一 Lecturer 时，系统会面对“来源键指向 A、当前姓名指向 B”的歧义。
+    const sourceOwner = db.prepare("SELECT 1 FROM teachers WHERE teaching_members_key = ? LIMIT 1").get(name);
+    if (sourceOwner) throw new MasterDataUniqueConflictError("A teacher imported from this Teaching Members name already exists.");
+    db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
+  });
   try {
-    database().prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)").run(id, name, staffType);
+    create.immediate();
   } catch (error) {
+    if (error instanceof MasterDataUniqueConflictError) throw error;
     if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A teacher with this name already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
-  return { id, name, staffType, status: "Active", sections: 0 };
+  return { id, revision: 1, name, staffType, status: "Active", sections: 0 };
 }
 
-export function updateTeacher(id: string, input: { name: string; staffType: "FT" | "PT" }) {
+export function updateTeacher(id: string, input: { name: string; staffType: "FT" | "PT"; revision: number }): MasterDataSaveResult | null {
   // 编辑时保留原有教师 ID，因此已经关联的教学分配、不可用时段和排课记录
   // 都会继续指向同一位教师，不会因修改姓名而丢失。
-  const result = database().prepare(`
-    UPDATE teachers SET name = ?, staff_type = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(input.name, input.staffType, id);
-  return result.changes > 0;
+  assertTeacherDetails(input.name, input.staffType);
+  assertMasterDataRevision(input.revision);
+  const db = masterDataDatabase();
+  const update = db.transaction(() => {
+    const current = db.prepare("SELECT name, staff_type, revision FROM teachers WHERE id = ?").get(id) as { name: string; staff_type: "FT" | "PT"; revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== input.revision) throw new MasterDataRevisionConflictError();
+
+    const changed = current.name !== input.name || current.staff_type !== input.staffType;
+    if (!changed) return { revision: current.revision, changed: false };
+    if (current.name !== input.name) {
+      const sourceOwner = db.prepare("SELECT id FROM teachers WHERE teaching_members_key = ? AND id <> ? LIMIT 1").get(input.name, id);
+      if (sourceOwner) throw new MasterDataUniqueConflictError("A teacher imported from this Teaching Members name already exists.");
+    }
+
+    // revision 和 ID 同时参与最终 UPDATE；ID 保持最后一个绑定参数，兼容并发回归的
+    // statement preload，并防止未来重构误把旧表单变成无条件覆盖。
+    const result = db.prepare(`
+      UPDATE teachers SET name = ?, staff_type = ?, revision = revision + 1,
+        updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?
+    `).run(input.name, input.staffType, input.revision, id);
+    if (result.changes !== 1) throw new MasterDataRevisionConflictError();
+    // 姓名和 FT／PT 都会出现在警告判断或提示中，因此必须与主资料原子重算。
+    refreshAllScheduleWarnings(db);
+    return { revision: input.revision + 1, changed: true };
+  });
+  try {
+    return update.immediate();
+  } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError || error instanceof MasterDataUniqueConflictError) throw error;
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A teacher with this name already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
-export function setTeacherStatus(id: string, isActive: boolean) {
+export function setTeacherStatus(id: string, isActive: boolean, revision: number): MasterDataSaveResult | null {
   // 停用教师只会把其从后续可选名单中隐藏，同时完整保留旧时间表中的历史记录。
   // 状态和全部相关 warning 必须一起提交；重算失败时回滚状态，不能留下界面与警告互相矛盾的资料。
-  const db = database();
+  if (typeof isActive !== "boolean") throw new MasterDataInputError("Teacher status must be true or false.");
+  assertMasterDataRevision(revision);
+  const db = masterDataDatabase();
   const statusTransaction = db.transaction(() => {
-    const result = db.prepare("UPDATE teachers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
-    if (result.changes > 0) refreshAllScheduleWarnings(db);
-    return result.changes > 0;
+    const current = db.prepare("SELECT is_active, revision FROM teachers WHERE id = ?").get(id) as { is_active: number; revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== revision) throw new MasterDataRevisionConflictError();
+    if (Boolean(current.is_active) === isActive) return { revision: current.revision, changed: false };
+    const result = db.prepare(`UPDATE teachers SET is_active = ?, revision = revision + 1,
+      updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?`).run(isActive ? 1 : 0, revision, id);
+    if (result.changes !== 1) throw new MasterDataRevisionConflictError();
+    refreshAllScheduleWarnings(db);
+    return { revision: revision + 1, changed: true };
   });
-  return statusTransaction.immediate();
+  try {
+    return statusTransaction.immediate();
+  } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function listStudentGroups(): StudentGroupRecord[] {
   // 学生班级按年级、专业、班级编号依次排序，保证老师每次查看时顺序一致、容易查找。
-  const rows = database().prepare("SELECT id, code, year, program FROM student_groups ORDER BY year ASC, program ASC, code ASC").all() as StudentGroupRecord[];
+  const rows = masterDataDatabase().prepare("SELECT id, revision, code, year, program FROM student_groups ORDER BY year ASC, program ASC, code ASC").all() as StudentGroupRecord[];
   return rows;
 }
 
@@ -1403,6 +1610,14 @@ export class MasterDataUniqueConflictError extends Error {
   }
 }
 
+export class MasterDataRevisionConflictError extends Error {
+  // 浏览器提交的是打开资料表单时看到的版本；版本不同表示另一账号已经先保存。
+  constructor() {
+    super("This master-data record was changed by another scheduler. Reload the latest record before editing it again.");
+    this.name = "MasterDataRevisionConflictError";
+  }
+}
+
 export class MasterDataInputError extends Error {
   // 不可用时段等基础资料若引用不存在的教师，应返回明确 400，而不是暴露外键错误。
   constructor(message: string) {
@@ -1411,47 +1626,104 @@ export class MasterDataInputError extends Error {
   }
 }
 
+type MasterDataSaveResult = { revision: number; changed: boolean };
+
+function masterDataDatabase() {
+  // 初始化结构和真正读写都可能在另一服务进程持有写锁时遇到 BUSY；统一转换后
+  // 所有基础资料 GET／POST／PATCH 都会收到可重试 JSON 503，而不是框架 HTML。
+  try {
+    return database();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
+}
+
+function assertMasterDataRevision(revision: number) {
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new MasterDataInputError("Master-data revision must be a positive whole number.");
+  }
+}
+
+function assertTeacherDetails(name: string, staffType: "FT" | "PT") {
+  const normalizedName = normalizeRequiredUppercaseText(name, TEACHER_NAME_MAX_LENGTH);
+  if (normalizedName !== name || !["FT", "PT"].includes(staffType)) {
+    throw new MasterDataInputError("Teacher name or staff type is invalid.");
+  }
+}
+
+function assertStudentGroupDetails(code: string, year: number, program: string) {
+  const normalizedCode = normalizeRequiredUppercaseText(code, STUDENT_GROUP_CODE_MAX_LENGTH);
+  const normalizedProgram = normalizeRequiredUppercaseText(program, STUDENT_GROUP_PROGRAM_MAX_LENGTH);
+  if (normalizedCode !== code || normalizedProgram !== program || !Number.isSafeInteger(year) || ![1, 2, 3].includes(year)) {
+    throw new MasterDataInputError("Student-group code, programme or year is invalid.");
+  }
+}
+
+function assertRoomDetails(input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }) {
+  const normalizedCode = normalizeRequiredUppercaseText(input.code, ROOM_CODE_MAX_LENGTH);
+  const addressParts = input.code.split("-");
+  const featuresAreBoolean = [input.hasLab, input.hasMultiProjector, input.isSmartClassroom].every((value) => typeof value === "boolean");
+  if (normalizedCode !== input.code || addressParts.length < 3 || addressParts.some((part) => part.length === 0)
+    || !Number.isSafeInteger(input.capacity) || input.capacity < 1 || input.capacity > ROOM_CAPACITY_MAXIMUM || !featuresAreBoolean) {
+    throw new MasterDataInputError("Room code, capacity or feature choices are invalid.");
+  }
+}
+
 export function createStudentGroup(code: string, year: number, program: string): StudentGroupRecord {
   // 学生班级 ID 是冲突检查所依赖的稳定身份；年级和专业仍可修改，
   // 由数据库生成的 ID 则保护已有课程关联不受名称调整影响。
+  assertStudentGroupDetails(code, year, program);
   const id = crypto.randomUUID();
   try {
-    database().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
+    masterDataDatabase().prepare("INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)").run(id, code, year, program);
   } catch (error) {
     // 只有稳定的 SQLite 唯一键错误才代表班级编号重复；磁盘、trigger 等未知故障继续向上抛，
     // 由 API 隐藏技术细节并返回通用 500，不能误导老师继续修改一个本来并未重复的编号。
     if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
-  return { id, code, year, program };
+  return { id, revision: 1, code, year, program };
 }
 
-export function updateStudentGroup(id: string, input: { code: string; year: number; program: string }) {
+export function updateStudentGroup(id: string, input: { code: string; year: number; program: string; revision: number }): MasterDataSaveResult | null {
   // 修改拼写、专业或年级时保留原班级 ID，因此已经分配给该班的所有课程班次都会继续存在。
-  const db = database();
+  assertStudentGroupDetails(input.code, input.year, input.program);
+  assertMasterDataRevision(input.revision);
+  const db = masterDataDatabase();
   const updateTransaction = db.transaction(() => {
+    const current = db.prepare("SELECT code, year, program, revision FROM student_groups WHERE id = ?").get(id) as { code: string; year: number; program: string; revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== input.revision) throw new MasterDataRevisionConflictError();
+    const changed = current.code !== input.code || current.year !== input.year || current.program !== input.program;
+    if (!changed) return { revision: current.revision, changed: false };
     const result = db.prepare(`
-      UPDATE student_groups SET code = ?, year = ?, program = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(input.code, input.year, input.program, id);
+      UPDATE student_groups SET code = ?, year = ?, program = ?, revision = revision + 1,
+        updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?
+    `).run(input.code, input.year, input.program, input.revision, id);
+    if (result.changes !== 1) throw new MasterDataRevisionConflictError();
     // 冲突警告会直接显示班级编号，因此资料修改和 warning 重算必须一起提交；
     // 重算失败时保留原编号、年级和专业，避免接口假失败后资料其实已经改变。
-    if (result.changes > 0) refreshAllScheduleWarnings(db);
-    return result.changes > 0;
+    refreshAllScheduleWarnings(db);
+    return { revision: input.revision + 1, changed: true };
   });
   try {
     return updateTransaction.immediate();
   } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError) throw error;
     if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
 }
 
 export function listRooms(): RoomRecord[] {
   // 把数据库中分开的教室功能布尔字段转换为简短列表，方便资料表格直接展示。
-  const rows = database().prepare("SELECT id, code, capacity, has_multi_projector, is_lab, is_smart_classroom, is_active FROM rooms ORDER BY code ASC").all() as Array<{ id: string; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number }>;
+  const rows = masterDataDatabase().prepare("SELECT id, revision, code, capacity, has_multi_projector, is_lab, is_smart_classroom, is_active FROM rooms ORDER BY code ASC").all() as Array<{ id: string; revision: number; code: string; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; is_active: number }>;
   return rows.map((row) => ({
     id: row.id,
+    revision: row.revision,
     code: row.code,
     capacity: row.capacity,
     features: [row.is_lab ? "Lab" : "", row.has_multi_projector ? "Multi projector" : "", row.is_smart_classroom ? "Smart classroom" : ""].filter(Boolean),
@@ -1462,58 +1734,87 @@ export function listRooms(): RoomRecord[] {
 export function createRoom(input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }): RoomRecord {
   // 教室容量和全部设施标记一次性保存。根据院系规则，Smart Classroom 必然同时属于
   // Multi Projector，确保后续教室要求检查始终看到一致资料。
+  assertRoomDetails(input);
   const id = crypto.randomUUID();
   // 教室编号格式是 Block-Level-Room，因此取第一段作为楼栋编号，供连续课程跨楼提醒使用。
   const block = input.code.split("-")[0] || null;
   // 本院系规定 Smart Classroom 一定具备 Multi Projector，所以保存时自动补上该标记。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
   try {
-    database().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
+    masterDataDatabase().prepare("INSERT INTO rooms (id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0);
   } catch (error) {
     // 与学生班级相同，只把真正的编号唯一键冲突转换为 409；其他数据库异常不能伪装成重复编号。
     if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A room with this code already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
-  return { id, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
+  return { id, revision: 1, code: input.code, capacity: input.capacity, features: [input.hasLab ? "Lab" : "", hasMultiProjector ? "Multi projector" : "", input.isSmartClassroom ? "Smart classroom" : ""].filter(Boolean), status: "Active" };
 }
 
-export function updateRoom(id: string, input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean }) {
+export function updateRoom(id: string, input: { code: string; capacity: number; hasLab: boolean; hasMultiProjector: boolean; isSmartClassroom: boolean; revision: number }): MasterDataSaveResult | null {
   // 教室地址变化时重新解析 Block，保证背靠背课程的跨楼提醒使用最新楼栋，
   // 而不是继续读取旧地址留下的值。
+  assertRoomDetails(input);
+  assertMasterDataRevision(input.revision);
   const block = input.code.split("-")[0] || null;
   // 编辑资料时同样强制执行“Smart Classroom 也是 Multi Projector”的院系规则。
   const hasMultiProjector = input.hasMultiProjector || input.isSmartClassroom;
-  const db = database();
+  const db = masterDataDatabase();
   const updateTransaction = db.transaction(() => {
+    const current = db.prepare(`SELECT code, block, capacity, has_multi_projector,
+      is_lab, is_smart_classroom, revision FROM rooms WHERE id = ?`).get(id) as { code: string; block: string | null; capacity: number; has_multi_projector: number; is_lab: number; is_smart_classroom: number; revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== input.revision) throw new MasterDataRevisionConflictError();
+    const changed = current.code !== input.code || current.block !== block || current.capacity !== input.capacity
+      || Boolean(current.has_multi_projector) !== hasMultiProjector || Boolean(current.is_lab) !== input.hasLab
+      || Boolean(current.is_smart_classroom) !== input.isSmartClassroom;
+    if (!changed) return { revision: current.revision, changed: false };
     const result = db.prepare(`
       /* timetabling:candidate-race-room-update */
       UPDATE rooms SET code = ?, block = ?, capacity = ?, has_multi_projector = ?,
-        is_lab = ?, is_smart_classroom = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, id);
+        is_lab = ?, is_smart_classroom = ?, revision = revision + 1,
+        updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?
+    `).run(input.code, block, input.capacity, hasMultiProjector ? 1 : 0, input.hasLab ? 1 : 0, input.isSmartClassroom ? 1 : 0, input.revision, id);
+    if (result.changes !== 1) throw new MasterDataRevisionConflictError();
     // 容量、设施和 Block 都会改变课程警告，因此和 warning 重算放在同一个事务。
-    if (result.changes > 0) refreshAllScheduleWarnings(db);
-    return result.changes > 0;
+    refreshAllScheduleWarnings(db);
+    return { revision: input.revision + 1, changed: true };
   });
   try {
     return updateTransaction.immediate();
   } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError) throw error;
     if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A room with this code already exists.");
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
 }
 
-export function setRoomStatus(id: string, isActive: boolean) {
+export function setRoomStatus(id: string, isActive: boolean, revision: number): MasterDataSaveResult | null {
   // 教室只停用、不直接删除，使旧时间表卡片仍能引用有效的历史教室；
   // 新的排课候选搜索则会自动排除已停用教室。
-  const db = database();
+  if (typeof isActive !== "boolean") throw new MasterDataInputError("Room status must be true or false.");
+  assertMasterDataRevision(revision);
+  const db = masterDataDatabase();
   const statusTransaction = db.transaction(() => {
-    const result = db.prepare("UPDATE rooms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(isActive ? 1 : 0, id);
+    const current = db.prepare("SELECT is_active, revision FROM rooms WHERE id = ?").get(id) as { is_active: number; revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== revision) throw new MasterDataRevisionConflictError();
+    if (Boolean(current.is_active) === isActive) return { revision: current.revision, changed: false };
+    const result = db.prepare(`UPDATE rooms SET is_active = ?, revision = revision + 1,
+      updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?`).run(isActive ? 1 : 0, revision, id);
+    if (result.changes !== 1) throw new MasterDataRevisionConflictError();
     // 状态和 `Room is unavailable` warning 必须始终来自同一次提交。
-    if (result.changes > 0) refreshAllScheduleWarnings(db);
-    return result.changes > 0;
+    refreshAllScheduleWarnings(db);
+    return { revision: revision + 1, changed: true };
   });
-  return statusTransaction.immediate();
+  try {
+    return statusTransaction.immediate();
+  } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function listUnavailableWindows(): UnavailableWindowRecord[] {
@@ -1612,8 +1913,8 @@ function isIntegerBetween(value: unknown, minimum: number, maximum: number): val
   return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
 }
 
-function isNullableNonEmptyString(value: unknown) {
-  return value === null || isNonEmptyString(value);
+function isNullableOpaqueResourceId(value: unknown) {
+  return value === null || isOpaqueResourceId(value);
 }
 
 function isWarningsJson(value: unknown) {
@@ -1653,14 +1954,16 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
         || (isIntegerBetween(weekStart, 1, 52)
           && isIntegerBetween(weekEnd, 1, 52)
           && Number(weekStart) <= Number(weekEnd));
-      return isNonEmptyString(course.id)
-        && isNonEmptyString(course.code)
-        && (course.catalog === null || typeof course.catalog === "string")
+      const normalizedCode = normalizeRequiredUppercaseText(course.code, COURSE_CODE_MAX_LENGTH);
+      const normalizedCatalog = normalizeOptionalText(course.catalog, COURSE_CATALOG_MAX_LENGTH);
+      return isOpaqueResourceId(course.id)
+        && normalizedCode !== null && normalizedCode === course.code
+        && normalizedCatalog.ok && normalizedCatalog.value === course.catalog
         && (course.revision === undefined || isIntegerBetween(course.revision, 1, Number.MAX_SAFE_INTEGER))
         && (course.duration_hours === null || isIntegerBetween(course.duration_hours, 2, 4))
         && isIntegerBetween(course.sessions_per_week, 1, 2)
         && (course.primary_year === null || isIntegerBetween(course.primary_year, 1, 3))
-        && (course.minimum_room_capacity === null || isIntegerBetween(course.minimum_room_capacity, 1, Number.MAX_SAFE_INTEGER))
+        && (course.minimum_room_capacity === null || isIntegerBetween(course.minimum_room_capacity, 1, ROOM_CAPACITY_MAXIMUM))
         && [course.requires_lab, course.requires_multi_projector, course.requires_smart_classroom,
           course.separate_sections_across_days].every((value) => value === 0 || value === 1)
         && ["ALL", "W1_4", "W5_8"].includes(String(course.week_pattern))
@@ -1676,22 +1979,28 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
     const courseById = new Map(snapshot.courses.map((course) => [course.id, course]));
 
     const allocationsAreValid = snapshot.allocations.every((allocation: unknown) => isPlainRecord(allocation)
-      && isNonEmptyString(allocation.id)
-      && isNonEmptyString(allocation.course_id)
+      && isOpaqueResourceId(allocation.id)
+      && isOpaqueResourceId(allocation.course_id)
       && courseById.has(allocation.course_id)
-      && isNonEmptyString(allocation.teacher_id)
-      && isIntegerBetween(allocation.assigned_group_count, 1, Number.MAX_SAFE_INTEGER));
+      && isOpaqueResourceId(allocation.teacher_id)
+      && isIntegerBetween(allocation.assigned_group_count, 1, maximumTeachingGroupsPerRow));
     if (!allocationsAreValid) return null;
     if (!hasUniqueValues(snapshot.allocations.map((allocation) => allocation.id))) return null;
     if (!hasUniqueValues(snapshot.allocations.map((allocation) => `${allocation.course_id}\u0000${allocation.teacher_id}`))) return null;
+    const allocationCountByCourse = new Map<string, number>();
+    for (const allocation of snapshot.allocations) {
+      const total = (allocationCountByCourse.get(allocation.course_id) ?? 0) + allocation.assigned_group_count;
+      if (total > maximumTeachingGroupsPerCourse) return null;
+      allocationCountByCourse.set(allocation.course_id, total);
+    }
 
     const sectionsAreValid = snapshot.sections.every((section: unknown) => isPlainRecord(section)
-      && isNonEmptyString(section.id)
-      && isNonEmptyString(section.course_id)
+      && isOpaqueResourceId(section.id)
+      && isOpaqueResourceId(section.course_id)
       && courseById.has(section.course_id)
-      && isIntegerBetween(section.sequence, 1, Number.MAX_SAFE_INTEGER)
-      && isNullableNonEmptyString(section.teacher_id)
-      && (section.allocation_teacher_id === undefined || isNullableNonEmptyString(section.allocation_teacher_id))
+      && isIntegerBetween(section.sequence, 1, maximumTeachingGroupsPerCourse)
+      && isNullableOpaqueResourceId(section.teacher_id)
+      && (section.allocation_teacher_id === undefined || isNullableOpaqueResourceId(section.allocation_teacher_id))
       && (section.allocation_teacher_id === undefined || section.allocation_teacher_id === null
         || section.allocation_teacher_id === section.teacher_id)
       && (section.revision === undefined || isIntegerBetween(section.revision, 1, Number.MAX_SAFE_INTEGER)));
@@ -1711,17 +2020,17 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
     }
 
     const sectionGroupsAreValid = snapshot.sectionGroups.every((assignment: unknown) => isPlainRecord(assignment)
-      && isNonEmptyString(assignment.section_id)
+      && isOpaqueResourceId(assignment.section_id)
       && sectionById.has(assignment.section_id)
-      && isNonEmptyString(assignment.student_group_id));
+      && isOpaqueResourceId(assignment.student_group_id));
     if (!sectionGroupsAreValid) return null;
     if (!hasUniqueValues(snapshot.sectionGroups.map((assignment) => `${assignment.section_id}\u0000${assignment.student_group_id}`))) return null;
 
     const lessonsAreValid = snapshot.lessons.every((lesson: unknown) => {
-      if (!isPlainRecord(lesson) || !isNonEmptyString(lesson.section_id)) return false;
+      if (!isPlainRecord(lesson) || !isOpaqueResourceId(lesson.section_id)) return false;
       const section = sectionById.get(lesson.section_id);
       const course = section ? courseById.get(section.course_id) : undefined;
-      return isNonEmptyString(lesson.id)
+      return isOpaqueResourceId(lesson.id)
         && Boolean(section && course)
         && isIntegerBetween(lesson.occurrence, 1, course?.sessions_per_week ?? 0)
         && isIntegerBetween(lesson.day_of_week, 1, 5)
@@ -1730,7 +2039,7 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
         && lesson.duration_hours === course?.duration_hours
         && Number(lesson.start_hour) + Number(lesson.duration_hours) <= 18
         && isIntegerBetween(course?.primary_year, 1, 3)
-        && isNullableNonEmptyString(lesson.room_id)
+        && isNullableOpaqueResourceId(lesson.room_id)
         && isWarningsJson(lesson.warnings_json)
         && isIntegerBetween(lesson.revision, 1, Number.MAX_SAFE_INTEGER);
     });
@@ -1916,21 +2225,73 @@ export function restoreLastCycleBackup(expectedBackupId: string, expectedCurrent
 }
 
 export function listCourses(): CourseRecord[] {
-  // 班次数量和教师分配总数分别使用独立子查询，避免一门课同时有多位教师和多个班次时，
-  // 连接结果互相相乘而造成统计数字虚高。
+  // 所有课程摘要和 allocation variance 在一条 SELECT 内完成。这样即使旧的单独
+  // /api/courses 仍被调用，它也只会返回某一个已提交版本，不会先读取课程、再为
+  // 52 门课逐一读取稍后的 variance；同时彻底移除原本的 N+1 查询。
   const rows = database().prepare(`
+    /* timetabling:course-list */
+    WITH
+    section_totals AS (
+      SELECT course_id, COUNT(*) AS configured_sections
+      FROM course_sections
+      GROUP BY course_id
+    ),
+    lesson_totals AS (
+      SELECT sections.course_id, COUNT(*) AS scheduled_lessons
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      GROUP BY sections.course_id
+    ),
+    expected AS (
+      SELECT course_id, teacher_id, assigned_group_count AS expected_sections
+      FROM teaching_allocations
+    ),
+    allocation_totals AS (
+      SELECT course_id, SUM(expected_sections) AS allocated_sections
+      FROM expected
+      GROUP BY course_id
+    ),
+    actual AS (
+      SELECT course_id, teacher_id, COUNT(*) AS actual_sections
+      FROM course_sections
+      WHERE teacher_id IS NOT NULL
+      GROUP BY course_id, teacher_id
+    ),
+    participants AS (
+      SELECT course_id, teacher_id FROM expected
+      UNION
+      SELECT course_id, teacher_id FROM actual
+    ),
+    variance_totals AS (
+      SELECT participants.course_id, COUNT(*) AS allocation_variance_count
+      FROM participants
+      LEFT JOIN expected ON expected.course_id = participants.course_id
+        AND expected.teacher_id = participants.teacher_id
+      LEFT JOIN actual ON actual.course_id = participants.course_id
+        AND actual.teacher_id = participants.teacher_id
+      -- 手工课程没有 Teaching Members 基线；即使已人工指派教师也不应产生 mismatch。
+      WHERE EXISTS (
+        SELECT 1 FROM expected baseline
+        WHERE baseline.course_id = participants.course_id
+      )
+        AND COALESCE(expected.expected_sections, 0) <> COALESCE(actual.actual_sections, 0)
+      GROUP BY participants.course_id
+    )
     SELECT courses.id, courses.code, courses.catalog, courses.revision, courses.duration_hours, courses.sessions_per_week,
       courses.primary_year, courses.minimum_room_capacity, courses.requires_lab,
       courses.requires_multi_projector, courses.requires_smart_classroom,
       courses.separate_sections_across_days, courses.week_pattern, courses.week_start, courses.week_end,
-      (SELECT COUNT(*) FROM course_sections WHERE course_sections.course_id = courses.id) AS configured_sections,
-      (SELECT COUNT(*) FROM scheduled_lessons
-        JOIN course_sections ON course_sections.id = scheduled_lessons.section_id
-        WHERE course_sections.course_id = courses.id) AS scheduled_lessons,
-      (SELECT COALESCE(SUM(assigned_group_count), 0) FROM teaching_allocations WHERE teaching_allocations.course_id = courses.id) AS allocated_sections
+      COALESCE(section_totals.configured_sections, 0) AS configured_sections,
+      COALESCE(lesson_totals.scheduled_lessons, 0) AS scheduled_lessons,
+      COALESCE(allocation_totals.allocated_sections, 0) AS allocated_sections,
+      COALESCE(variance_totals.allocation_variance_count, 0) AS allocation_variance_count
     FROM courses
+    LEFT JOIN section_totals ON section_totals.course_id = courses.id
+    LEFT JOIN lesson_totals ON lesson_totals.course_id = courses.id
+    LEFT JOIN allocation_totals ON allocation_totals.course_id = courses.id
+    LEFT JOIN variance_totals ON variance_totals.course_id = courses.id
     ORDER BY courses.code ASC
-  `).all() as Array<{ id: string; code: string; catalog: string | null; revision: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; scheduled_lessons: number; allocated_sections: number }>;
+  `).all() as Array<{ id: string; code: string; catalog: string | null; revision: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start: number | null; week_end: number | null; configured_sections: number; scheduled_lessons: number; allocated_sections: number; allocation_variance_count: number }>;
   return rows.map((row) => ({
     id: row.id,
     code: row.code,
@@ -1950,29 +2311,39 @@ export function listCourses(): CourseRecord[] {
     allocatedSections: row.allocated_sections,
     configuredSections: row.configured_sections,
     scheduledLessons: row.scheduled_lessons,
-    allocationVarianceCount: listCourseAllocationVariances(row.id).length,
+    allocationVarianceCount: row.allocation_variance_count,
   }));
+}
+
+export class ManualCourseInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManualCourseInputError";
+  }
 }
 
 export function createManualCourse(input: { code: string; catalog: string | null; sectionCount: number }): CourseRecord {
   // 手动新增用于补充 Excel 遗漏的课程；新生成的班次暂不分配教师和学生班级，
   // 由排课老师明确选择，避免系统自行猜测。
+  const parsed = parseManualCourseInput(input);
+  if (!parsed.ok) throw new ManualCourseInputError(parsed.error);
+  const validatedInput = parsed.value;
   const db = database();
   // 手动课程只补齐 Excel 缺失行，不会凭空创建教学分配数量；
   // 所有班次初始未分配，教师和学生班级由老师自行设置。
   const create = db.transaction(() => {
     const id = crypto.randomUUID();
-    db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)").run(id, input.code, input.catalog);
+    db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)").run(id, validatedInput.code, validatedInput.catalog);
     const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, NULL)");
-    for (let sequence = 1; sequence <= input.sectionCount; sequence += 1) {
+    for (let sequence = 1; sequence <= validatedInput.sectionCount; sequence += 1) {
       insertSection.run(crypto.randomUUID(), id, sequence);
     }
     // 新课程的全部默认值都由同一张表定义，而且此事务刚建立了精确 sectionCount 个班次。
     // 在提交前构造标准 CourseRecord，避免事务已提交后再次 listCourses 失败而向用户误报保存失败。
     return {
       id,
-      code: input.code,
-      catalog: input.catalog,
+      code: validatedInput.code,
+      catalog: validatedInput.catalog,
       revision: 1,
       durationHours: null,
       sessionsPerWeek: 1,
@@ -1986,7 +2357,7 @@ export function createManualCourse(input: { code: string; catalog: string | null
       weekStart: null,
       weekEnd: null,
       allocatedSections: 0,
-      configuredSections: input.sectionCount,
+      configuredSections: validatedInput.sectionCount,
       scheduledLessons: 0,
       allocationVarianceCount: 0,
     };
@@ -2015,16 +2386,26 @@ export class CourseSectionResizeConflictError extends Error {
   }
 }
 
-export function resizeCourseSections(courseId: string, sectionCount: number) {
+export function resizeCourseSections(courseId: string, sectionCount: number, revision: number): { revision: number; changed: boolean } | null {
   // 增加数量时接着现有编号生成班次；减少数量时只从编号最大的未排班次开始删除，
   // 绝不会静默丢弃已经排入时间表的工作。
-  const db = database();
+  if (!isOpaqueResourceId(courseId)) throw new CourseSetupInputError("Course id is invalid.");
+  if (!Number.isSafeInteger(sectionCount) || sectionCount < 1 || sectionCount > maximumTeachingGroupsPerCourse) {
+    throw new CourseSetupInputError(`Section count must be a whole number from 1 to ${maximumTeachingGroupsPerCourse}.`);
+  }
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new CourseSetupInputError("Course revision must be a positive whole number.");
+  }
+  const db = courseSetupDatabase();
   // 只调整最高序号一端的班次，保证保留下来的 LEAD_01 至 LEAD_N 标签、
   // 教师分配和学生班级关联都保持稳定。
   const resize = db.transaction(() => {
-    const course = db.prepare("SELECT id FROM courses WHERE id = ?").get(courseId) as { id: string } | undefined;
+    const course = db.prepare("SELECT id, revision FROM courses WHERE id = ?").get(courseId) as { id: string; revision: number } | undefined;
     if (!course) return false;
+    if (course.revision !== revision) throw new CourseSetupRevisionConflictError();
     const currentSections = db.prepare("SELECT id, sequence, teacher_id FROM course_sections WHERE course_id = ? ORDER BY sequence ASC").all(courseId) as Array<{ id: string; sequence: number; teacher_id: string | null }>;
+    // 完全相同的数量不会更新 timestamp 或 revision，也不会让其他账号已打开的设置无故失效。
+    if (sectionCount === currentSections.length) return { revision: course.revision, changed: false };
 
     if (sectionCount > currentSections.length) {
       const insertSection = db.prepare("INSERT INTO course_sections (id, course_id, sequence, teacher_id) VALUES (?, ?, ?, NULL)");
@@ -2047,10 +2428,22 @@ export function resizeCourseSections(courseId: string, sectionCount: number) {
       const removeSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
       for (const section of removable) removeSection.run(section.id);
     }
-    return true;
+    // 课程 revision 同时保护 Course Setup 与班次数量，因为导入、设置和手工 resize
+    // 都会改变老师在 Sections 面板中看到的课程基准。ID 保持最后一个绑定参数。
+    const courseUpdate = db.prepare(`UPDATE courses SET revision = revision + 1,
+      updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?`).run(revision, courseId);
+    if (courseUpdate.changes !== 1) throw new CourseSetupRevisionConflictError();
+    return { revision: revision + 1, changed: true };
   });
   // IMMEDIATE 让“检查尾部是否仍有资料”和真正删除之间不会被另一服务进程插入新分配。
-  return resize.immediate();
+  try {
+    const result = resize.immediate();
+    return result === false ? null : result;
+  } catch (error) {
+    if (error instanceof CourseSetupInputError || error instanceof CourseSetupRevisionConflictError || error instanceof CourseSectionResizeConflictError || error instanceof CourseSetupBusyError) throw error;
+    if (isSqliteBusyError(error)) throw new CourseSetupBusyError();
+    throw error;
+  }
 }
 
 export class CourseSetupInputError extends Error {
@@ -2100,14 +2493,15 @@ export function updateCourseSetup(id: string, input: CourseSetupInput): { revisi
   // 课程要求适用于该课生成的每个班次，因此只保存在课程层级；
   // 像 LEAD 有 18 个班次时无需重复存储 18 份相同设置。
   // 业务规则也必须在共用数据库入口验证，因为维护脚本可能绕过网页 API。
+  if (!isOpaqueResourceId(id)) throw new CourseSetupInputError("Course id is invalid.");
   if (!Number.isSafeInteger(input.revision) || input.revision < 1) throw new CourseSetupInputError("Course revision must be a positive whole number.");
   if (!Number.isInteger(input.durationHours) || input.durationHours < 2 || input.durationHours > 4) throw new CourseSetupInputError("Course duration must be 2 to 4 whole hours.");
   if (![1, 2].includes(input.sessionsPerWeek)) throw new CourseSetupInputError("Weekly sessions must be 1 or 2.");
   if (input.primaryYear !== null && ![1, 2, 3].includes(input.primaryYear)) throw new CourseSetupInputError("Primary year must be Year 1, Year 2, Year 3 or blank.");
-  if (input.minimumRoomCapacity !== null && (!Number.isSafeInteger(input.minimumRoomCapacity) || input.minimumRoomCapacity < 1)) throw new CourseSetupInputError("Minimum room capacity must be a positive whole number or blank.");
+  if (input.minimumRoomCapacity !== null && (!Number.isSafeInteger(input.minimumRoomCapacity) || input.minimumRoomCapacity < 1 || input.minimumRoomCapacity > ROOM_CAPACITY_MAXIMUM)) throw new CourseSetupInputError(`Minimum room capacity must be a whole number from 1 to ${ROOM_CAPACITY_MAXIMUM}, or blank.`);
   if (![input.requiresLab, input.requiresMultiProjector, input.requiresSmartClassroom, input.separateSectionsAcrossDays].every((value) => typeof value === "boolean")) throw new CourseSetupInputError("Course requirement switches must be true or false.");
-  if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isSafeInteger(input.weekStart) || !Number.isSafeInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd < input.weekStart))) {
-    throw new CourseSetupInputError("Teaching weeks must be blank for all weeks or a valid positive start and end range.");
+  if ((input.weekStart === null) !== (input.weekEnd === null) || (input.weekStart !== null && input.weekEnd !== null && (!Number.isSafeInteger(input.weekStart) || !Number.isSafeInteger(input.weekEnd) || input.weekStart < 1 || input.weekEnd > 52 || input.weekEnd < input.weekStart))) {
+    throw new CourseSetupInputError("Teaching weeks must be blank for all weeks or a valid range from week 1 to week 52.");
   }
 
   const db = courseSetupDatabase();
@@ -2184,6 +2578,7 @@ export function listCourseSections(courseId: string): CourseSectionRecord[] {
   // 把一个班次关联的多个学生班级聚合到同一结果行，
   // 让浏览器能在教师分配旁完整展示该班次涉及的冲突范围。
   const rows = database().prepare(`
+    /* timetabling:course-workspace-sections */
     SELECT course_sections.id, courses.code, course_sections.sequence, course_sections.revision, teachers.id AS teacher_id,
       teachers.name AS teacher_name, student_groups.id AS group_id, student_groups.code AS group_code
     FROM course_sections
@@ -2209,26 +2604,68 @@ export function listCourseSections(courseId: string): CourseSectionRecord[] {
 export function listCourseAllocationVariances(courseId: string): AllocationVarianceRecord[] {
   // 比较导入的教师班次数量与当前实际班次分配。系统允许老师手动替换任课教师，
   // 但会把与原分配不一致的情况清楚显示给排课人员。
-  const db = database();
-  // 手动课程没有 Teaching Members 的原始分配基线，因此自由选择的教师
-  // 不应被误报为与一个根本不存在的分配不一致。
-  const hasAllocation = db.prepare("SELECT 1 FROM teaching_allocations WHERE course_id = ? LIMIT 1").get(courseId);
-  if (!hasAllocation) return [];
-
-  // 结果同时包含预期教师和当前实际使用的代课教师。
-  // 相关子查询使计算逻辑容易阅读，而且在院系规模的数据量下性能足够。
-  const rows = db.prepare(`
+  // 基线存在、预期数量和实际数量必须由同一条 SELECT 判断。旧 allocation 端点即使
+  // 独立使用本函数，也不会在“基线存在检查”与明细读取之间跨过另一个进程的提交。
+  const rows = database().prepare(`
     SELECT teachers.id, teachers.name,
       COALESCE((SELECT assigned_group_count FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id), 0) AS expected_sections,
       (SELECT COUNT(*) FROM course_sections sections WHERE sections.course_id = ? AND sections.teacher_id = teachers.id) AS actual_sections
     FROM teachers
-    WHERE EXISTS (SELECT 1 FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id)
-       OR EXISTS (SELECT 1 FROM course_sections sections WHERE sections.course_id = ? AND sections.teacher_id = teachers.id)
+    WHERE EXISTS (SELECT 1 FROM teaching_allocations baseline WHERE baseline.course_id = ?)
+      AND (
+        EXISTS (SELECT 1 FROM teaching_allocations allocations WHERE allocations.course_id = ? AND allocations.teacher_id = teachers.id)
+        OR EXISTS (SELECT 1 FROM course_sections sections WHERE sections.course_id = ? AND sections.teacher_id = teachers.id)
+      )
     ORDER BY teachers.name
-  `).all(courseId, courseId, courseId, courseId) as Array<{ id: string; name: string; expected_sections: number; actual_sections: number }>;
+  `).all(courseId, courseId, courseId, courseId, courseId) as Array<{ id: string; name: string; expected_sections: number; actual_sections: number }>;
   return rows
     .filter((row) => row.expected_sections !== row.actual_sections)
     .map((row) => ({ teacherId: row.id, teacherName: row.name, expectedSections: row.expected_sections, actualSections: row.actual_sections }));
+}
+
+export function listDataManagementWorkspace(): DataManagementWorkspaceRecord {
+  // 教师分配数量、课程摘要以及其余基础资料属于同一个资料管理画面。DEFERRED 在
+  // 第一条 SELECT 固定 SQLite 快照，使 Teaching Members 导入无法夹在四份清单之间。
+  try {
+    const db = database();
+    const readWorkspace = db.transaction(() => ({
+      teachers: listTeachers(),
+      groups: listStudentGroups(),
+      rooms: listRooms(),
+      courses: listCourses(),
+    }));
+    return readWorkspace.deferred();
+  } catch (error) {
+    // database() 初始化和事务内第一条 SELECT 都可能遇到另一进程的短暂锁；只把
+    // 稳定的 BUSY/LOCKED 转成可重试错误，磁盘、schema 等未知故障继续交给 API 隐藏。
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
+}
+
+export function listCourseSectionsWorkspace(courseId: string): CourseSectionsWorkspaceRecord | null {
+  // 课程 revision、班次关联和 Teaching Members 差异必须来自同一提交时刻；否则老师
+  // 可能刚打开面板就拿着旧 revision，或看到旧教师配上新 variance。
+  try {
+    const db = database();
+    const readWorkspace = db.transaction(() => {
+      // sections 是这份 workspace 的第一条业务 SELECT，也承担 test-only preload 的
+      // pre-read 屏障；随后 currentCourse 与 variance 会自动沿用同一 SQLite 快照。
+      // 即使历史课程没有班次，仍继续读取 course 清单，故不会把合法空课程误报404。
+      const sections = listCourseSections(courseId);
+      const currentCourse = listCourses().find((course) => course.id === courseId);
+      if (!currentCourse) return null;
+      return {
+        currentCourse,
+        sections,
+        allocationVariances: listCourseAllocationVariances(courseId),
+      };
+    });
+    return readWorkspace.deferred();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export class CourseSectionRevisionConflictError extends Error {
@@ -2250,6 +2687,10 @@ export class CourseSectionInputError extends Error {
 export function updateCourseSection(id: string, input: { teacherId: string | null; studentGroupIds: string[]; revision: number }) {
   // 教师和学生班级属于整个班次的共享资料；独立 revision 与事务 CAS
   // 可阻止两个账号从旧页面先后保存时，后提交者静默覆盖先提交者。
+  if (!isOpaqueResourceId(id)) throw new CourseSectionInputError("Section id is invalid.");
+  const parsed = parseCourseSectionAssignmentInput(input);
+  if (!parsed.ok) throw new CourseSectionInputError(parsed.error);
+  input = parsed.value;
   const db = database();
   const transaction = db.transaction(() => {
     const section = db.prepare("SELECT id, course_id, teacher_id, revision FROM course_sections WHERE id = ?").get(id) as { id: string; course_id: string; teacher_id: string | null; revision: number } | undefined;
@@ -2278,7 +2719,9 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     // revision 的比较必须出现在 UPDATE 条件中，不能只依靠前面的 SELECT；这样即使另一进程
     // 恰好在两条语句之间先保存，changes 也会变成 0，并触发明确的并发冲突。
     const updateResult = teacherChanged
-      ? db.prepare("UPDATE course_sections SET teacher_id = ?, allocation_teacher_id = NULL, revision = revision + 1 WHERE id = ? AND revision = ?").run(input.teacherId, id, input.revision)
+      ? db.prepare(`/* timetabling:course-workspace-section-write */
+        UPDATE course_sections SET teacher_id = ?, allocation_teacher_id = NULL,
+          revision = revision + 1 WHERE id = ? AND revision = ?`).run(input.teacherId, id, input.revision)
       : db.prepare("UPDATE course_sections SET revision = revision + 1 WHERE id = ? AND revision = ?").run(id, input.revision);
     if (updateResult.changes !== 1) throw new CourseSectionRevisionConflictError();
 
@@ -2986,6 +3429,9 @@ function isScheduledOccurrenceUniqueError(error: unknown) {
 export function placeScheduledLesson(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }): ScheduledLessonRecord {
   // 即使存在警告，也按用户要求创建整点课程并保存警告内容；
   // 新课程、关联警告和返回资料放在同一个事务中，任一步失败都不会留下半完成排课。
+  const parsed = parseScheduledLessonPlacementInput(input);
+  if (!parsed.ok) throw new ScheduledLessonPlacementInputError(parsed.error);
+  input = parsed.value;
   const db = database();
   const placementTransaction = db.transaction(() => {
     const section = db.prepare(`SELECT sections.id, courses.code, sections.sequence, courses.duration_hours, courses.sessions_per_week, courses.primary_year, courses.week_start, courses.week_end, teachers.id AS teacher_id, teachers.name AS teacher_name FROM course_sections sections JOIN courses ON courses.id = sections.course_id LEFT JOIN teachers ON teachers.id = sections.teacher_id WHERE sections.id = ?`).get(input.sectionId) as { id: string; code: string; sequence: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; week_start: number | null; week_end: number | null; teacher_id: string | null; teacher_name: string | null } | undefined;
@@ -3041,6 +3487,10 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   // 修订版本检查防止多人编辑时静默覆盖；教师、学生班级和课程位置一起保存，
   // 确保重新计算的冲突始终与界面显示的卡片资料一致。读取、验证和写入全部
   // 放进 IMMEDIATE 事务，另一服务进程不能在验证教师或教室后抢先改变状态。
+  if (!isOpaqueResourceId(id)) throw new ScheduledLessonUpdateInputError("Lesson id is invalid.");
+  const parsed = parseScheduledLessonUpdateInput(input);
+  if (!parsed.ok) throw new ScheduledLessonUpdateInputError(parsed.error);
+  input = parsed.value;
   const db = database();
   const updateTransaction = db.transaction(() => {
     // 先在写锁内读取课程、当前 revision、共享教师和原教室；学生班级属于班次，
@@ -3114,6 +3564,9 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
 export function removeScheduledLesson(id: string, revision: number) {
   // 删除一条排课只会把对应的每周课次退回待排区；若该班次每周上两次，
   // 另一课次仍保留在原时间表位置。
+  if (!isOpaqueResourceId(id) || !isPositiveSafeInteger(revision)) {
+    throw new ScheduledLessonUpdateInputError("Lesson id and revision are invalid.");
+  }
   const db = database();
   const removeTransaction = db.transaction(() => {
     const removed = db.prepare("DELETE FROM scheduled_lessons WHERE id = ? AND revision = ?").run(id, revision).changes > 0;
@@ -3133,10 +3586,63 @@ export class TeachingAllocationImportConflictError extends Error {
   }
 }
 
-export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZeroRows: number): TeachingMembersImportSummary {
+export class TeachingAllocationImportInputError extends Error {
+  // 工作簿结构虽可读取，但数量不符合安全业务范围时稳定返回 400，而不是数据库 500。
+  constructor(message: string) {
+    super(message);
+    this.name = "TeachingAllocationImportInputError";
+  }
+}
+
+export function importTeachingMembers(rows: TeachingMembersImportRow[], zeroAllocationRows: number): TeachingMembersImportSummary {
   // 先把已验证的工作表行整理为教师清单、课程清单和教学分配映射，
   // 再一次性执行完整导入事务。
-  const db = database();
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > 5_000) {
+    throw new TeachingAllocationImportInputError("Teaching Members must contain 1 to 5,000 complete rows.");
+  }
+  if (!Number.isSafeInteger(zeroAllocationRows) || zeroAllocationRows < 0 || zeroAllocationRows > rows.length) {
+    throw new TeachingAllocationImportInputError("The zero-allocation row count is invalid.");
+  }
+  const groupCountByCourse = new Map<string, number>();
+  const staffTypeByLecturer = new Map<string, "FT" | "PT">();
+  const catalogByCourse = new Map<string, string | null>();
+  let workbookGroupCount = 0;
+  for (const row of rows) {
+    // API 已经执行同一组检查；数据库入口仍再次确认自然键、说明文字和控制字符，
+    // 防止未来脚本直接调用导入器时绕过长度边界或用 NUL 碰撞内部复合键。
+    const normalizedMod = normalizeRequiredUppercaseText(row?.mod, COURSE_CODE_MAX_LENGTH);
+    const normalizedCatalog = normalizeOptionalText(row?.catalog, COURSE_CATALOG_MAX_LENGTH);
+    const normalizedLecturer = normalizeRequiredUppercaseText(row?.lecturer, TEACHER_NAME_MAX_LENGTH);
+    if (normalizedMod !== row?.mod || !normalizedCatalog.ok || normalizedCatalog.value !== row?.catalog
+      || normalizedLecturer !== row?.lecturer || (row?.staffType !== "FT" && row?.staffType !== "PT")) {
+      throw new TeachingAllocationImportInputError("Teaching Members contains invalid course, catalog, lecturer or staff-type text.");
+    }
+    // Number.isSafeInteger 会同时挡住 Infinity、科学记数溢出和不精确的大整数；
+    // 上限检查发生在任何展开循环和数据库连接之前。
+    if (!Number.isSafeInteger(row.groupCount) || row.groupCount < 0 || row.groupCount > maximumTeachingGroupsPerRow) {
+      throw new TeachingAllocationImportInputError(`Every group count must be a whole number from 0 to ${maximumTeachingGroupsPerRow}.`);
+    }
+    const previousStaffType = staffTypeByLecturer.get(row.lecturer);
+    if (previousStaffType !== undefined && previousStaffType !== row.staffType) {
+      throw new TeachingAllocationImportInputError(`${row.lecturer} has conflicting Staff Type values in this workbook.`);
+    }
+    staffTypeByLecturer.set(row.lecturer, row.staffType);
+    if (catalogByCourse.has(row.mod) && catalogByCourse.get(row.mod) !== row.catalog) {
+      throw new TeachingAllocationImportInputError(`${row.mod} has conflicting Catalog values in this workbook.`);
+    }
+    catalogByCourse.set(row.mod, row.catalog);
+    const courseGroupCount = (groupCountByCourse.get(row.mod) ?? 0) + row.groupCount;
+    if (courseGroupCount > maximumTeachingGroupsPerCourse) {
+      throw new TeachingAllocationImportInputError(`${row.mod} exceeds the ${maximumTeachingGroupsPerCourse}-group course limit.`);
+    }
+    groupCountByCourse.set(row.mod, courseGroupCount);
+    workbookGroupCount += row.groupCount;
+    if (workbookGroupCount > maximumTeachingGroupsPerWorkbook) {
+      throw new TeachingAllocationImportInputError(`The workbook exceeds the ${maximumTeachingGroupsPerWorkbook.toLocaleString("en-US")}-group safety limit.`);
+    }
+  }
+
+  const db = masterDataDatabase();
   // 使用 Map 去除表格中的重复项，同时保证每位教师、每门课程以及每个课程—教师组合
   // 最终都只有一条明确记录。
   const teachers = new Map<string, { name: string; staffType: "FT" | "PT" }>();
@@ -3146,10 +3652,12 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   for (const row of rows) {
     // 每一行有效工作表资料都会加入教师基础清单，即使该教师当前所有课程分配都为零。
     teachers.set(row.lecturer, { name: row.lecturer, staffType: row.staffType });
-    // 明确的零表示该教师不教授这门课，因此该单元格不会创建教师分配、课程，
-    // 也不会生成任何待排班次。
-    if (row.groupCount === 0) continue;
+    // 课程也必须在零值行加入本次范围：这让明确的 0 可以清除该课程旧分配，同时继续
+    // 复用课程 ID 和人工 Course Setup。完全没有出现在工作簿中的课程则不会被触碰。
     courses.set(row.mod, { code: row.mod, catalog: row.catalog });
+    // 零值不建立 teaching_allocation；后面的差异同步会删除这门课程原有分配和
+    // 无保护的自动班次。教师与课程主资料仍按上面的稳定 ID 规则维护。
+    if (row.groupCount === 0) continue;
     // 空字符分隔符不会出现在正常课程编号或姓名中，因此可安全组成复合键，
     // 用于识别同一个教学分配在多行中重复出现的情况。
     const key = `${row.mod}\u0000${row.lecturer}`;
@@ -3158,36 +3666,92 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
   }
   const transaction = db.transaction(() => {
     // 整个导入保持“全部成功或全部失败”的原子性，老师不会看到只导入了一半的教学分配。
-    const findTeacher = db.prepare("SELECT id, is_active FROM teachers WHERE name = ?");
-    const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, ?)");
-    const updateTeacher = db.prepare("UPDATE teachers SET staff_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-    const findCourse = db.prepare("SELECT id FROM courses WHERE code = ?");
+    const findTeacherBySourceKey = db.prepare(`SELECT id, name, staff_type, is_active, revision, teaching_members_key
+      FROM teachers WHERE teaching_members_key = ?`);
+    const findTeacherByCurrentName = db.prepare(`SELECT id, name, staff_type, is_active, revision, teaching_members_key
+      FROM teachers WHERE name = ?`);
+    const claimTeacherSourceKey = db.prepare("UPDATE teachers SET teaching_members_key = ? WHERE teaching_members_key IS NULL AND id = ?");
+    const insertTeacher = db.prepare("INSERT INTO teachers (id, name, staff_type, teaching_members_key) VALUES (?, ?, ?, ?)");
+    const updateImportedTeacherStaffType = db.prepare(`UPDATE teachers SET staff_type = ?, revision = revision + 1,
+      updated_at = CURRENT_TIMESTAMP WHERE revision = ? AND id = ?`);
+    const findCourse = db.prepare("SELECT id, catalog FROM courses WHERE code = ?");
     const insertCourse = db.prepare("INSERT INTO courses (id, code, catalog) VALUES (?, ?, ?)");
-    const updateCourse = db.prepare("UPDATE courses SET catalog = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const updateCourseCatalog = db.prepare("UPDATE courses SET catalog = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const bumpCourseRevision = db.prepare(`/* timetabling:data-workspace-import-write */
+      UPDATE courses SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`);
     const courseIds = new Map<string, string>();
+    const existingCourseIds = new Set<string>();
+    const changedExistingCourseIds = new Set<string>();
     const teacherIds = new Map<string, string>();
     const teacherActiveById = new Map<string, boolean>();
     const teacherNameById = new Map<string, string>();
+    let teacherWarningsNeedRefresh = false;
 
-    for (const teacher of teachers.values()) {
-      // 如果已有同名手动教师则复用其稳定 ID，并保留老师在系统内明确设置的 Active／Inactive 状态；
-      // Excel 只能维护教师类型，不能用一次重新导入偷偷覆盖人工停用决定。新教师仍使用数据库默认的 Active 状态。
-      const existing = findTeacher.get(teacher.name) as { id: string; is_active: number } | undefined;
+    // 正数课程允许新建；零值只是一项“清除既有课程”的指令，绝不能凭空建立空课程。
+    // 先只查询并整理可执行动作；若全零且一个课程都不存在，会在任何教师／课程写入前 400。
+    const actionableCourses = new Map<string, { course: { code: string; catalog: string | null }; existing: { id: string; catalog: string | null } | undefined }>();
+    for (const course of courses.values()) {
+      const existing = findCourse.get(course.code) as { id: string; catalog: string | null } | undefined;
+      if (existing || (groupCountByCourse.get(course.code) ?? 0) > 0) {
+        actionableCourses.set(course.code, { course, existing });
+      }
+    }
+    if (actionableCourses.size === 0) {
+      throw new TeachingAllocationImportInputError("No existing courses matched the zero-allocation rows in this workbook.");
+    }
+    for (const { course, existing } of actionableCourses.values()) {
       const id = existing?.id ?? crypto.randomUUID();
-      if (existing) updateTeacher.run(teacher.staffType, id);
-      else insertTeacher.run(id, teacher.name, teacher.staffType);
+      // Catalog 真的变化时才提高课程 revision；相同重导不会让已打开的 Course Setup
+      // 无意义失效，也不会只因为 CURRENT_TIMESTAMP 写入形成假变化。
+      if (existing) {
+        existingCourseIds.add(id);
+        if (existing.catalog !== course.catalog) {
+          updateCourseCatalog.run(course.catalog, id);
+          changedExistingCourseIds.add(id);
+        }
+      } else {
+        insertCourse.run(id, course.code, course.catalog);
+      }
+      courseIds.set(course.code, id);
+    }
+
+    type ImportedTeacherRow = { id: string; name: string; staff_type: "FT" | "PT"; is_active: number; revision: number; teaching_members_key: string | null };
+    for (const teacher of teachers.values()) {
+      // 来源键优先于当前显示名称，因此管理员改名后，下一次 Excel 导入仍会命中原教师。
+      // 只有尚未认领来源键的同名记录可以被首次导入认领；其他组合一律不猜测。
+      const sourceMatch = findTeacherBySourceKey.get(teacher.name) as ImportedTeacherRow | undefined;
+      const nameMatch = findTeacherByCurrentName.get(teacher.name) as ImportedTeacherRow | undefined;
+      if (sourceMatch && nameMatch && sourceMatch.id !== nameMatch.id) {
+        throw new TeachingAllocationImportConflictError(`${teacher.name} matches one teacher's Teaching Members source and another teacher's current name. Rename the conflicting teacher before importing again.`);
+      }
+
+      let existing = sourceMatch;
+      if (!existing && nameMatch) {
+        if (nameMatch.teaching_members_key !== null) {
+          throw new TeachingAllocationImportConflictError(`${teacher.name} is already linked to a different Teaching Members source. Review the teacher names before importing again.`);
+        }
+        const claimed = claimTeacherSourceKey.run(teacher.name, nameMatch.id);
+        if (claimed.changes !== 1) {
+          throw new TeachingAllocationImportConflictError(`${teacher.name} changed while its Teaching Members source was being linked. Refresh and import again.`);
+        }
+        // 只认领隐藏来源键不改变网页可见资料，因此不消耗 revision，也不改 updated_at。
+        existing = { ...nameMatch, teaching_members_key: teacher.name };
+      }
+
+      const id = existing?.id ?? crypto.randomUUID();
+      if (existing) {
+        // Excel 的 Staff Type 是来源权威；真实变化才提高教师 revision。人工姓名和启用状态始终保留。
+        if (existing.staff_type !== teacher.staffType) {
+          const updated = updateImportedTeacherStaffType.run(teacher.staffType, existing.revision, id);
+          if (updated.changes !== 1) throw new MasterDataRevisionConflictError();
+          teacherWarningsNeedRefresh = true;
+        }
+      } else {
+        insertTeacher.run(id, teacher.name, teacher.staffType, teacher.name);
+      }
       teacherIds.set(teacher.name, id);
       teacherActiveById.set(id, existing ? existing.is_active === 1 : true);
-      teacherNameById.set(id, teacher.name);
-    }
-    for (const course of courses.values()) {
-      // 这里刻意不覆盖课程时长、年级和教室要求等手动设置，只刷新 Excel 课程目录资料，
-      // 因而以后重新导入教学分配时不会丢失已经完成的排课配置。
-      const existing = findCourse.get(course.code) as { id: string } | undefined;
-      const id = existing?.id ?? crypto.randomUUID();
-      if (existing) updateCourse.run(course.catalog, id);
-      else insertCourse.run(id, course.code, course.catalog);
-      courseIds.set(course.code, id);
+      teacherNameById.set(id, existing?.name ?? teacher.name);
     }
 
     // 只更新本工作簿中出现的课程；老师因 Excel 遗漏而手动新增的其他课程会继续保留。
@@ -3199,11 +3763,43 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       if (findScheduledCourse.get(courseId)) throw new TeachingAllocationImportConflictError("Teaching allocation cannot be re-imported after one of its courses has been scheduled. Use the manual course and section corrections, or start a new cycle first.");
     }
 
-    // 工作簿中的 teaching_allocations 是最新的“期望数量”，可以整体替换；课程班次则包含
-    // 手工教师和学生班级，必须保留稳定 ID，并按 sequence 做差异化更新。
-    const deleteCourseAllocations = db.prepare("DELETE FROM teaching_allocations WHERE course_id = ?");
+    // 工作簿中的 teaching_allocations 是最新“期望数量”，但相同记录不应删除重建。
+    // 按教师做差异同步可保留 allocation ID；后续任何班次保护冲突仍会回滚全部变化。
+    const listCourseAllocations = db.prepare("SELECT id, teacher_id, assigned_group_count FROM teaching_allocations WHERE course_id = ?");
+    const deleteAllocation = db.prepare("DELETE FROM teaching_allocations WHERE id = ?");
+    const updateAllocation = db.prepare("UPDATE teaching_allocations SET assigned_group_count = ? WHERE id = ?");
     const insertAllocation = db.prepare("INSERT INTO teaching_allocations (id, course_id, teacher_id, assigned_group_count) VALUES (?, ?, ?, ?)");
-    for (const courseId of importedCourseIds) deleteCourseAllocations.run(courseId);
+
+    const desiredAllocationsByCourse = new Map<string, Map<string, number>>();
+    for (const allocation of allocations.values()) {
+      const courseId = courseIds.get(allocation.mod);
+      const teacherId = teacherIds.get(allocation.lecturer);
+      if (!courseId || !teacherId) continue;
+      const courseAllocations = desiredAllocationsByCourse.get(courseId) ?? new Map<string, number>();
+      courseAllocations.set(teacherId, allocation.groupCount);
+      desiredAllocationsByCourse.set(courseId, courseAllocations);
+    }
+    for (const courseId of importedCourseIds) {
+      const desiredAllocations = desiredAllocationsByCourse.get(courseId) ?? new Map<string, number>();
+      const existingAllocations = listCourseAllocations.all(courseId) as Array<{ id: string; teacher_id: string; assigned_group_count: number }>;
+      const existingByTeacher = new Map(existingAllocations.map((allocation) => [allocation.teacher_id, allocation]));
+      for (const existing of existingAllocations) {
+        const desiredCount = desiredAllocations.get(existing.teacher_id);
+        if (desiredCount === undefined) {
+          deleteAllocation.run(existing.id);
+          if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
+        } else if (desiredCount !== existing.assigned_group_count) {
+          updateAllocation.run(desiredCount, existing.id);
+          if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
+        }
+      }
+      for (const [teacherId, desiredCount] of desiredAllocations) {
+        if (!existingByTeacher.has(teacherId)) {
+          insertAllocation.run(crypto.randomUUID(), courseId, teacherId, desiredCount);
+          if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
+        }
+      }
+    }
 
     // 每门课程建立按 Excel 顺序展开的教师清单，例如 A 教 2 班、B 教 1 班会得到 [A, A, B]。
     // 它只自动维护仍带 allocation_teacher_id 的班次；老师手工改过的班次来源标记已被清空。
@@ -3212,7 +3808,6 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       const courseId = courseIds.get(allocation.mod);
       const teacherId = teacherIds.get(allocation.lecturer);
       if (!courseId || !teacherId) continue;
-      insertAllocation.run(crypto.randomUUID(), courseId, teacherId, allocation.groupCount);
       const desiredTeachers = desiredTeachersByCourse.get(courseId) ?? [];
       for (let group = 0; group < allocation.groupCount; group += 1) {
         desiredTeachers.push(teacherId);
@@ -3247,6 +3842,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
             throw new TeachingAllocationImportConflictError(`${teacherNameById.get(desiredTeacherId) ?? "The allocated teacher"} is inactive. Activate this teacher before assigning new sections through Teaching allocation.`);
           }
           insertSection.run(crypto.randomUUID(), courseId, sequence, desiredTeacherId, desiredTeacherId);
+          if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
         } else if (existingSection.allocation_teacher_id !== null && (existingSection.teacher_id !== desiredTeacherId || existingSection.allocation_teacher_id !== desiredTeacherId)) {
           // 同一个停用教师已经属于该班次时可 grandfather 并保持稳定 ID；只有实际改派到停用教师才属于被禁止的新分配。
           if (existingSection.teacher_id !== desiredTeacherId && !teacherActiveById.get(desiredTeacherId)) {
@@ -3254,6 +3850,7 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
           }
           // 自动维护的教师真的变化时提高班次 revision，使已经打开的 Sections 表单不能用旧资料覆盖导入结果。
           updateImportedSection.run(desiredTeacherId, desiredTeacherId, existingSection.id);
+          if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
         }
       }
 
@@ -3261,24 +3858,44 @@ export function importTeachingMembers(rows: TeachingMembersImportRow[], ignoredZ
       // 老师必须先在 Sections 页面明确清空这些资料，避免一次上传静默毁掉手工作业。
       const extraSections = existingSections.filter((section) => section.sequence > desiredTeachers.length).sort((left, right) => right.sequence - left.sequence);
       for (const section of extraSections) {
-        const hasProtectedTeacher = section.teacher_id !== null && section.allocation_teacher_id === null;
+        // 只有完全空白的手工尾班（两者皆 null）或教师仍等于导入来源的自动班可以删除。
+        // teacher/source 任何不一致都表示人工修改或旧资料异常，必须交给老师先复核。
+        const hasProtectedTeacher = section.teacher_id !== section.allocation_teacher_id;
         if (section.has_student_groups || hasProtectedTeacher) {
           const label = `${courseCode}_${String(section.sequence).padStart(2, "0")}`;
           throw new TeachingAllocationImportConflictError(`Teaching allocation cannot reduce ${courseCode} because ${label} has a manually maintained teacher or student group. Clear that section first, then import again.`);
         }
         deleteSection.run(section.id);
+        if (existingCourseIds.has(courseId)) changedExistingCourseIds.add(courseId);
       }
     }
+    // 一个课程在同一次导入中可能同时改变 Catalog、allocation、班次数量和自动教师。
+    // Set 把这些变化合并为恰好一次 revision +1；纯同表重导不会执行任何 UPDATE。
+    for (const courseId of changedExistingCourseIds) {
+      const bumped = bumpCourseRevision.run(courseId);
+      if (bumped.changes !== 1) throw new Error("An imported course disappeared before its revision could be updated.");
+    }
+    // 教师类型可能影响其他未参与本次导入的已排课程警告，因此在同一事务最后统一重算一次。
+    if (teacherWarningsNeedRefresh) refreshAllScheduleWarnings(db);
+    return courseIds.size;
   });
   // 导入会同时读取教师状态并写入教师、课程和班次；IMMEDIATE 让停用操作与导入形成清楚的先后次序。
-  transaction.immediate();
+  let importedCourseCount: number;
+  try {
+    importedCourseCount = transaction.immediate();
+  } catch (error) {
+    if (error instanceof TeachingAllocationImportInputError || error instanceof TeachingAllocationImportConflictError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 
   // 返回精简的审计摘要，供上传完成提示显示导入了多少教师、课程、分配和班次。
   return {
-    courses: courses.size,
+    courses: importedCourseCount,
     teachers: teachers.size,
     allocations: allocations.size,
     sections: [...allocations.values()].reduce((total, allocation) => total + allocation.groupCount, 0),
-    ignoredZeroRows,
+    zeroAllocationRows,
+    ignoredZeroRows: zeroAllocationRows,
   };
 }
