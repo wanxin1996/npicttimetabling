@@ -535,17 +535,24 @@ export default function Home() {
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
   const [currentCycle, setCurrentCycle] = useState<CycleStatus | null>(null);
-  const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready">("checking");
+  const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready" | "load-error">("checking");
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
   // ref 会在同一个事件循环内立即挡住重复 Enter／双击，state 则把按钮显示为进行中。
   // 首次 setup 若发出两次请求，第二个 409 不应盖掉第一笔已经成功的登录结果。
   const authenticationRequestInFlight = useRef(false);
   const [authenticationSubmitting, setAuthenticationSubmitting] = useState(false);
   const [accounts, setAccounts] = useState<AppUser[]>([]);
+  // 完整恢复会覆盖管理员打开页面后发生的任何业务修改，因此页面先保存服务端给出的
+  // 当前资料指纹，提交时再由数据库在写锁内核对。这个值只作并发确认，不显示给用户。
+  const [systemRestoreCurrentToken, setSystemRestoreCurrentToken] = useState<string | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [importing, setImporting] = useState(false);
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
+  // 资料维护动作共用一把即时锁。ref 在第一次点击的同一事件循环内生效，state
+  // 负责停用画面按钮和导航；只用 state 会让快速双击有机会送出两笔写入请求。
+  const managementMutationKeyRef = useRef<string | null>(null);
+  const [managementMutationKey, setManagementMutationKey] = useState<string | null>(null);
   const [notice, setNoticeMessage] = useState("Loading the local scheduling database...");
   const [noticeTone, setNoticeTone] = useState<NoticeTone>("info");
   // 序号与文案分开保存；即使老师连续两次遇到完全相同的错误，每次调用仍会增加序号、重新显示提示并重启八秒计时器。
@@ -566,6 +573,31 @@ export default function Home() {
     setNoticeTone(tone);
     setShowNoticeToast(true);
     setNoticeRequestNumber((current) => current + 1);
+  }
+
+  function beginManagementMutation(key: string) {
+    // 不同资料页也共享同一个数据库；上一笔写入尚未确认时，不允许导航或另一笔
+    // 写入并行开始，否则后完成的旧刷新可能覆盖较新的画面和提示。
+    if (managementMutationKeyRef.current || lessonMutationIdRef.current || placingSessionKeyRef.current || savingCourseSetupIdRef.current || savingSectionIdRef.current) {
+      setNotice("Another change is still being saved. Wait for it to finish before trying again.", "warning");
+      return false;
+    }
+    // 让已经发出的五秒轮询立即过期，并阻止当前恢复确认继续使用旧资料指纹。
+    // 即使写入最终被服务端拒绝，重新审阅一次也比误覆盖他人资料更安全。
+    visibleWorkspaceRefreshNumber.current += 1;
+    activeManualTimetableRefreshNumber.current = null;
+    setSystemRestoreCurrentToken(null);
+    managementMutationKeyRef.current = key;
+    setManagementMutationKey(key);
+    return true;
+  }
+
+  function finishManagementMutation(key: string) {
+    // finally 可能在页面状态已经变化后运行；只有仍持有同一把锁的请求可以释放它，
+    // 避免迟到的旧请求意外解锁一笔较新的操作。
+    if (managementMutationKeyRef.current !== key) return;
+    managementMutationKeyRef.current = null;
+    setManagementMutationKey(null);
   }
 
   useEffect(() => {
@@ -688,17 +720,68 @@ export default function Home() {
   // Inspector 只要仍有一张编辑表单，就要求老师先明确 Close／Save／Return，再离开
   // 年级或打开另一张课；这既保护已标记 stale 的草稿，也避免普通未保存选择被拖动
   // 或导航静默清除。真正保存期间还会冻结所有相关入口直到请求完成。
-  const workspaceNavigationLocked = editingLesson !== null || lessonMutation !== null || placingSessionKey !== null || savingCourseSetupId !== null;
+  const workspaceNavigationLocked = editingLesson !== null || lessonMutation !== null || placingSessionKey !== null || savingCourseSetupId !== null || managementMutationKey !== null;
+
+  function setActiveView(nextView: View) {
+    // 恢复指纹只对管理员实际审阅的 Accounts 页面有效。任何导航离开都会同步
+    // 清除它；重新进入时必须向服务端取得新指纹，不能跨页面长期保留旧确认。
+    if (nextView !== "Accounts") setSystemRestoreCurrentToken(null);
+    setView(nextView);
+  }
+
+  function clearSessionBoundWorkspace() {
+    // React 在登录画面出现时不会卸载这个组件。退出、会话过期或完整恢复后必须显式
+    // 清除管理员账号清单、恢复指纹和上一个账号读取的业务资料；否则下一位普通排课
+    // 账号登录后会先看到旧 Accounts 页面或旧课表，直到后台刷新才被替换。
+    visibleWorkspaceRefreshNumber.current += 1;
+    activeManualTimetableRefreshNumber.current = null;
+    setCurrentUser(null);
+    setAccounts([]);
+    setSystemRestoreCurrentToken(null);
+    setTeachers([]);
+    setGroups([]);
+    setRooms([]);
+    setCourses([]);
+    setEditingTeacher(null);
+    setEditingGroup(null);
+    setEditingRoom(null);
+    setEditingCourse(null);
+    setSelectedCourse(null);
+    setSections([]);
+    setAllocationVariances([]);
+    setLessons([]);
+    setUnscheduledSections([]);
+    editingLessonRef.current = null;
+    setEditingLesson(null);
+    setLessonDraftIsStale(false);
+    setPlacingSection(null);
+    setCandidateSection(null);
+    setCandidateSlots([]);
+    setPersonalOwnerId("");
+    setPersonalLessons([]);
+    setUnavailableWindows([]);
+    setScheduleIssues([]);
+    setRuleSettings([]);
+    setCurrentCycle(null);
+    setShowForm(false);
+    setShowTimetableInspector(false);
+    setShowUnscheduledDrawer(true);
+    setView("Year timetables");
+  }
 
   function openView(nextView: View) {
     // 切换资料页面时清除上一页专用的编辑对象、筛选和课程详情，防止旧状态被错误带到新的表格。
-    if (editingLessonRef.current || lessonMutationIdRef.current || placingSessionKeyRef.current || savingCourseSetupIdRef.current) {
+    if (editingLessonRef.current || lessonMutationIdRef.current || placingSessionKeyRef.current || savingCourseSetupIdRef.current || managementMutationKeyRef.current) {
       setNotice(editingLessonRef.current
         ? "Close or save the open Inspector lesson before leaving this workspace."
         : "A save is still in progress. Wait for it to finish before leaving this workspace.", "warning");
       return;
     }
-    setView(nextView);
+    // 同步导航也要废弃此前已发出的 Rules／Cycle／Accounts／Personal 读取；否则它们
+    // 迟到后会把用户拉回旧页面并应用旧资料。
+    visibleWorkspaceRefreshNumber.current += 1;
+    activeManualTimetableRefreshNumber.current = null;
+    setActiveView(nextView);
     setQuery("");
     setShowForm(false);
     setEditingTeacher(null);
@@ -753,7 +836,7 @@ export default function Home() {
       setScheduleIssues(workspace.issues);
       setTeachers(workspace.teachers);
       setRooms(workspace.rooms);
-      setView("Year timetables");
+      setActiveView("Year timetables");
       setShowForm(false);
       // 普通换年级会关闭旧编辑器；并发冲突则传入课程 ID，在同一批最新资料中
       // 重新找到它并打开，老师不用再到总表里寻找刚才那张卡。
@@ -870,17 +953,23 @@ export default function Home() {
   async function openScheduleIssue(issue: ScheduleIssue) {
     // 从问题清单打开课程前重新读取该年级的一致工作区，确保编辑器使用最新 revision，
     // 并且总表与待排区来自同一 SQLite 快照，不会覆盖另一位老师刚保存的修改。
-    if (lessonMutationIdRef.current || placingSessionKeyRef.current) {
-      setNotice("A timetable update is still in progress. Wait for it to finish before opening another issue.", "warning");
+    if (lessonMutationIdRef.current || placingSessionKeyRef.current || managementMutationKeyRef.current) {
+      setNotice(managementMutationKeyRef.current
+        ? "A data change is still being saved. Wait for it to finish before opening another issue."
+        : "A timetable update is still in progress. Wait for it to finish before opening another issue.", "warning");
       return;
     }
     // 复用主动刷新流程，让它提高 generation 并暂时挡住后台轮询。否则 Rules 页上一批
     // 已经在途的五秒请求可能晚于本次点击返回，再把旧问题资料写回新打开的年级页面。
+    const requestNumber = visibleWorkspaceRefreshNumber.current + 1;
     const timetableResult = await openTimetable(issue.primaryYear, undefined, {
       id: issue.lessonId,
       sectionId: issue.sectionId,
       occurrence: issue.occurrence,
     });
+    // openTimetable 会同步领取上面的号码；等待期间若导航或写入又提高 generation，
+    // 这次旧点击不得再写提示、打开 Inspector 或覆盖后来操作的焦点。
+    if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
     if (!timetableResult.loaded) return setNotice("The lesson linked to this issue could not be loaded.", "error");
 
     const linkedLesson = timetableResult.reopenedLesson;
@@ -896,7 +985,7 @@ export default function Home() {
     // 从问题清单进入编辑时，先收起左侧待排抽屉，给右侧 Inspector 和五天总表留下足够空间。
     setShowUnscheduledDrawer(false);
     setShowTimetableInspector(true);
-    setView("Year timetables");
+    setActiveView("Year timetables");
     setShowForm(false);
     setNotice(`${issue.sectionLabel} opened from the issue list.`, "info");
 
@@ -904,54 +993,94 @@ export default function Home() {
     requestAnimationFrame(() => document.getElementById("lesson-editor")?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" }));
   }
 
+  async function fetchRulesWorkspace() {
+    // 三份规则资料必须作为一个完整批次读取。三个接口并不承诺数据库级同一快照；
+    // 这里只保证全部 HTTP 响应和 JSON 都可用后才一起更新画面，避免半套资料被应用。
+    const [rulesResponse, issuesResponse, settingsResponse] = await Promise.all([
+      fetch("/api/unavailability"),
+      fetch("/api/issues"),
+      fetch("/api/rule-settings"),
+    ]);
+    if (!rulesResponse.ok || !issuesResponse.ok || !settingsResponse.ok) throw new Error("Rules workspace request failed.");
+    const [nextWindows, nextIssues, nextSettings] = await Promise.all([
+      rulesResponse.json() as Promise<UnavailableWindow[]>,
+      issuesResponse.json() as Promise<ScheduleIssue[]>,
+      settingsResponse.json() as Promise<RuleSetting[]>,
+    ]);
+    return { nextWindows, nextIssues, nextSettings };
+  }
+
+  async function refreshRulesWorkspace() {
+    const { nextWindows, nextIssues, nextSettings } = await fetchRulesWorkspace();
+    setUnavailableWindows(nextWindows);
+    setScheduleIssues(nextIssues);
+    setRuleSettings(nextSettings);
+  }
+
   async function openRules() {
-    // 同时读取不可用时段、最新问题和可开关规则；规则改变后重新打开本页即可看到所有受影响课程的重新计算结果。
-    if (lessonMutationIdRef.current || placingSessionKeyRef.current) {
-      setNotice("A timetable update is still in progress. Wait for it to finish before leaving the Inspector.", "warning");
-      return;
+    // 同时读取不可用时段、最新问题和可开关规则；只有完整读取成功才进入本页。
+    if (lessonMutationIdRef.current || placingSessionKeyRef.current || managementMutationKeyRef.current) {
+      setNotice(managementMutationKeyRef.current
+        ? "A save is still in progress. Wait for it to finish before opening the rules workspace."
+        : "A timetable update is still in progress. Wait for it to finish before leaving the Inspector.", "warning");
+      return false;
     }
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
     try {
-      const [rulesResponse, issuesResponse, settingsResponse] = await Promise.all([
-        fetch("/api/unavailability"),
-        fetch("/api/issues"),
-        fetch("/api/rule-settings"),
-      ]);
-      if (!rulesResponse.ok || !issuesResponse.ok || !settingsResponse.ok) {
-        setNotice("Rules and timetable issues could not be loaded. Check the connection and try again.", "error");
-        return;
-      }
-      // 三份正文全部解析成功后才切换页面，避免损坏响应造成“半张规则页”。
-      const [nextWindows, nextIssues, nextSettings] = await Promise.all([
-        rulesResponse.json() as Promise<UnavailableWindow[]>,
-        issuesResponse.json() as Promise<ScheduleIssue[]>,
-        settingsResponse.json() as Promise<RuleSetting[]>,
-      ]);
-      setUnavailableWindows(nextWindows);
-      setScheduleIssues(nextIssues);
-      setRuleSettings(nextSettings);
-      setView("Rules & issues");
+      const workspace = await fetchRulesWorkspace();
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
+      setUnavailableWindows(workspace.nextWindows);
+      setScheduleIssues(workspace.nextIssues);
+      setRuleSettings(workspace.nextSettings);
+      setActiveView("Rules & issues");
       setShowForm(false);
+      return true;
     } catch {
       // 断网时保留老师当前页面和资料，不留下未处理的 Promise，也不误显示空白规则页。
-      setNotice("Rules and timetable issues could not be loaded. Check the connection and try again.", "error");
+      if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+        setNotice("Rules and timetable issues could not be loaded. Check the connection and try again.", "error");
+      }
+      return false;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
     }
   }
 
   async function openCycle() {
     // 新周期工具每年只使用两次，而且包含清空资料的高风险操作，因此只在进入专用页面时加载，不能与日常排课共用快捷入口。
+    if (lessonMutationIdRef.current || placingSessionKeyRef.current || managementMutationKeyRef.current) {
+      setNotice("A change is still in progress. Wait for it to finish before opening cycle recovery.", "warning");
+      return false;
+    }
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
     try {
       const response = await fetch("/api/cycle");
       if (!response.ok) {
-        setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
-        return;
+        if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+          setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
+        }
+        return false;
       }
       const nextCycle = await response.json() as CycleStatus;
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
       setCurrentCycle(nextCycle);
-      setView("Cycle");
+      setActiveView("Cycle");
       setShowForm(false);
+      return true;
     } catch {
       // 新周期属于高风险页面；读取失败时继续停留原页面，绝不能显示过期或不完整的清空状态。
-      setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
+      if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+        setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
+      }
+      return false;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
     }
   }
 
@@ -969,21 +1098,36 @@ export default function Home() {
       setNotice(`Add at least one ${missingOwner} before opening a personal timetable.`, "warning");
       return;
     }
+    if (lessonMutationIdRef.current || placingSessionKeyRef.current || managementMutationKeyRef.current) {
+      setNotice("A change is still in progress. Wait for it to finish before opening a personal timetable.", "warning");
+      return;
+    }
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
     try {
       const response = await fetch(`/api/schedule/personal?kind=${kind}&ownerId=${encodeURIComponent(ownerId)}`);
       if (!response.ok) {
-        setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
+        if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+          setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
+        }
         return;
       }
       const nextPersonalLessons = await response.json() as ScheduledLesson[];
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
       // 只有新课表完整到达后才更新选择器和页面，失败时保留老师仍可阅读的上一版画面。
       setPersonalKind(kind);
       setPersonalOwnerId(ownerId);
       setPersonalLessons(nextPersonalLessons);
-      setView("Personal timetables");
+      setActiveView("Personal timetables");
       setShowForm(false);
     } catch {
-      setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
+      if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+        setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
+      }
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
     }
   }
 
@@ -1340,28 +1484,95 @@ export default function Home() {
     // 在等待服务器前保存真实表单元素；React 事件回调暂停后会把 event.currentTarget 清空，但这个独立引用仍可安全重置表单。
     const form = event.currentTarget;
     const data = new FormData(form);
-    const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Unavailable time could not be saved.", "error");
-    form.reset();
-    await openRules();
-    setNotice(`${kind} unavailable time saved.`, "success");
+    const mutationKey = `rule-window-add:${kind}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Unavailable time could not be saved.", "error");
+        return;
+      }
+      committed = true;
+      form.reset();
+      try {
+        await refreshRulesWorkspace();
+        setNotice(`${kind} unavailable time saved.`, "success");
+      } catch {
+        // POST 已提交但清单不可信时，继续启用同一表单会让老师重复新增相同限制。
+        // 进入不可编辑画面，要求完整刷新后再写。
+        setAuthScreen("load-error");
+        setNotice(`${kind} unavailable time was saved, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      }
+    } catch {
+      setAuthScreen("load-error");
+      setNotice(committed
+        ? `${kind} unavailable time was saved, but its latest result could not be loaded. Refresh before continuing.`
+        : "The unavailable-time request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function removeUnavailableWindow(window: UnavailableWindow) {
     // 删除不可用时段会立即影响之后的排课检查；已有课程的 warning 会在重新打开或编辑时根据最新规则刷新。
-    const response = await fetch(`/api/unavailability?id=${window.id}&kind=${window.kind}`, { method: "DELETE" });
-    if (!response.ok) return setNotice("Unavailable time could not be removed.", "error");
-    await openRules();
-    setNotice(`${window.ownerLabel} unavailable time removed.`, "success");
+    const mutationKey = `rule-window-remove:${window.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch(`/api/unavailability?id=${window.id}&kind=${window.kind}`, { method: "DELETE" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Unavailable time could not be removed.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await refreshRulesWorkspace();
+        setNotice(`${window.ownerLabel} unavailable time removed.`, "success");
+      } catch {
+        setAuthScreen("load-error");
+        setNotice(`${window.ownerLabel} unavailable time was removed, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      }
+    } catch {
+      setAuthScreen("load-error");
+      setNotice(committed
+        ? "The unavailable time was removed, but the latest rules page could not be loaded. Refresh before continuing."
+        : "The remove request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function toggleRuleSetting(rule: RuleSetting) {
     // 每次只保存一个规则开关，随后重新载入本页；服务端会用新政策重新计算全部问题，让开关影响立即可见。
-    const response = await fetch("/api/rule-settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: rule.key, enabled: !rule.enabled }) });
-    if (!response.ok) return setNotice("The rule setting could not be changed.", "error");
-    await openRules();
-    setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`, "success");
+    const mutationKey = `rule-setting:${rule.key}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch("/api/rule-settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: rule.key, enabled: !rule.enabled }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "The rule setting could not be changed.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await refreshRulesWorkspace();
+        setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`, "success");
+      } catch {
+        setAuthScreen("load-error");
+        setNotice(`${rule.label} was ${rule.enabled ? "disabled" : "enabled"}, but the latest rules and issues could not be loaded. Refresh before making another change.`, "warning");
+      }
+    } catch {
+      setAuthScreen("load-error");
+      setNotice(committed
+        ? `${rule.label} was changed, but the latest rules page could not be loaded. Refresh before continuing.`
+        : "The rule-setting request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   function toggleForm() {
@@ -1393,18 +1604,35 @@ export default function Home() {
 
   useEffect(() => {
     // 页面启动时先检查登录状态，再请求受保护的业务资料；未登录浏览器不会先下载教师或课程数据。
-    void fetch("/api/auth/status").then(async (response) => {
-      // BUSY 503 和未知500都不能被当成“没有用户”而误显示登录表单；交给下方 catch
-      // 保持检查状态并提示刷新，避免老师误以为账号或会话已经消失。
-      if (!response.ok) throw new Error("Authentication status is temporarily unavailable.");
-      const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
-      if (status.setupRequired) return setAuthScreen("setup");
-      if (!status.user) return setAuthScreen("login");
-      setCurrentUser(status.user);
-      setAuthScreen("ready");
-      await loadData();
-      setNotice("Local data is saved and ready for scheduling setup.", "success");
-    }).catch(() => setNotice("Unable to check authentication. Please refresh and try again.", "error")).finally(() => setIsLoading(false));
+    void (async () => {
+      try {
+        const response = await fetch("/api/auth/status");
+        // BUSY 503 和未知500都不能被当成“没有用户”而误显示登录表单。
+        if (!response.ok) throw new Error("Authentication status is temporarily unavailable.");
+        const status = await response.json() as { setupRequired: boolean; user: AppUser | null };
+        if (status.setupRequired) {
+          setAuthScreen("setup");
+          return;
+        }
+        if (!status.user) {
+          setAuthScreen("login");
+          return;
+        }
+
+        // 必须先完整取得四张基础清单，之后才开放可编辑工作区。若这里先设 ready，
+        // 首次读取失败会把真正有资料的数据库伪装成四张可编辑空表。
+        await loadData();
+        setCurrentUser(status.user);
+        setAuthScreen("ready");
+        setNotice("Local data is saved and ready for scheduling setup.", "success");
+      } catch {
+        setCurrentUser(null);
+        setAuthScreen("load-error");
+        setNotice("The secure session or scheduling data could not be loaded. Refresh before making changes.", "error");
+      } finally {
+        setIsLoading(false);
+      }
+    })();
   }, [loadData]);
 
   useEffect(() => {
@@ -1416,7 +1644,7 @@ export default function Home() {
       // 轮询只请求当前可见的年级表、个人表或规则页，既保持多浏览器同步，也避免反复下载无关资料表。
       // 显式换年级或保存后重载期间直接跳过本次 tick；不能先领取更大号码再返回，
       // 否则一个没有实际请求的后台轮询也会把老师主动刷新误判成旧响应。
-      if (activeManualTimetableRefreshNumber.current !== null) return;
+      if (activeManualTimetableRefreshNumber.current !== null || managementMutationKeyRef.current !== null) return;
       const pollableView = view === "Year timetables"
         || (view === "Personal timetables" && Boolean(personalOwnerId))
         || view === "Rules & issues";
@@ -1435,7 +1663,7 @@ export default function Home() {
       }
       if (!active || responses.length === 0) return;
       if (responses.some((response) => response.status === 401)) {
-        setCurrentUser(null);
+        clearSessionBoundWorkspace();
         setAuthScreen("login");
         return setNotice("Your session expired. Please sign in again.", "error");
       }
@@ -1507,23 +1735,69 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
       });
-      const body = await response.json().catch(() => ({})) as { error?: string; user?: AppUser };
-      if (!response.ok || !body.user) {
-        setNotice(body.error ?? "Authentication failed. Try again.", "error");
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Authentication failed. Check the details and try again.", "error");
         return;
       }
-      setCurrentUser(body.user);
-      setAuthScreen("ready");
+
+      // HTTP 2xx 已表示 setup／login 事务被服务端接受。若正文在传输途中损坏，不能
+      // 把已经建立的管理员或会话误报成失败并鼓励重复提交；改由受保护 status 端点
+      // 核实 Cookie。核实仍失败时进入不可编辑画面，要求刷新，而不是继续显示表单。
+      let authenticatedUser: AppUser | null = null;
+      const body = await response.json().catch(() => null) as { user?: AppUser } | null;
+      if (body?.user && typeof body.user.username === "string") authenticatedUser = body.user;
+      if (!authenticatedUser) {
+        try {
+          const statusResponse = await fetch("/api/auth/status", { cache: "no-store" });
+          if (!statusResponse.ok) throw new Error("Authentication status was unavailable.");
+          const status = await statusResponse.json() as { user?: AppUser | null };
+          if (!status.user || typeof status.user.username !== "string") throw new Error("The new session was not confirmed.");
+          authenticatedUser = status.user;
+        } catch {
+          setCurrentUser(null);
+          setAuthScreen("load-error");
+          setNotice("The server accepted the credentials, but the new session could not be confirmed. Refresh before trying again.", "warning");
+          return;
+        }
+      }
       try {
+        // 登录接口成功只代表会话已建立；基础资料全部读取成功后才开放编辑页面，
+        // 否则断网会让真实数据库看起来像一套可修改的空资料。
         await loadData();
-        setNotice(`Signed in as ${body.user.username}.`, "success");
+        setCurrentUser(authenticatedUser);
+        setAuthScreen("ready");
+        setNotice(`Signed in as ${authenticatedUser.username}.`, "success");
       } catch {
-        // 会话已经建立时不能再说“登录失败”；保留已登录状态并明确要求刷新资料。
+        // 会话已经建立时不能再说“登录失败”；错误画面保留刷新入口，但绝不渲染空资料表。
+        setCurrentUser(null);
+        setAuthScreen("load-error");
         setNotice("Signed in, but scheduling data could not be loaded. Refresh before making changes.", "warning");
       }
     } catch {
-      // 断网或服务器没有返回可用结果时保留表单和输入，让老师可以直接重试。
-      setNotice("Authentication could not reach the server. Check the connection and try again.", "error");
+      // 请求本身抛错时，服务器仍可能已经建立首位管理员或登录会话，只是响应头没有
+      // 到达浏览器。先尝试核实现有 Cookie；无法核实时冻结表单并要求刷新，绝不能
+      // 用“try again”鼓励重复 setup／login 写入。
+      try {
+        const statusResponse = await fetch("/api/auth/status", { cache: "no-store" });
+        if (!statusResponse.ok) throw new Error("Authentication status was unavailable.");
+        const status = await statusResponse.json() as { user?: AppUser | null };
+        if (!status.user || typeof status.user.username !== "string") throw new Error("No confirmed session is available.");
+        try {
+          await loadData();
+          setCurrentUser(status.user);
+          setAuthScreen("ready");
+          setNotice(`Signed in as ${status.user.username}. The original response was interrupted, but the session was confirmed.`, "warning");
+        } catch {
+          setCurrentUser(null);
+          setAuthScreen("load-error");
+          setNotice("A session was established, but scheduling data could not be loaded. Refresh before making changes.", "warning");
+        }
+      } catch {
+        setCurrentUser(null);
+        setAuthScreen("load-error");
+        setNotice("The authentication result could not be confirmed. Refresh the page to check the current setup or session before trying again.", "warning");
+      }
     } finally {
       authenticationRequestInFlight.current = false;
       setAuthenticationSubmitting(false);
@@ -1539,7 +1813,7 @@ export default function Home() {
         setNotice(body.error ?? "Sign out could not be completed. Try again.", "error");
         return;
       }
-      setCurrentUser(null);
+      clearSessionBoundWorkspace();
       setAuthScreen("login");
       setNotice("Signed out.", "success");
     } catch {
@@ -1549,12 +1823,70 @@ export default function Home() {
   }
 
   async function openAccounts() {
-    // 只有管理员进入账号页时才读取账号清单，日常排课请求不会附带其他用户名，减少不必要的账号资料暴露。
+    // 只有管理员进入账号页时才读取账号清单和恢复指纹。先取得指纹、再读取清单：
+    // 若两次读取之间有人写入，提交恢复时旧指纹必然得到409，而不会把未审阅的新资料覆盖。
+    if (managementMutationKeyRef.current || lessonMutationIdRef.current || placingSessionKeyRef.current || savingCourseSetupIdRef.current || savingSectionIdRef.current) {
+      setNotice("A change is still in progress. Wait for it to finish before opening Accounts.", "warning");
+      return false;
+    }
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
+    setSystemRestoreCurrentToken(null);
+    try {
+      const statusResponse = await fetch("/api/system-backup/status", { cache: "no-store" });
+      if (!statusResponse.ok) {
+        if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+          const body = await statusResponse.json().catch(() => ({})) as { error?: string };
+          setNotice(body.error ?? "The current system data could not be reviewed for restore.", "error");
+        }
+        return false;
+      }
+      const status = await statusResponse.json() as { currentToken?: string };
+      if (typeof status.currentToken !== "string" || !/^[0-9a-f]{64}$/.test(status.currentToken)) {
+        throw new Error("The restore status response was invalid.");
+      }
+
+      const accountsResponse = await fetch("/api/auth/accounts", { cache: "no-store" });
+      if (!accountsResponse.ok) {
+        if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+          const body = await accountsResponse.json().catch(() => ({})) as { error?: string };
+          setNotice(body.error ?? "Only the administrator can manage accounts.", "error");
+        }
+        return false;
+      }
+      const nextAccounts = await accountsResponse.json() as AppUser[];
+      if (!Array.isArray(nextAccounts)) throw new Error("The accounts response was invalid.");
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
+
+      setAccounts(nextAccounts);
+      setSystemRestoreCurrentToken(status.currentToken);
+      setActiveView("Accounts");
+      setShowForm(false);
+      return true;
+    } catch {
+      // 两份资料只有全部读取和解析成功后才应用；断网时保留原页面，也绝不启用
+      // 缺少状态确认的破坏性恢复表单。
+      if (requestNumber === visibleWorkspaceRefreshNumber.current) {
+        setSystemRestoreCurrentToken(null);
+        setNotice("Accounts and restore status could not be loaded. Check the connection and try again.", "error");
+      }
+      return false;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
+    }
+  }
+
+  async function refreshAccountsAfterMutation() {
+    // 账号写入已确认后只刷新清单，不再次执行页面导航，也不在 helper 内写提示；
+    // 调用方才能准确区分“写入失败”和“已写入但清单刷新失败”。
     const response = await fetch("/api/auth/accounts");
-    if (!response.ok) return setNotice("Only the administrator can manage accounts.", "error");
-    setAccounts(await response.json());
-    setView("Accounts");
-    setShowForm(false);
+    if (!response.ok) throw new Error("Accounts could not be refreshed.");
+    setAccounts(await response.json() as AppUser[]);
+    // 账号本身属于完整恢复会覆盖的系统状态；任何账号写入后，旧恢复指纹即使仍在
+    // React state 中也不能继续使用。管理员需重新进入本页审阅并取得新指纹。
+    setSystemRestoreCurrentToken(null);
   }
 
   async function createAccount(event: FormEvent<HTMLFormElement>) {
@@ -1563,32 +1895,87 @@ export default function Home() {
     // 请求前保存表单元素，避免异步响应回来后读取已被 React 清空的事件目标，导致账号其实已创建但页面误报错误。
     const form = event.currentTarget;
     const data = new FormData(form);
-    const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: String(data.get("username") ?? ""), password: String(data.get("password") ?? "") }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Account could not be created.", "error");
-    form.reset();
-    await openAccounts();
-    setNotice(`${body.username} account created.`, "success");
+    const username = String(data.get("username") ?? "");
+    const mutationKey = "account-create";
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password: String(data.get("password") ?? "") }) });
+      const body = await response.json().catch(() => ({})) as { error?: string; username?: string };
+      if (!response.ok) {
+        setNotice(body.error ?? "Account could not be created.", "error");
+        return;
+      }
+      committed = true;
+      form.reset();
+      try {
+        await refreshAccountsAfterMutation();
+        setNotice(`${body.username ?? username} account created.`, "success");
+      } catch {
+        setNotice(`${body.username ?? username} account was created, but the latest account list could not be loaded. Refresh before making another change.`, "warning");
+      }
+    } catch {
+      setNotice(committed
+        ? "The account was created, but its latest details could not be loaded. Refresh before continuing."
+        : "The create-account request was interrupted, so its result is unknown. Refresh the account list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     // 密码修改成功后撤销该账号的所有浏览器会话，包括当前页面，确保旧密码建立的会话不能继续使用。
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    const response = await fetch("/api/auth/password", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currentPassword: String(data.get("currentPassword") ?? ""), newPassword: String(data.get("newPassword") ?? "") }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Password could not be changed.", "error");
-    setCurrentUser(null);
-    setAuthScreen("login");
-    setNotice("Password changed. Sign in again with the new password.", "success");
+    const mutationKey = "password-change";
+    if (!beginManagementMutation(mutationKey)) return;
+    try {
+      const response = await fetch("/api/auth/password", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currentPassword: String(data.get("currentPassword") ?? ""), newPassword: String(data.get("newPassword") ?? "") }) });
+      const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        setNotice(body.error ?? "Password could not be changed.", "error");
+        return;
+      }
+      clearSessionBoundWorkspace();
+      setAuthScreen("login");
+      setNotice("Password changed. Sign in again with the new password.", "success");
+    } catch {
+      // 响应中断时密码可能已经提交且所有会话可能已经撤销。回到登录页比继续显示
+      // 受保护资料更安全；老师可先尝试新密码，再决定是否需要重试。
+      clearSessionBoundWorkspace();
+      setAuthScreen("login");
+      setNotice("The password-change result is unknown because the response was interrupted. Try signing in with the new password before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function changeAccountStatus(account: AppUser) {
     // 停用账号会保留记录和审计关联，但阻止之后登录；保存后立即刷新清单，让管理员确认最新状态。
-    const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive }) });
-    if (!response.ok) return setNotice("Account status could not be changed.", "error");
-    await openAccounts();
-    setNotice(`${account.username} ${account.isActive ? "deactivated" : "activated"}.`, "success");
+    const mutationKey = `account-status:${account.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Account status could not be changed.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await refreshAccountsAfterMutation();
+        setNotice(`${account.username} ${account.isActive ? "deactivated" : "activated"}.`, "success");
+      } catch {
+        setNotice(`${account.username} was ${account.isActive ? "deactivated" : "activated"}, but the latest account list could not be loaded. Refresh before making another change.`, "warning");
+      }
+    } catch {
+      setNotice(committed
+        ? `${account.username} status changed, but the latest account list could not be loaded. Refresh before continuing.`
+        : "The account-status request was interrupted, so its result is unknown. Refresh the account list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function resetAccountPassword(event: FormEvent<HTMLFormElement>) {
@@ -1597,11 +1984,22 @@ export default function Home() {
     // 先保存提交表单本身，因为 React 的事件目标只在同步回调期间可靠；服务器响应后使用稳定引用清空密码框。
     const form = event.currentTarget;
     const data = new FormData(form);
-    const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Password could not be reset.", "error");
-    form.reset();
-    setNotice("Password reset. Existing sessions for that account were signed out.", "success");
+    const mutationKey = "account-password-reset";
+    if (!beginManagementMutation(mutationKey)) return;
+    try {
+      const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });
+      const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        setNotice(body.error ?? "Password could not be reset.", "error");
+        return;
+      }
+      form.reset();
+      setNotice("Password reset. Existing sessions for that account were signed out.", "success");
+    } catch {
+      setNotice("The password-reset response was interrupted, so its result is unknown. Ask the scheduler to try the new password before resetting it again.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function downloadSystemBackup() {
@@ -1637,28 +2035,66 @@ export default function Home() {
   }
 
   async function restoreSystemBackup(event: FormEvent<HTMLFormElement>) {
-    // 浏览器用 FormData 原样上传所选文件和确认项；服务端会独立重复检查所有确认、文件结构和数据库完整性，不能信任前端结果。
+    // 浏览器提交所选文件、确认项和进入 Accounts 页面时取得的资料指纹；服务端会在
+    // 写锁内独立复核所有内容，不能信任前端判断或在提交前偷偷刷新成用户未审阅的新指纹。
     event.preventDefault();
     const form = event.currentTarget;
+    const expectedCurrentToken = systemRestoreCurrentToken;
+    if (!expectedCurrentToken) {
+      setNotice("Restore review is stale or unavailable. Leave and reopen Accounts before choosing a backup.", "warning");
+      return;
+    }
+    const mutationKey = "system-restore";
+    if (!beginManagementMutation(mutationKey)) return;
     const formData = new FormData(form);
+    // beginManagementMutation 会立即让 React state 中的旧指纹失效；这里使用事件开始时
+    // 捕获的稳定值完成本次已确认请求，后续点击则必须重新打开 Accounts。
+    formData.set("expectedCurrentToken", expectedCurrentToken);
     setRestoringBackup(true);
     setNotice("Validating the backup and saving the current system state...", "info");
     try {
       const response = await fetch("/api/system-backup", { method: "POST", body: formData });
-      const body = await response.json();
-      if (!response.ok) return setNotice(body.error ?? "The full system backup could not be restored.", "error");
+      const body = await response.json().catch(() => ({})) as { error?: string; code?: string; safetyBackupFilename?: string };
+      if (!response.ok) {
+        if (response.status === 409 && body.code === "SYSTEM_STATE_CHANGED") {
+          // 另一账号在管理员审阅后又提交了资料。清掉文件和确认项，强制重新查看
+          // 当前状态；绝不能只换一个隐藏 token 后自动重试破坏性操作。
+          form.reset();
+          setSystemRestoreCurrentToken(null);
+          setNotice(body.error ?? "Current system data changed. Nothing was restored; reopen Accounts and review the latest data.", "warning");
+          return;
+        }
+        if (response.status === 401 || response.status === 403 || response.status >= 500) {
+          // 身份错误或通用服务器故障不能证明恢复没有到达提交边界。和断网结果未知
+          // 采用相同安全姿态：清掉旧工作区、回到登录页，再检查实际资料。只凭 HTTP
+          // 503 无法区分应用的数据库锁和平台网关故障，因此也不能安全留在旧画面。
+          form.reset();
+          clearSessionBoundWorkspace();
+          setAuthScreen("login");
+          setNotice(body.error ?? "The restore result could not be confirmed. Sign in again and verify the current system.", "warning");
+          return;
+        }
+        setNotice(body.error ?? "The full system backup could not be restored.", "error");
+        return;
+      }
 
       // 完整恢复成功后当前会话已被删除，而且备份中的账号已取代在线账号；页面必须立即返回登录画面。
       form.reset();
-      setCurrentUser(null);
-      setAccounts([]);
+      clearSessionBoundWorkspace();
       setAuthScreen("login");
-      setNotice(`Full system restored. All sessions were signed out. Server safety copy: ${body.safetyBackupFilename}.`, "success");
+      setNotice(body.safetyBackupFilename
+        ? `Full system restored. All sessions were signed out. Server safety copy: ${body.safetyBackupFilename}.`
+        : "The restore was accepted and all sessions were signed out. Sign in and verify the restored system.", body.safetyBackupFilename ? "success" : "warning");
     } catch {
-      // 网络中断不能推断恢复成功或失败；提示老师重新登录检查实际资料，再决定是否需要再次恢复。
+      // 网络中断不能推断恢复成功或失败。立即关闭可编辑工作区并清除确认，要求重新
+      // 登录检查实际资料后再决定下一步，不能保留旧画面并鼓励盲目重试。
+      form.reset();
+      clearSessionBoundWorkspace();
+      setAuthScreen("login");
       setNotice("The restore response was interrupted. Sign in again and verify the current system before retrying.", "warning");
     } finally {
       setRestoringBackup(false);
+      finishManagementMutation(mutationKey);
     }
   }
 
@@ -1669,19 +2105,48 @@ export default function Home() {
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.", "warning");
+    const mutationKey = "cycle-start";
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
     // 把老师打开页面时看到的周期指纹交给服务器；若另一账号已经修改课程，
     // 服务器会要求刷新复核，而不是把老师没有确认过的新资料直接清空。
-    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? ""), currentToken: currentCycle?.currentToken ?? "" }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "A new cycle could not be started.", "error");
-    setCurrentCycle(body);
-    setLessons([]);
-    setUnscheduledSections([]);
-    setSelectedCourse(null);
-    setSections([]);
-    await loadData();
-    form.reset();
-    setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.", "success");
+    try {
+      const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? ""), currentToken: currentCycle?.currentToken ?? "" }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "A new cycle could not be started.", "error");
+        return;
+      }
+      // HTTP 2xx 已明确表示清空事务提交；从这里开始即使读取正文或刷新失败，
+      // 提示也只能说“已提交但未能刷新”，不能诱导老师重复清空。
+      committed = true;
+      const body = await response.json() as CycleStatus;
+      setCurrentCycle(body);
+      setLessons([]);
+      setUnscheduledSections([]);
+      setSelectedCourse(null);
+      setSections([]);
+      form.reset();
+      try {
+        await loadData();
+        setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.", "success");
+      } catch {
+        // 清空已经提交后，旧课程清单不再可信。切到不可编辑错误画面，防止老师在
+        // 重新载入前继续操作已从数据库删除的记录。
+        setAuthScreen("load-error");
+        setNotice("The new cycle was started, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+      }
+    } catch {
+      if (committed) setCurrentCycle(null);
+      // 连接中断时无法判断清空事务是否已经提交；保留可编辑旧画面会比要求刷新更
+      // 危险，因此无论是否已读到2xx都先冻结工作区。
+      setAuthScreen("load-error");
+      setNotice(committed
+        ? "The new cycle was started, but its latest status could not be loaded. Refresh before continuing."
+        : "The new-cycle response was interrupted, so the result is unknown. Refresh the cycle status before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function restoreCycle(event: FormEvent<HTMLFormElement>) {
@@ -1691,40 +2156,96 @@ export default function Home() {
     const form = event.currentTarget;
     const data = new FormData(form);
     if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.", "warning");
+    const mutationKey = "cycle-restore";
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
     // 同时提交页面显示的备份 ID 与当前周期指纹，防止多人操作时恢复了另一份新备份，
     // 或覆盖另一位老师在本页面打开后刚保存的课程工作。
-    const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? ""), backupId: currentCycle?.backup?.id ?? "", currentToken: currentCycle?.currentToken ?? "" }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "The emergency backup could not be restored.", "error");
-    setCurrentCycle(body);
-    await loadData();
-    form.reset();
-    setNotice("The last emergency cycle backup was restored.", "success");
+    try {
+      const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? ""), backupId: currentCycle?.backup?.id ?? "", currentToken: currentCycle?.currentToken ?? "" }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "The emergency backup could not be restored.", "error");
+        return;
+      }
+      committed = true;
+      const body = await response.json() as CycleStatus;
+      setCurrentCycle(body);
+      form.reset();
+      try {
+        await loadData();
+        setNotice("The last emergency cycle backup was restored.", "success");
+      } catch {
+        // 恢复会替换整套课程资料；刷新失败时隐藏旧可编辑清单，直到完整页面重载。
+        setAuthScreen("load-error");
+        setNotice("The emergency cycle backup was restored, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+      }
+    } catch {
+      if (committed) setCurrentCycle(null);
+      setAuthScreen("load-error");
+      setNotice(committed
+        ? "The emergency cycle backup was restored, but its latest status could not be loaded. Refresh before continuing."
+        : "The restore response was interrupted, so the result is unknown. Refresh the cycle status before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function toggleTeacher(teacher: Teacher) {
     // 教师只切换启用状态而不删除记录，保护历史排课和分配关联；停用后不再出现在新的选择清单。
     const isActive = teacher.status !== "Active";
-    const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
-    if (!response.ok) return setNotice("Teacher status could not be updated.", "error");
+    const mutationKey = `teacher-status:${teacher.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
     try {
-      await loadData();
-      setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}.`, "success");
+      const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Teacher status could not be updated.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await loadData();
+        setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}.`, "success");
+      } catch {
+        setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`, "warning");
+      }
     } catch {
-      setNotice("Teacher status changed but the latest data could not be loaded.", "warning");
+      setNotice(committed
+        ? "Teacher status changed, but the latest data could not be loaded. Refresh before continuing."
+        : "The teacher-status response was interrupted, so the result is unknown. Refresh the teacher list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
     }
   }
 
   async function toggleRoom(room: Room) {
     // 教室采用相同的非破坏性停用方式，保留历史课程使用记录，同时阻止新的排课继续选择它。
     const isActive = room.status !== "Active";
-    const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
-    if (!response.ok) return setNotice("Room status could not be updated.", "error");
+    const mutationKey = `room-status:${room.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
     try {
-      await loadData();
-      setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}.`, "success");
+      const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "Room status could not be updated.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await loadData();
+        setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}.`, "success");
+      } catch {
+        setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`, "warning");
+      }
     } catch {
-      setNotice("Room status changed but the latest data could not be loaded.", "warning");
+      setNotice(committed
+        ? "Room status changed, but the latest data could not be loaded. Refresh before continuing."
+        : "The room-status response was interrupted, so the result is unknown. Refresh the room list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
     }
   }
 
@@ -1765,24 +2286,36 @@ export default function Home() {
       payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")) };
     }
 
+    const viewAtSubmit = view;
+    const mutationKey = `master-record:${viewAtSubmit}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
     // 浏览器先统一大小写和数字格式再发送；数据库约束与服务端验证仍是最终防线，不能只依赖表单。
-    const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    if (!response.ok) {
-      const body = await response.json();
-      setNotice(body.error ?? "This record could not be saved.", "error");
-      return;
-    }
-
-    form.reset();
-    setShowForm(false);
-    setEditingTeacher(null);
-    setEditingGroup(null);
-    setEditingRoom(null);
     try {
-      await loadData();
-      setNotice(`${view.slice(0, -1)} saved to the local database.`, "success");
+      const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        setNotice(body.error ?? "This record could not be saved.", "error");
+        return;
+      }
+      committed = true;
+      form.reset();
+      setShowForm(false);
+      setEditingTeacher(null);
+      setEditingGroup(null);
+      setEditingRoom(null);
+      try {
+        await loadData();
+        setNotice(`${viewAtSubmit.slice(0, -1)} saved to the local database.`, "success");
+      } catch {
+        setNotice("The record was saved, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+      }
     } catch {
-      setNotice("Record was saved but the latest data could not be loaded.", "warning");
+      setNotice(committed
+        ? "The record was saved, but the latest data could not be loaded. Refresh before continuing."
+        : "The save response was interrupted, so the result is unknown. Refresh this list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
     }
   }
 
@@ -1794,18 +2327,36 @@ export default function Home() {
     const formData = new FormData(form);
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.", "warning");
+    const mutationKey = "teaching-members-import";
+    if (!beginManagementMutation(mutationKey)) return;
     setImporting(true);
+    let committed = false;
     // 工作表名称、表头、每行内容和全部分配由服务端校验，并在一个事务中更新，失败时不会留下半份导入资料。
-    const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
-    const body = await response.json();
-    setImporting(false);
-    if (!response.ok) return setNotice(body.error ?? "Teaching allocation import failed.", "error");
-    form.reset();
     try {
-      await loadData();
-      setNotice(`Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${body.ignoredZeroRows} zero-allocation rows were ignored.`, "success");
+      const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
+      const body = await response.json().catch(() => ({})) as { error?: string; courses?: number; teachers?: number; sections?: number; ignoredZeroRows?: number };
+      if (!response.ok) {
+        setNotice(body.error ?? "Teaching allocation import failed.", "error");
+        return;
+      }
+      committed = true;
+      form.reset();
+      try {
+        await loadData();
+        const summary = [body.courses, body.teachers, body.sections, body.ignoredZeroRows].every((value) => typeof value === "number")
+          ? `Imported ${body.courses} courses, ${body.teachers} teachers and ${body.sections} pre-assigned sections. ${body.ignoredZeroRows} zero-allocation rows were ignored.`
+          : "Teaching allocation import completed.";
+        setNotice(summary, "success");
+      } catch {
+        setNotice("Teaching allocation import completed, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+      }
     } catch {
-      setNotice("Import completed, but the latest data could not be loaded.", "warning");
+      setNotice(committed
+        ? "Teaching allocation import completed, but its latest result could not be loaded. Refresh before continuing."
+        : "The import response was interrupted, so the result is unknown. Refresh the course and teacher lists before retrying.", "warning");
+    } finally {
+      setImporting(false);
+      finishManagementMutation(mutationKey);
     }
   }
 
@@ -1815,35 +2366,79 @@ export default function Home() {
     // 调用接口前保存表单节点，使成功后的重置不依赖已经失效的 React 事件对象。
     const form = event.currentTarget;
     const data = new FormData(form);
-    const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: String(data.get("code") ?? ""), catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Manual course could not be created.", "error");
-    form.reset();
-    setShowForm(false);
-    await loadData();
-    setNotice(`${body.code} and ${body.configuredSections} unassigned sections created.`, "success");
+    const submittedCode = String(data.get("code") ?? "").trim().toUpperCase();
+    const mutationKey = "manual-course-create";
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: submittedCode, catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
+      const body = await response.json().catch(() => ({})) as { error?: string; code?: string; configuredSections?: number };
+      if (!response.ok) {
+        setNotice(body.error ?? "Manual course could not be created.", "error");
+        return;
+      }
+      committed = true;
+      form.reset();
+      setShowForm(false);
+      try {
+        await loadData();
+        const createdSummary = typeof body.configuredSections === "number"
+          ? `${body.code ?? submittedCode} and ${body.configuredSections} unassigned sections created.`
+          : `${body.code ?? submittedCode} and its unassigned sections were created.`;
+        setNotice(createdSummary, "success");
+      } catch {
+        setNotice(`${body.code ?? submittedCode} was created, but the latest course list could not be loaded. Refresh before continuing.`, "warning");
+      }
+    } catch {
+      setNotice(committed
+        ? `${submittedCode || "The course"} was created, but its latest details could not be loaded. Refresh before continuing.`
+        : "The create-course response was interrupted, so the result is unknown. Refresh the course list before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function changeSectionCount(event: FormEvent<HTMLFormElement>) {
     // 减少班次数量时只删除编号最高的班次；即使尚未排课也是有意义的课程资料，因此提交前要求明确确认。
     event.preventDefault();
     if (!selectedCourse) return;
+    const courseAtSubmit = selectedCourse;
     const data = new FormData(event.currentTarget);
     const sectionCount = Number(data.get("sectionCount"));
-    if (sectionCount < sections.length && !window.confirm(`Remove ${sections.length - sectionCount} highest-numbered unscheduled section(s) from ${selectedCourse.code}?`)) return;
-    const response = await fetch(`/api/courses/${selectedCourse.id}/sections`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionCount }) });
-    const body = await response.json();
-    if (!response.ok) return setNotice(body.error ?? "Section count could not be changed.", "error");
-    await loadData();
-    await openSections(selectedCourse);
-    setNotice(`${selectedCourse.code} now has ${sectionCount} sections.`, "success");
+    if (sectionCount < sections.length && !window.confirm(`Remove ${sections.length - sectionCount} highest-numbered unscheduled section(s) from ${courseAtSubmit.code}?`)) return;
+    const mutationKey = `section-count:${courseAtSubmit.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    let committed = false;
+    try {
+      const response = await fetch(`/api/courses/${courseAtSubmit.id}/sections`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sectionCount }) });
+      const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        setNotice(body.error ?? "Section count could not be changed.", "error");
+        return;
+      }
+      committed = true;
+      try {
+        await loadData();
+        const sectionsLoaded = await openSections(courseAtSubmit, false);
+        if (!sectionsLoaded) throw new Error("Sections could not be refreshed.");
+        setNotice(`${courseAtSubmit.code} now has ${sectionCount} sections.`, "success");
+      } catch {
+        setNotice(`${courseAtSubmit.code} section count was changed, but the latest course details could not be loaded. Refresh before changing it again.`, "warning");
+      }
+    } catch {
+      setNotice(committed
+        ? `${courseAtSubmit.code} section count was changed, but its latest details could not be loaded. Refresh before continuing.`
+        : "The section-count response was interrupted, so the result is unknown. Refresh the course sections before retrying.", "warning");
+    } finally {
+      finishManagementMutation(mutationKey);
+    }
   }
 
   async function saveCourseSetup(event: FormEvent<HTMLFormElement>) {
     // 课程清单每次只打开一门课的设置，避免老师同时面对 52 门课程的大量必填规则。
     event.preventDefault();
     if (!editingCourse) return;
-    if (savingCourseSetupIdRef.current) {
+    if (savingCourseSetupIdRef.current || managementMutationKeyRef.current) {
       setNotice("A course setup is already being saved. Wait for it to finish.", "warning");
       return;
     }
@@ -1853,6 +2448,7 @@ export default function Home() {
     savingCourseSetupIdRef.current = courseAtSubmit.id;
     setSavingCourseSetupId(courseAtSubmit.id);
     const data = new FormData(event.currentTarget);
+    let committed = false;
     try {
       const response = await fetch(`/api/courses/${courseAtSubmit.id}`, {
         method: "PATCH",
@@ -1874,7 +2470,8 @@ export default function Home() {
           weekEnd: data.get("weekEnd") ? Number(data.get("weekEnd")) : null,
         }),
       });
-      const body = await response.json();
+      committed = response.ok;
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
         if (response.status === 409 && body.code === "COURSE_SETUP_CHANGED") {
           // 旧表单已经不可信，关闭它并重新载入课程清单；老师再次点 Configure 时
@@ -1910,33 +2507,56 @@ export default function Home() {
       restoreCourseConfigureFocus(courseAtSubmit.id, true);
       setNotice(`${courseAtSubmit.code} setup saved. Its generated sections will use these requirements.`, "success");
     } catch {
-      setNotice("Course setup could not be saved. Check the connection and try again.", "error");
+      if (committed) {
+        setShowForm(false);
+        setEditingCourse(null);
+        restoreCourseConfigureFocus(courseAtSubmit.id, false);
+      }
+      setNotice(committed
+        ? `${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`
+        : "The course-setup response was interrupted, so the result is unknown. Refresh the course list before retrying.", "warning");
     } finally {
       savingCourseSetupIdRef.current = null;
       setSavingCourseSetupId(null);
     }
   }
 
-  async function openSections(course: Course) {
+  async function openSections(course: Course, showFailureNotice = true) {
     // 只有点击 Sections 时才读取班次明细和教师分配差异，让最初的 52 门课程清单保持简洁且加载快速。
-    const [sectionsResponse, allocationResponse] = await Promise.all([fetch(`/api/courses/${course.id}/sections`), fetch(`/api/courses/${course.id}/allocation`)]);
-    if (!sectionsResponse.ok || !allocationResponse.ok) return setNotice("Course sections could not be loaded.", "error");
-    setSections(await sectionsResponse.json());
-    setAllocationVariances(await allocationResponse.json());
-    setSelectedCourse(course);
-    setShowForm(false);
-    setEditingCourse(null);
+    try {
+      const [sectionsResponse, allocationResponse] = await Promise.all([fetch(`/api/courses/${course.id}/sections`), fetch(`/api/courses/${course.id}/allocation`)]);
+      if (!sectionsResponse.ok || !allocationResponse.ok) throw new Error("Course sections request failed.");
+      const [nextSections, nextVariances] = await Promise.all([
+        sectionsResponse.json() as Promise<CourseSection[]>,
+        allocationResponse.json() as Promise<AllocationVariance[]>,
+      ]);
+      setSections(nextSections);
+      setAllocationVariances(nextVariances);
+      setSelectedCourse(course);
+      setShowForm(false);
+      setEditingCourse(null);
+      return true;
+    } catch {
+      if (showFailureNotice) setNotice("Course sections could not be loaded. Check the connection and try again.", "error");
+      return false;
+    }
   }
 
   async function saveSection(event: FormEvent<HTMLFormElement>, section: CourseSection) {
     // 勾选的学生班级会成为该班次之后所有学生冲突、每日时数和个人课表检查的范围；
     // revision 让服务器确认老师保存的正是当前看到的这一版资料。
     event.preventDefault();
-    if (savingSectionIdRef.current) return;
+    if (savingSectionIdRef.current) {
+      setNotice("A section assignment is already being saved. Wait for it to finish.", "warning");
+      return;
+    }
+    const mutationKey = `section-assignment:${section.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
     savingSectionIdRef.current = section.id;
     setSavingSectionId(section.id);
     const data = new FormData(event.currentTarget);
     const courseAtStart = selectedCourse;
+    let committed = false;
     try {
       const response = await fetch(`/api/course-sections/${section.id}`, {
         method: "PATCH",
@@ -1947,23 +2567,37 @@ export default function Home() {
           revision: section.revision,
         }),
       });
-      const body = await response.json() as { error?: string; allocationVariances?: AllocationVariance[] };
+      const body = await response.json().catch(() => ({})) as { error?: string; allocationVariances?: AllocationVariance[] };
       if (!response.ok) {
         // 409 表示另一位老师已经先保存；强制重新读取并用 revision 作为 form key，
         // 让非受控下拉框和复选框也立刻显示最新资料，而不是继续保留旧选择。
-        if (response.status === 409 && courseAtStart) await openSections(courseAtStart);
-        setNotice(body.error ?? "Section could not be saved.", "error");
+        const latestLoaded = response.status === 409 && courseAtStart ? await openSections(courseAtStart, false) : true;
+        setNotice(latestLoaded
+          ? body.error ?? "Section could not be saved."
+          : `${body.error ?? "Section changed in another session."} The latest section details could not be loaded; refresh before editing again.`, "error");
         return;
       }
-      if (courseAtStart) await openSections(courseAtStart);
+      committed = true;
+      const latestLoaded = courseAtStart ? await openSections(courseAtStart, false) : true;
+      if (!latestLoaded) {
+        setNotice(`${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before editing it again.`, "warning");
+        return;
+      }
+      if (!Array.isArray(body.allocationVariances)) {
+        setNotice(`${section.label} assignment was saved and reloaded, but the allocation summary was missing from the response. Refresh before relying on the mismatch count.`, "warning");
+        return;
+      }
       const mismatchCount = body.allocationVariances?.length ?? 0;
       setNotice(mismatchCount ? `${section.label} saved. Teaching allocation now has ${mismatchCount} teacher count mismatch${mismatchCount === 1 ? "" : "es"}.` : `${section.label} assignment saved and matches the Teaching Members counts.`, mismatchCount ? "warning" : "success");
     } catch {
-      // 网络断开时必须解除 Saving 状态并告诉老师资料尚未确认，不能让按钮永久卡住。
-      setNotice("The section could not be saved because the connection was interrupted. Check the network and try again.", "error");
+      // 请求中断时不能断言数据库没有写入；先刷新本班次确认实际 revision，再决定是否重试。
+      setNotice(committed
+        ? `${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before continuing.`
+        : "The section-save response was interrupted, so the result is unknown. Refresh the section before retrying.", "warning");
     } finally {
       savingSectionIdRef.current = null;
       setSavingSectionId(null);
+      finishManagementMutation(mutationKey);
     }
   }
 
@@ -2015,6 +2649,12 @@ export default function Home() {
           </div>
           {authScreen === "checking" ? (
             <p className="text-sm text-slate-500">Checking secure session...</p>
+          ) : authScreen === "load-error" ? (
+            <div>
+              <h1 className="text-2xl font-black">Workspace unavailable</h1>
+              <p className="mt-2 text-sm leading-6 text-slate-500">The secure session or scheduling data could not be loaded. No editable empty workspace has been opened.</p>
+              <button onClick={() => window.location.reload()} className="mt-5 w-full rounded-xl bg-[#153d75] px-4 py-3 font-bold text-white" type="button">Refresh and try again</button>
+            </div>
           ) : (
             <form onSubmit={submitAuthentication}>
               <h1 className="text-2xl font-black">{authScreen === "setup" ? "Create the administrator" : "Sign in"}</h1>
@@ -2125,7 +2765,7 @@ export default function Home() {
           </div>
 
           <div className="ml-auto flex shrink-0 items-center gap-2 md:ml-0">
-            <button disabled={workspaceNavigationLocked} onClick={() => setView("Profile")} className="max-w-24 truncate text-sm font-bold text-slate-700 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">{currentUser?.username}</button>
+            <button disabled={workspaceNavigationLocked} onClick={() => openView("Profile")} className="max-w-24 truncate text-sm font-bold text-slate-700 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">{currentUser?.username}</button>
             <button disabled={workspaceNavigationLocked} onClick={() => void logout()} className="rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-semibold text-slate-600 disabled:cursor-wait disabled:opacity-50" type="button">Sign out</button>
           </div>
         </div>
@@ -2144,7 +2784,7 @@ export default function Home() {
             {isDataManagementView && (
               <button
                 onClick={toggleForm}
-                disabled={savingCourseSetupId !== null}
+                disabled={savingCourseSetupId !== null || managementMutationKey !== null}
                 className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f] disabled:cursor-wait disabled:opacity-60"
                 type="button"
               >
@@ -2630,7 +3270,7 @@ export default function Home() {
                       <div className="mb-2 flex items-center justify-between">
                         <p className="text-sm font-black text-slate-950">Year {timetableYear} issues</p>
                         <button
-                          disabled={lessonMutation !== null || placingSessionKey !== null}
+                          disabled={lessonMutation !== null || placingSessionKey !== null || managementMutationKey !== null}
                           onClick={() => void openRules()}
                           className="text-xs font-bold text-blue-700 disabled:cursor-wait disabled:opacity-50"
                           type="button"
@@ -2645,7 +3285,7 @@ export default function Home() {
                           {visibleYearIssues.map((issue) => (
                             <button
                               key={issue.id}
-                              disabled={lessonMutation !== null || placingSessionKey !== null}
+                              disabled={lessonMutation !== null || placingSessionKey !== null || managementMutationKey !== null}
                               onClick={() => void openScheduleIssue(issue)}
                               className="rounded-xl border border-slate-200 p-2.5 text-left text-xs hover:border-blue-300 hover:bg-blue-50 disabled:cursor-wait disabled:opacity-50"
                               type="button"
@@ -2686,7 +3326,7 @@ export default function Home() {
                   <label className="flex items-start gap-2"><input name="understandBackup" type="checkbox" className="mt-1" /><span>I understand that only the latest emergency snapshot is retained.</span></label>
                   <label className="font-semibold">Type START NEW CYCLE<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal" /></label>
                 </div>
-                <button disabled={currentCycle.courses === 0} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50" type="submit">Back up and start new cycle</button>
+                <button disabled={currentCycle.courses === 0 || managementMutationKey !== null} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-50" type="submit">{managementMutationKey === "cycle-start" ? "Starting new cycle..." : "Back up and start new cycle"}</button>
               </form>
               <form onSubmit={restoreCycle} className="rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
                 <p className="font-black text-amber-950">Restore latest emergency backup</p>
@@ -2705,7 +3345,7 @@ export default function Home() {
                         <input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-amber-200 bg-white px-3 py-2 font-normal" />
                       </label>
                     </div>
-                    <button className="mt-4 rounded-xl bg-amber-700 px-4 py-2.5 text-sm font-bold text-white" type="submit">Restore emergency backup</button>
+                    <button disabled={managementMutationKey !== null} className="mt-4 rounded-xl bg-amber-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-50" type="submit">{managementMutationKey === "cycle-restore" ? "Restoring..." : "Restore emergency backup"}</button>
                   </>
                 ) : (
                   <p className="mt-3 text-sm text-slate-500">No emergency cycle backup is available yet.</p>
@@ -2728,11 +3368,11 @@ export default function Home() {
                   <input name="newPassword" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" />
                 </label>
               </div>
-              <button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Change password</button>
+              <button disabled={managementMutationKey !== null} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "password-change" ? "Changing password..." : "Change password"}</button>
             </form>
           )}
 
-          {view === "Accounts" && (
+          {view === "Accounts" && currentUser?.isAdmin && (
             /* 完整备份和恢复包含密码哈希、全部账号和部门排课资料，因此只放在管理员受限页面。 */
             <div className="mb-6 grid gap-4 lg:grid-cols-[400px_1fr]">
               <div className="grid content-start gap-4">
@@ -2740,20 +3380,25 @@ export default function Home() {
                   <p className="font-black text-blue-950">Full system backup</p>
                   <p className="mt-1 text-xs leading-5 text-blue-800">Download a verified SQLite backup containing master data, rules, courses, timetables and accounts. Active login sessions are excluded.</p>
                   <p className="mt-3 text-xs font-semibold leading-5 text-amber-800">Keep this sensitive file in an access-controlled department folder.</p>
-                  <button onClick={() => void downloadSystemBackup()} disabled={downloadingBackup || restoringBackup} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="button">{downloadingBackup ? "Checking backup..." : "Download full backup"}</button>
+                  <button onClick={() => void downloadSystemBackup()} disabled={downloadingBackup || restoringBackup || managementMutationKey !== null} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="button">{downloadingBackup ? "Checking backup..." : "Download full backup"}</button>
                 </section>
 
                 <form onSubmit={restoreSystemBackup} className="rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
                   {/* 服务端恢复前会保存当前状态；旁边的下载再提供一份由管理员独立保管的系统外副本。 */}
                   <p className="font-black text-red-950">Restore full system backup</p>
                   <p className="mt-1 text-xs leading-5 text-red-800">The uploaded file replaces all current data and accounts. The server first retains an automatic safety copy of the current state.</p>
+                  {systemRestoreCurrentToken ? (
+                    <p className="mt-3 text-xs font-semibold leading-5 text-emerald-800">Current system state was reviewed when this Accounts page opened. Any later change will stop restore with no data replaced.</p>
+                  ) : (
+                    <p className="mt-3 text-xs font-semibold leading-5 text-red-800">Restore review is stale or unavailable. Leave and reopen Accounts to review the latest system state before selecting a backup.</p>
+                  )}
                   <div className="mt-4 grid gap-3 text-sm text-red-950">
-                    <label className="font-semibold">Verified .sqlite backup<input name="backupFile" required accept=".sqlite,application/vnd.sqlite3" type="file" className="mt-1 block w-full rounded-xl border border-red-200 bg-white p-2 text-xs font-normal" /></label>
-                    <label className="flex items-start gap-2"><input name="understandReplace" type="checkbox" className="mt-1" /><span>I understand that all current timetable data and accounts will be replaced.</span></label>
-                    <label className="flex items-start gap-2"><input name="understandSignOut" type="checkbox" className="mt-1" /><span>I understand that every browser will be signed out and I must use an account from the backup.</span></label>
-                    <label className="font-semibold">Type RESTORE FULL BACKUP<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal" /></label>
+                    <label className="font-semibold">Verified .sqlite backup<input disabled={!systemRestoreCurrentToken || managementMutationKey !== null} name="backupFile" required accept=".sqlite,application/vnd.sqlite3" type="file" className="mt-1 block w-full rounded-xl border border-red-200 bg-white p-2 text-xs font-normal disabled:cursor-not-allowed disabled:opacity-60" /></label>
+                    <label className="flex items-start gap-2"><input disabled={!systemRestoreCurrentToken || managementMutationKey !== null} name="understandReplace" type="checkbox" className="mt-1 disabled:cursor-not-allowed" /><span>I understand that all current timetable data and accounts will be replaced.</span></label>
+                    <label className="flex items-start gap-2"><input disabled={!systemRestoreCurrentToken || managementMutationKey !== null} name="understandSignOut" type="checkbox" className="mt-1 disabled:cursor-not-allowed" /><span>I understand that every browser will be signed out and I must use an account from the backup.</span></label>
+                    <label className="font-semibold">Type RESTORE FULL BACKUP<input disabled={!systemRestoreCurrentToken || managementMutationKey !== null} name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal disabled:cursor-not-allowed disabled:opacity-60" /></label>
                   </div>
-                  <button disabled={restoringBackup || downloadingBackup} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{restoringBackup ? "Validating and restoring..." : "Restore and sign out everyone"}</button>
+                  <button disabled={!systemRestoreCurrentToken || restoringBackup || downloadingBackup || managementMutationKey !== null} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{restoringBackup ? "Validating and restoring..." : "Restore and sign out everyone"}</button>
                 </form>
 
                 <form onSubmit={createAccount} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -2764,7 +3409,7 @@ export default function Home() {
                     <label className="text-sm font-semibold">Username<input name="username" required minLength={3} autoComplete="off" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label>
                     <label className="text-sm font-semibold">Temporary password<input name="password" required minLength={10} autoComplete="new-password" type="password" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 font-normal" /></label>
                   </div>
-                  <button className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white" type="submit">Create account</button>
+                  <button disabled={managementMutationKey !== null} className="mt-4 rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "account-create" ? "Creating account..." : "Create account"}</button>
                 </form>
 
                 <form onSubmit={resetAccountPassword} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -2774,7 +3419,7 @@ export default function Home() {
                     <select name="userId" required className="rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="">Choose scheduler</option>{accounts.filter((account) => !account.isAdmin).map((account) => <option key={account.id} value={account.id}>{account.username}</option>)}</select>
                     <input name="password" required minLength={10} placeholder="New temporary password" autoComplete="new-password" type="password" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" />
                   </div>
-                  <button className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800" type="submit">Reset and sign out account</button>
+                  <button disabled={managementMutationKey !== null} className="mt-4 rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-800 disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "account-password-reset" ? "Resetting password..." : "Reset and sign out account"}</button>
                 </form>
               </div>
 
@@ -2793,7 +3438,7 @@ export default function Home() {
                       <div className="flex items-center gap-2">
                         <Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>
                         {!account.isAdmin && (
-                          <button onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700" type="button">
+                          <button disabled={managementMutationKey !== null} onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">
                             {account.isActive ? "Deactivate" : "Activate"}
                           </button>
                         )}
@@ -2813,7 +3458,7 @@ export default function Home() {
                 {ruleSettings.map((rule) => (
                   <div key={rule.key} className="flex items-center justify-between gap-4 bg-white p-4">
                     <div><p className="text-sm font-bold text-slate-900">{rule.label}</p><p className="mt-1 text-xs text-slate-500">{rule.description}</p></div>
-                    <button onClick={() => void toggleRuleSetting(rule)} className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-bold ${rule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500"}`} type="button">{rule.enabled ? "Enabled" : "Disabled"}</button>
+                    <button disabled={managementMutationKey !== null} onClick={() => void toggleRuleSetting(rule)} className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-bold disabled:cursor-wait disabled:opacity-50 ${rule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500"}`} type="button">{managementMutationKey === `rule-setting:${rule.key}` ? "Saving..." : rule.enabled ? "Enabled" : "Disabled"}</button>
                   </div>
                 ))}
               </div>
@@ -2853,8 +3498,8 @@ export default function Home() {
                       {[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((hour) => <option key={hour} value={hour}>{hour}:00 end</option>)}
                     </select>
                   </div>
-                  <button className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">
-                    Add {kind.toLowerCase()} restriction
+                  <button disabled={managementMutationKey !== null} className="mt-3 rounded-lg bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">
+                    {managementMutationKey === `rule-window-add:${kind}` ? "Saving..." : `Add ${kind.toLowerCase()} restriction`}
                   </button>
                 </form>
               ))}
@@ -2871,7 +3516,7 @@ export default function Home() {
                           <span className="ml-3 font-bold">{window.ownerLabel}</span>
                           <span className="ml-3 text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][window.dayOfWeek - 1]} {window.startHour}:00–{window.endHour}:00</span>
                         </div>
-                        <button onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700" type="button">Remove</button>
+                        <button disabled={managementMutationKey !== null} onClick={() => void removeUnavailableWindow(window)} className="font-semibold text-red-700 disabled:cursor-wait disabled:opacity-50" type="button">{managementMutationKey === `rule-window-remove:${window.id}` ? "Removing..." : "Remove"}</button>
                       </div>
                     ))}
                   </div>
@@ -2894,7 +3539,7 @@ export default function Home() {
                       <div key={issue.id} className="grid gap-2 p-4 text-sm md:grid-cols-[110px_1fr_auto]">
                         <div><Pill tone={issue.severity === "High" ? "red" : issue.severity === "Warning" ? "amber" : "blue"}>{issue.severity}</Pill><p className="mt-2 text-xs font-semibold text-slate-500">{issue.category}</p></div>
                         <div><p className="font-black text-slate-950">{issue.sectionLabel} · Year {issue.primaryYear}</p><p className="mt-1 font-semibold text-slate-700">{issue.message}</p><p className="mt-1 text-xs text-slate-500">{issue.teacherName ?? "Teacher pending"} · {issue.studentGroups.join(", ") || "Student group pending"} · {issue.roomCode ?? "Room pending"}</p></div>
-                        <div className="text-right"><p className="text-xs font-semibold text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00–{String(issue.endHour).padStart(2, "0")}:00</p><button onClick={() => void openScheduleIssue(issue)} className="mt-2 rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-bold text-blue-700 hover:bg-blue-50" type="button">Open lesson</button></div>
+                        <div className="text-right"><p className="text-xs font-semibold text-slate-500">{["Mon", "Tue", "Wed", "Thu", "Fri"][issue.dayOfWeek - 1]} {String(issue.startHour).padStart(2, "0")}:00–{String(issue.endHour).padStart(2, "0")}:00</p><button disabled={managementMutationKey !== null} onClick={() => void openScheduleIssue(issue)} className="mt-2 rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-bold text-blue-700 hover:bg-blue-50 disabled:cursor-wait disabled:opacity-50" type="button">Open lesson</button></div>
                       </div>
                     ))}
                   </div>
@@ -2908,7 +3553,7 @@ export default function Home() {
             <div className="flex flex-col gap-4 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
                 {(["Teachers", "Student groups", "Rooms", "Courses"] as View[]).map((item) => (
-                  <button key={item} disabled={savingCourseSetupId !== null} onClick={() => openView(item)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition disabled:cursor-wait disabled:opacity-50 ${view === item ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`} type="button">{item}</button>
+                  <button key={item} disabled={savingCourseSetupId !== null || managementMutationKey !== null} onClick={() => openView(item)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition disabled:cursor-wait disabled:opacity-50 ${view === item ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`} type="button">{item}</button>
                 ))}
               </div>
               <label className="relative block sm:w-64"><span className="sr-only">Search data</span><input ref={view === "Courses" ? courseSearchInputRef : undefined} value={query} onChange={(event) => setQuery(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:bg-white" placeholder={`Search ${view.toLowerCase()}...`} /></label>
@@ -2922,7 +3567,7 @@ export default function Home() {
                   <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections; rows with 0 are ignored.</p>
                   <div className="flex flex-col gap-3">
                     <input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" />
-                    <button disabled={importing} className="w-fit rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">
+                    <button disabled={managementMutationKey !== null} className="w-fit rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">
                       {importing ? "Importing..." : "Import allocation"}
                     </button>
                   </div>
@@ -2934,7 +3579,7 @@ export default function Home() {
                     <input name="code" required placeholder="Mod" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
                     <input name="catalog" placeholder="Catalog (optional)" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
                     <input name="sectionCount" required min="1" max="999" type="number" placeholder="Sections" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm" />
-                    <button className="rounded-xl bg-blue-700 px-4 py-2 text-sm font-bold text-white" type="submit">Add</button>
+                    <button disabled={managementMutationKey !== null} className="rounded-xl bg-blue-700 px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "manual-course-create" ? "Adding..." : "Add"}</button>
                   </div>
                 </form>
               </div>
@@ -2948,11 +3593,11 @@ export default function Home() {
                 <div className="grid gap-3 md:grid-cols-4">
                   <label className="text-xs font-semibold text-slate-700">
                     Duration (hours)
-                    <input ref={courseDurationInputRef} name="durationHours" required min="2" max="4" defaultValue={editingCourse.durationHours ?? ""} disabled={savingCourseSetupId !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
+                    <input ref={courseDurationInputRef} name="durationHours" required min="2" max="4" defaultValue={editingCourse.durationHours ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
                   </label>
                   <label className="text-xs font-semibold text-slate-700">
                     Sessions/week
-                    <select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} disabled={savingCourseSetupId !== null} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
+                    <select name="sessionsPerWeek" defaultValue={editingCourse.sessionsPerWeek} disabled={savingCourseSetupId !== null || managementMutationKey !== null} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
                       <option value="1">1</option>
                       <option value="2">2</option>
                     </select>
@@ -2960,7 +3605,7 @@ export default function Home() {
                   <label className="text-xs font-semibold text-slate-700">
                     Primary year
                     {/* 已有排课必须始终属于一张年级总表；禁用空选项可在界面第一层防止课程被无意隐藏。 */}
-                    <select name="primaryYear" required={editingCourse.scheduledLessons > 0} defaultValue={editingCourse.primaryYear ?? ""} disabled={savingCourseSetupId !== null} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
+                    <select name="primaryYear" required={editingCourse.scheduledLessons > 0} defaultValue={editingCourse.primaryYear ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100">
                       <option value="" disabled={editingCourse.scheduledLessons > 0}>Choose later</option>
                       <option value="1">Year 1</option>
                       <option value="2">Year 2</option>
@@ -2970,24 +3615,24 @@ export default function Home() {
                   </label>
                   <label className="text-xs font-semibold text-slate-700">
                     Minimum capacity
-                    <input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} disabled={savingCourseSetupId !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
+                    <input name="minimumRoomCapacity" min="1" defaultValue={editingCourse.minimumRoomCapacity ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" />
                   </label>
                 </div>
                 {/* 起止周都留空表示每周上课；同时填写时支持 1–4、3–6、5–8 等包含两端的区间。 */}
                 <div className="mt-3 max-w-lg rounded-xl border border-emerald-100 bg-white/70 p-3">
                   <p className="text-xs font-bold text-slate-700">Teaching weeks</p>
                   <div className="mt-2 grid grid-cols-2 gap-3">
-                    <label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" defaultValue={editingCourse.weekStart ?? ""} disabled={savingCourseSetupId !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
-                    <label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" defaultValue={editingCourse.weekEnd ?? ""} disabled={savingCourseSetupId !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                    <label className="text-xs font-semibold text-slate-700">Start week<input name="weekStart" min="1" defaultValue={editingCourse.weekStart ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                    <label className="text-xs font-semibold text-slate-700">End week<input name="weekEnd" min="1" defaultValue={editingCourse.weekEnd ?? ""} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="number" placeholder="All weeks" className="mt-1 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
                   </div>
                   <p className="mt-2 text-xs text-emerald-800">Leave both blank for every week. Limited ranges include both the start and end week.</p>
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-700">
-                  <label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} disabled={savingCourseSetupId !== null} type="checkbox" /> Lab</label>
-                  <label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} disabled={savingCourseSetupId !== null} type="checkbox" /> Multi projector</label>
-                  <label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} disabled={savingCourseSetupId !== null} type="checkbox" /> Smart classroom</label>
-                  <label className="flex items-center gap-2"><input name="separateSectionsAcrossDays" defaultChecked={editingCourse.separateSectionsAcrossDays} disabled={savingCourseSetupId !== null} type="checkbox" /> Keep sections on different days</label>
-                  <button disabled={savingCourseSetupId !== null} className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">
+                  <label className="flex items-center gap-2"><input name="requiresLab" defaultChecked={editingCourse.requiresLab} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="checkbox" /> Lab</label>
+                  <label className="flex items-center gap-2"><input name="requiresMultiProjector" defaultChecked={editingCourse.requiresMultiProjector} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="checkbox" /> Multi projector</label>
+                  <label className="flex items-center gap-2"><input name="requiresSmartClassroom" defaultChecked={editingCourse.requiresSmartClassroom} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="checkbox" /> Smart classroom</label>
+                  <label className="flex items-center gap-2"><input name="separateSectionsAcrossDays" defaultChecked={editingCourse.separateSectionsAcrossDays} disabled={savingCourseSetupId !== null || managementMutationKey !== null} type="checkbox" /> Keep sections on different days</label>
+                  <button disabled={savingCourseSetupId !== null || managementMutationKey !== null} className="rounded-xl bg-emerald-700 px-4 py-2 font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">
                     {savingCourseSetupId === editingCourse.id ? "Saving..." : "Save course setup"}
                   </button>
                 </div>
@@ -3002,7 +3647,7 @@ export default function Home() {
                   <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]">
                     <input name="name" required defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="staffType" defaultValue={editingTeacher?.staffType ?? "FT"} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select>
-                    <button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingTeacher ? "Save changes" : "Save teacher"}</button>
+                    <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Teachers" ? "Saving..." : editingTeacher ? "Save changes" : "Save teacher"}</button>
                   </div>
                 )}
                 {view === "Student groups" && (
@@ -3010,7 +3655,7 @@ export default function Home() {
                     <input name="code" required defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="year" defaultValue={editingGroup?.year ?? 1} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select>
                     <input name="program" required defaultValue={editingGroup?.program} placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
-                    <button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingGroup ? "Save changes" : "Save group"}</button>
+                    <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Student groups" ? "Saving..." : editingGroup ? "Save changes" : "Save group"}</button>
                   </div>
                 )}
                 {view === "Rooms" && (
@@ -3021,7 +3666,7 @@ export default function Home() {
                     <label className="flex items-center gap-2 text-sm"><input name="lab" defaultChecked={editingRoom?.features.includes("Lab")} type="checkbox" /> Lab</label>
                     <label className="flex items-center gap-2 text-sm"><input name="projector" defaultChecked={editingRoom?.features.includes("Multi projector")} type="checkbox" /> Projector</label>
                     <label className="flex items-center gap-2 text-sm"><input name="smart" defaultChecked={editingRoom?.features.includes("Smart classroom")} type="checkbox" /> Smart</label>
-                    <button className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white" type="submit">{editingRoom ? "Save changes" : "Save room"}</button>
+                    <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Rooms" ? "Saving..." : editingRoom ? "Save changes" : "Save room"}</button>
                   </div>
                 )}
               </form>
@@ -3039,7 +3684,7 @@ export default function Home() {
                       <td className="px-5 py-4"><Pill tone={teacher.staffType === "PT" ? "amber" : "blue"}>{teacher.staffType}</Pill></td>
                       <td className="px-5 py-4 text-slate-600">{teacher.sections}</td>
                       <td className="px-5 py-4"><Pill tone={teacher.status === "Active" ? "green" : "slate"}>{teacher.status}</Pill></td>
-                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => { setEditingTeacher(teacher); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button><button onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{teacher.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
+                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button disabled={managementMutationKey !== null} onClick={() => { setEditingTeacher(teacher); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button><button disabled={managementMutationKey !== null} onClick={() => toggleTeacher(teacher)} className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50" type="button">{managementMutationKey === `teacher-status:${teacher.id}` ? "Saving..." : teacher.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3050,7 +3695,7 @@ export default function Home() {
                   <tbody>{filteredGroups.map((group) => (
                     <tr className="border-t border-slate-100" key={group.id}>
                       <td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td>
-                      <td className="px-5 py-4 text-right"><button onClick={() => { setEditingGroup(group); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button></td>
+                      <td className="px-5 py-4 text-right"><button disabled={managementMutationKey !== null} onClick={() => { setEditingGroup(group); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button></td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3063,7 +3708,7 @@ export default function Home() {
                       <td className="px-5 py-4 font-semibold text-slate-800">{room.code}</td><td className="px-5 py-4 text-slate-600">{room.capacity}</td>
                       <td className="px-5 py-4"><div className="flex flex-wrap gap-1.5">{room.features.length ? room.features.map((feature) => <Pill key={feature} tone="slate">{feature}</Pill>) : <span className="text-slate-400">None</span>}</div></td>
                       <td className="px-5 py-4"><Pill tone={room.status === "Active" ? "green" : "slate"}>{room.status}</Pill></td>
-                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => { setEditingRoom(room); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900" type="button">Edit</button><button onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900" type="button">{room.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
+                      <td className="px-5 py-4 text-right"><div className="flex justify-end gap-3"><button disabled={managementMutationKey !== null} onClick={() => { setEditingRoom(room); setShowForm(true); }} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Edit</button><button disabled={managementMutationKey !== null} onClick={() => toggleRoom(room)} className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50" type="button">{managementMutationKey === `room-status:${room.id}` ? "Saving..." : room.status === "Active" ? "Deactivate" : "Activate"}</button></div></td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -3080,14 +3725,14 @@ export default function Home() {
                         <td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"} · ${course.weekStart !== null && course.weekEnd !== null ? `W${course.weekStart}–${course.weekEnd}` : "all weeks"}` : "Not configured"}</td>
                         <td className="px-5 py-4 text-right">
                           <div className="flex justify-end gap-3">
-                            <button disabled={savingCourseSetupId !== null} onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Sections</button>
+                            <button disabled={savingCourseSetupId !== null || managementMutationKey !== null} onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Sections</button>
                             {/* callback ref 会在筛选隐藏课程时删除旧节点；409 后不会把焦点送到已脱离 DOM 的按钮。 */}
                             <button
                               ref={(button) => {
                                 if (button) courseConfigureButtonRefs.current.set(course.id, button);
                                 else courseConfigureButtonRefs.current.delete(course.id);
                               }}
-                              disabled={savingCourseSetupId !== null}
+                              disabled={savingCourseSetupId !== null || managementMutationKey !== null}
                               onClick={() => { setEditingCourse(course); setShowForm(true); }}
                               className="font-semibold text-blue-700 hover:text-blue-900 disabled:cursor-wait disabled:opacity-50"
                               type="button"
@@ -3109,12 +3754,12 @@ export default function Home() {
               <div className="border-t border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                   <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
-                  <button onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700" type="button">Close</button>
+                  <button disabled={managementMutationKey !== null} onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">Close</button>
                 </div>
                 {/* 修正班次数量时保留低编号班次；仍含排课或班级关联的班次，服务端会拒绝删除。 */}
                 <form key={`${selectedCourse.id}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
-                  <label className="text-xs font-semibold text-amber-950">Total sections<input name="sectionCount" required min="1" max="999" defaultValue={sections.length} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm" /></label>
-                  <button className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900" type="submit">Update count</button>
+                  <label className="text-xs font-semibold text-amber-950">Total sections<input name="sectionCount" required min="1" max="999" defaultValue={sections.length} disabled={managementMutationKey !== null} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                  <button disabled={managementMutationKey !== null} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900 disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === `section-count:${selectedCourse.id}` ? "Updating..." : "Update count"}</button>
                   <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
                 </form>
                 {allocationVariances.length > 0 && (
@@ -3133,15 +3778,15 @@ export default function Home() {
                       <div className="grid gap-3 md:grid-cols-[130px_1fr_auto]">
                         <p className="pt-2 font-bold text-slate-900">{section.label}</p>
                         {/* 旧班次可保留当前停用教师，但只有 Active 教师会出现在可改选名单中。 */}
-                        <TeacherSelect teachers={teachers} selectedTeacherId={section.teacherId} selectedTeacherName={section.teacherName} ariaLabel={`Teacher for ${section.label}`} />
-                        <button disabled={savingSectionId !== null} className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit" aria-label={`Save ${section.label} assignments`}>
+                        <TeacherSelect teachers={teachers} selectedTeacherId={section.teacherId} selectedTeacherName={section.teacherName} ariaLabel={`Teacher for ${section.label}`} disabled={managementMutationKey !== null} />
+                        <button disabled={savingSectionId !== null || managementMutationKey !== null} className="rounded-lg bg-[#153d75] px-3 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit" aria-label={`Save ${section.label} assignments`}>
                           {savingSectionId === section.id ? "Saving..." : "Save"}
                         </button>
                       </div>
                       <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-700">
                         {groups.map((group) => (
                           <label key={group.id} className="flex items-center gap-1.5">
-                            <input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} type="checkbox" />
+                            <input name="studentGroupIds" value={group.id} defaultChecked={section.studentGroupIds.includes(group.id)} disabled={managementMutationKey !== null} type="checkbox" />
                             {group.code}
                           </label>
                         ))}

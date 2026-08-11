@@ -13,8 +13,8 @@
 
 1. 在服务上新增一个 Volume，并挂载到 `/data`。
 2. Railway 会自动提供 `RAILWAY_VOLUME_MOUNT_PATH=/data`；应用将数据库保存为 `/data/timetabling.db`。
-3. 如需使用其他文件名，可另外设置 `TIMETABLING_DATABASE_PATH`，其优先级高于自动卷路径。
-4. 启动脚本会在 Railway 环境检查卷路径是否存在且可写；没有挂载卷时服务会拒绝启动，避免数据落入临时文件系统。
+3. 如需使用其他文件名或子目录，可另外设置 `TIMETABLING_DATABASE_PATH`；该路径仍必须位于挂载卷内，不能指向 `/app` 或其他容器临时目录。
+4. 启动脚本会在 Railway 环境检查真实卷路径及数据库目录是否存在且可写；即使设置了自定义数据库路径，没有挂载卷或路径逃出卷时服务也会拒绝启动。
 
 不要在 Build Command 或 Pre-deploy Command 中建立或迁移 SQLite。Railway 的卷只在应用启动容器中挂载，构建和 pre-deploy 容器无法访问卷。
 

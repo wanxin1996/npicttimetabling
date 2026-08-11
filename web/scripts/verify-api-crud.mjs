@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -215,11 +215,10 @@ async function requestApi(pathname, options = {}) {
   return { response, body: responseBody };
 }
 
-function readBusinessSnapshot() {
+function readBusinessSnapshotFrom(databasePath) {
   // 超限或故障请求必须证明“全部业务表零变化”，不能只比较课程总数。
   // 独立只读连接可看到服务器已经提交的状态，但不会取得写锁或改变正式资料。
-  assert(testDatabasePath, "The temporary database path is not ready.");
-  const db = new Database(testDatabasePath, { readonly: true });
+  const db = new Database(databasePath, { readonly: true });
   try {
     const readSnapshot = db.transaction(() => ({
       teachers: db.prepare("SELECT * FROM teachers ORDER BY id").all(),
@@ -240,6 +239,32 @@ function readBusinessSnapshot() {
     return readSnapshot.deferred();
   } finally {
     db.close();
+  }
+}
+
+function readBusinessSnapshot() {
+  assert(testDatabasePath, "The temporary database path is not ready.");
+  return readBusinessSnapshotFrom(testDatabasePath);
+}
+
+function fullRestoreForm(contents, filename, expectedCurrentToken) {
+  // 所有完整恢复回归都走真实 multipart、双确认和精确短语，不能绕过 Route Handler。
+  const form = new FormData();
+  form.append("backupFile", new Blob([contents], { type: "application/vnd.sqlite3" }), filename);
+  form.append("understandReplace", "on");
+  form.append("understandSignOut", "on");
+  form.append("confirmation", "RESTORE FULL BACKUP");
+  if (expectedCurrentToken !== undefined) form.append("expectedCurrentToken", expectedCurrentToken);
+  return form;
+}
+
+async function pathExists(filename) {
+  try {
+    await stat(filename);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -1640,17 +1665,221 @@ async function verifySystemBackupAcrossColumnOrders() {
     backupDatabase.close();
   }
 
+  const stateBeforeRestore = readBusinessSnapshot();
+  const sessionsBeforeRejectedRestore = executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all());
+  const safetyDirectory = path.join(path.dirname(testDatabasePath), "integration-restore-safety");
+  assert.equal(await pathExists(safetyDirectory), false);
+  const statusBeforeMarker = await requestApi("/api/system-backup/status");
+  assert.match(statusBeforeMarker.body.currentToken, /^[0-9a-f]{64}$/);
+
+  // 下载副本和 restore safety 都会删除会话；人工 trigger 若同时把业务字段改成另一个
+  // 合法值，普通 invariants 发现不了。脱敏前后的规范 token 必须拒绝这两条路径，且
+  // 不得改变 live、会话或建立任何 safety 文件。
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_mutate_backup_while_stripping_sessions
+    AFTER DELETE ON auth_sessions
+    BEGIN
+      UPDATE teachers SET name = name || ' BACKUP MUTATION'
+      WHERE id = (SELECT id FROM teachers ORDER BY id LIMIT 1);
+    END;
+  `));
+  try {
+    const mutatedDownload = await requestApi("/api/system-backup", { expectedStatus: 500 });
+    assert.deepEqual(mutatedDownload.body, {
+      error: "The database backup failed its safety checks. No backup was downloaded.",
+    });
+    const mutatedSafetyRestore = await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(reorderedBackupPath), "mutated-safety.sqlite", statusBeforeMarker.body.currentToken),
+      expectedStatus: 500,
+    });
+    assert.deepEqual(mutatedSafetyRestore.body, {
+      error: "The system restore failed. Sign in again and verify the current data before retrying.",
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_mutate_backup_while_stripping_sessions"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeRestore);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+  assert.equal(await pathExists(safetyDirectory), false);
+
+  // current token 是恢复确认不可缺少的一部分。缺失／伪造格式必须在任何数据库变化或
+  // safety 文件出现前得到 400；合法旧 token 则在 BEGIN IMMEDIATE 内得到稳定 409。
+  for (const invalidToken of [undefined, "not-a-token", "A".repeat(64)]) {
+    await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(reorderedBackupPath), "invalid-token.sqlite", invalidToken),
+      expectedStatus: 400,
+    });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeRestore);
+    assert.equal(await pathExists(safetyDirectory), false);
+  }
+
+  const restoreMarker = (await requestApi("/api/teachers", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { name: "FULL RESTORE TOKEN MARKER", staffType: "FT" },
+  })).body;
+  const stateAfterMarker = readBusinessSnapshot();
+  const staleRestore = await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(reorderedBackupPath), "stale-token.sqlite", statusBeforeMarker.body.currentToken),
+    expectedStatus: 409,
+  });
+  assert.equal(staleRestore.body.code, "SYSTEM_STATE_CHANGED");
+  assert.match(staleRestore.body.error, /changed/i);
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+  assert.equal(await pathExists(safetyDirectory), false);
+  const currentRestoreStatus = await requestApi("/api/system-backup/status");
+  assert.match(currentRestoreStatus.body.currentToken, /^[0-9a-f]{64}$/);
+  assert.notEqual(currentRestoreStatus.body.currentToken, statusBeforeMarker.body.currentToken);
+  const expectedCurrentToken = currentRestoreStatus.body.currentToken;
+
+  // 缺少一条固定规则的 SQLite 仍会通过 schema、integrity 和 FK。旧实现会先提交
+  // 六条规则，再在提交后的 initialize 补第七条；下面的 trigger 会令它报告 500，
+  // 此时资料其实已经被替换。新实现必须在任何 live 写入前以 400 拒绝并保持会话。
+  const missingRulePath = path.join(temporaryDirectory, "missing-required-rule.sqlite");
+  await writeFile(missingRulePath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const missingRuleDatabase = new Database(missingRulePath);
+  try {
+    missingRuleDatabase.prepare("DELETE FROM rule_settings WHERE rule_key = 'prefer_9am'").run();
+    assert.deepEqual(missingRuleDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(missingRuleDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    missingRuleDatabase.close();
+  }
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_fail_post_restore_rule_initialization
+    BEFORE INSERT ON rule_settings WHEN NEW.rule_key = 'prefer_9am'
+    BEGIN SELECT RAISE(ABORT, 'forced post-restore rule initialization failure'); END;
+  `));
+  try {
+    await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(missingRulePath), "missing-required-rule.sqlite", expectedCurrentToken),
+      expectedStatus: 400,
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_post_restore_rule_initialization"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
+  // 紧急周期 JSON 也属于完整系统备份的一部分。五个空数组在 SQLite 看来是合法 TEXT，
+  // 但绝不是 Start 可能生成的可恢复周期；必须在上传校验阶段拒绝。
+  const invalidCyclePath = path.join(temporaryDirectory, "invalid-cycle-snapshot.sqlite");
+  await writeFile(invalidCyclePath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const invalidCycleDatabase = new Database(invalidCyclePath);
+  try {
+    invalidCycleDatabase.prepare("INSERT INTO schedule_backups (id, snapshot_json) VALUES (?, ?)")
+      .run(randomUUID(), JSON.stringify({ courses: [], allocations: [], sections: [], sectionGroups: [], lessons: [] }));
+  } finally {
+    invalidCycleDatabase.close();
+  }
+  await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(invalidCyclePath), "invalid-cycle-snapshot.sqlite", expectedCurrentToken),
+    expectedStatus: 400,
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+
+  // auth_sessions 不参与 current/target token，因为正常登录退出不应让确认过期；因此还要
+  // 防止人工 AFTER DELETE trigger 重插一个格式、FK 都合法的会话并绕过“退出所有人”。
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_retain_session_during_full_system_restore
+    AFTER DELETE ON auth_sessions
+    WHEN (SELECT file FROM pragma_database_list WHERE name = 'main') <> ''
+    BEGIN
+      INSERT OR REPLACE INTO auth_sessions (token_hash, user_id, expires_at, created_at)
+      VALUES ('${"e".repeat(64)}', OLD.user_id, '2099-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    END;
+  `));
+  try {
+    const retainedSessionRestore = await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(reorderedBackupPath), "retained-session-rollback.sqlite", expectedCurrentToken),
+      expectedStatus: 500,
+    });
+    assert.deepEqual(retainedSessionRestore.body, {
+      error: "The system restore failed. Sign in again and verify the current data before retrying.",
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_retain_session_during_full_system_restore"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
+  // 合法值也可能被 live 中的人工 AFTER trigger 静默改写，普通 business/FK/integrity
+  // 全部仍会通过。提交前的规范逐字段 token 必须发现目标不等值并回滚完整替换。
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_silently_change_full_system_restore
+    AFTER INSERT ON teachers
+    BEGIN UPDATE teachers SET name = name || ' RESTORE MUTATION' WHERE id = NEW.id; END;
+  `));
+  try {
+    const silentlyChangedRestore = await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(reorderedBackupPath), "silent-trigger-rollback.sqlite", expectedCurrentToken),
+      expectedStatus: 500,
+    });
+    assert.deepEqual(silentlyChangedRestore.body, {
+      error: "The system restore failed. Sign in again and verify the current data before retrying.",
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_silently_change_full_system_restore"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
+  // 即使安全副本已经可靠落盘，真正复制时的任意 trigger/磁盘故障仍必须回滚所有
+  // DELETE/INSERT，并保留当前登录。这里强制在第一张 master 表 INSERT 时失败。
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_fail_full_system_restore
+    BEFORE INSERT ON teachers BEGIN SELECT RAISE(ABORT, 'forced full restore failure'); END;
+  `));
+  try {
+    const failedRestore = await requestApi("/api/system-backup", {
+      method: "POST",
+      body: fullRestoreForm(await readFile(reorderedBackupPath), "forced-rollback.sqlite", expectedCurrentToken),
+      expectedStatus: 500,
+    });
+    assert.deepEqual(failedRestore.body, {
+      error: "The system restore failed. Sign in again and verify the current data before retrying.",
+    });
+    assert(!/sqlite|trigger|table|column|private|stack/i.test(JSON.stringify(failedRestore.body)));
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_full_system_restore"));
+  }
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+  await requestApi("/api/teachers");
+
   // Production 恢复接口必须按列名验证与复制，而不是因 cid 顺序不同拒绝，或用
   // SELECT * 把某列写进错误字段。恢复完成会按产品设计注销全部旧会话。
-  const stateBeforeRestore = readBusinessSnapshot();
-  const restoreForm = new FormData();
-  restoreForm.append("backupFile", new Blob([await readFile(reorderedBackupPath)], { type: "application/vnd.sqlite3" }), "legacy-column-order.sqlite");
-  restoreForm.append("understandReplace", "on");
-  restoreForm.append("understandSignOut", "on");
-  restoreForm.append("confirmation", "RESTORE FULL BACKUP");
-  const restored = await requestApi("/api/system-backup", { method: "POST", body: restoreForm });
+  const restored = await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(reorderedBackupPath), "legacy-column-order.sqlite", expectedCurrentToken),
+  });
   assert.equal(restored.body.restored, true);
   assert.deepEqual(readBusinessSnapshot(), stateBeforeRestore);
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT COUNT(*) AS count FROM teachers WHERE id = ?").get(restoreMarker.id).count), 0);
+
+  // 返回的安全副本必须是同卷上的耐久原子文件、权限收紧、会话脱敏，并逐字段等于
+  // 恢复前状态。响应只给 basename，不能允许路径跳出固定安全目录。
+  assert.equal(path.basename(restored.body.safetyBackupFilename), restored.body.safetyBackupFilename);
+  const safetyPath = path.join(safetyDirectory, restored.body.safetyBackupFilename);
+  assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
+  assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  assert.deepEqual(readBusinessSnapshotFrom(safetyPath), stateAfterMarker);
+  const safetyDatabase = new Database(safetyPath, { readonly: true });
+  try {
+    assert.deepEqual(safetyDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(safetyDatabase.pragma("foreign_key_check"), []);
+    assert.equal(safetyDatabase.prepare("SELECT COUNT(*) AS count FROM auth_sessions").get().count, 0);
+  } finally {
+    safetyDatabase.close();
+  }
   await requestApi("/api/auth/status", { expectedStatus: 200, authenticated: false });
   await requestApi("/api/teachers", { expectedStatus: 401 });
 
@@ -1662,7 +1891,7 @@ async function verifySystemBackupAcrossColumnOrders() {
   });
   sessionCookie = (login.response.headers.get("set-cookie") || "").split(";", 1)[0];
   assert(sessionCookie.includes("="));
-  report("完整系统备份按列名跨 fresh／历史迁移列顺序恢复");
+  report("完整系统备份业务校验、失败回滚、耐久安全副本及跨列顺序恢复");
 }
 
 async function verifyAtomicCycleActions(ids) {
@@ -1681,6 +1910,7 @@ async function verifyAtomicCycleActions(ids) {
   });
   const schedulerCookie = (schedulerLogin.response.headers.get("set-cookie") || "").split(";", 1)[0];
   assert(schedulerCookie.includes("="), "The normal scheduler login did not return a session cookie.");
+  await requestApi("/api/system-backup/status", { cookie: schedulerCookie, expectedStatus: 403 });
 
   await requestApi("/api/cycle", { authenticated: false, expectedStatus: 401 });
   await requestApi("/api/cycle", {
@@ -1921,10 +2151,94 @@ async function verifyAtomicCycleActions(ids) {
   const finalCycleStatus = await requestApi("/api/cycle", { cookie: schedulerCookie });
   assert.deepEqual(finalCycleStatus.body, restored.body);
 
-  // 注销普通排课账号，避免它的测试会话影响最终 auth_sessions=0 外键验收。
-  await requestApi("/api/auth/logout", { method: "POST", cookie: schedulerCookie });
+  // Start 后 master data 可以只被紧急 JSON 引用。删除这种教室不会破坏 live FK；完整
+  // 备份仍必须可下载及恢复，因为 Cycle Restore 已有专门的 FK 409 和完整事务回滚。
+  const orphanedMasterCycle = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: finalCycleStatus.body.currentToken },
+  });
+  const orphanedBackupId = orphanedMasterCycle.body.backup.id;
+  const orphanedSnapshot = executeTestDatabase((db) => JSON.parse(db.prepare("SELECT snapshot_json FROM schedule_backups WHERE id = ?").get(orphanedBackupId).snapshot_json));
+  const deletedRoomId = orphanedSnapshot.lessons.find((lesson) => lesson.room_id !== null)?.room_id;
+  assert(deletedRoomId, "The historical-master full-backup fixture needs a scheduled room.");
+  const deletedRoom = executeTestDatabase((db) => {
+    const room = db.prepare("SELECT * FROM rooms WHERE id = ?").get(deletedRoomId);
+    assert(room, "The historical-master room disappeared before the deletion fixture ran.");
+    db.prepare("DELETE FROM rooms WHERE id = ?").run(deletedRoomId);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rooms WHERE id = ?").get(deletedRoomId).count, 0);
+    return room;
+  });
+  const stateWithHistoricalMasterReference = readBusinessSnapshot();
+  const historicalRestoreStatus = await requestApi("/api/system-backup/status");
+  const historicalDownload = await fetch(new URL("/api/system-backup", baseUrl), {
+    headers: { Cookie: sessionCookie },
+    signal: AbortSignal.timeout(requestTimeoutMilliseconds),
+  });
+  assert.equal(historicalDownload.status, 200);
+  const historicalBackup = Buffer.from(await historicalDownload.arrayBuffer());
+  const historicalRestore = await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(historicalBackup, "historical-master-reference.sqlite", historicalRestoreStatus.body.currentToken),
+  });
+  assert.equal(historicalRestore.body.restored, true);
+  assert.deepEqual(readBusinessSnapshot(), stateWithHistoricalMasterReference);
+
+  // 完整恢复按设计撤销全部旧会话；重新登录后，Cycle Restore 必须把缺 master 转成
+  // 可解释的 409，同时逐表证明空 current cycle 和紧急备份都没有发生变化。
   await requestApi("/api/cycle", { cookie: schedulerCookie, expectedStatus: 401 });
-  report("普通账号的新周期快照、旧页面绑定、Start／Restore 原子回滚和完整恢复");
+  const administratorLogin = await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    json: { username: "integration-admin", password: "IntegrationTest123!" },
+  });
+  sessionCookie = (administratorLogin.response.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert(sessionCookie.includes("="));
+  const orphanedCycleStatus = await requestApi("/api/cycle");
+  const stateBeforeMissingMasterRestore = readBusinessSnapshot();
+  const missingMasterRestore = await requestApi("/api/cycle", {
+    method: "POST",
+    expectedStatus: 409,
+    json: {
+      action: "restore",
+      confirmation: "RESTORE LAST BACKUP",
+      currentToken: orphanedCycleStatus.body.currentToken,
+      backupId: orphanedBackupId,
+    },
+  });
+  assert.deepEqual(missingMasterRestore.body, { error: "The emergency backup depends on master data that no longer exists." });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeMissingMasterRestore);
+
+  // 后续原有 FK 验收仍需要初始 course fixture。把专门删除的 master 精确放回后再正常
+  // Restore，证明前一个 409 没有损坏快照，且测试不会把空周期泄漏给无关断言。
+  executeTestDatabase((db) => db.prepare(`INSERT INTO rooms (
+    id, code, block, capacity, has_multi_projector, is_lab, is_smart_classroom,
+    is_active, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    deletedRoom.id,
+    deletedRoom.code,
+    deletedRoom.block,
+    deletedRoom.capacity,
+    deletedRoom.has_multi_projector,
+    deletedRoom.is_lab,
+    deletedRoom.is_smart_classroom,
+    deletedRoom.is_active,
+    deletedRoom.created_at,
+    deletedRoom.updated_at,
+  ));
+  const repairedCycleStatus = await requestApi("/api/cycle");
+  const repairedCycle = await requestApi("/api/cycle", {
+    method: "POST",
+    json: {
+      action: "restore",
+      confirmation: "RESTORE LAST BACKUP",
+      currentToken: repairedCycleStatus.body.currentToken,
+      backupId: orphanedBackupId,
+    },
+  });
+  assert.equal(repairedCycle.body.courses, orphanedSnapshot.courses.length);
+  assert.deepEqual(cyclePayloadFromSnapshot(readBusinessSnapshot()), orphanedSnapshot);
+  report("Cycle 原子回滚及历史快照缺 master 时的完整系统备份／恢复兼容");
 }
 
 async function verifyLogout() {

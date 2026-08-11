@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import Module, { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import ts from "typescript";
 
@@ -11,6 +12,7 @@ import ts from "typescript";
 // 连接、事务和全局 schema 版本都保持干净。所有数据库都位于系统临时目录。
 const projectRoot = process.cwd();
 const databaseSourcePath = path.join(projectRoot, "src", "lib", "database.ts");
+const persistentStorageScriptPath = path.join(projectRoot, "scripts", "verify-persistent-storage.mjs");
 const nativeRequire = createRequire(import.meta.url);
 const databaseSource = await readFile(databaseSourcePath, "utf8");
 const schemaVersionMatch = databaseSource.match(/const runtimeSchemaVersion = (\d+);/);
@@ -183,6 +185,97 @@ async function withIsolatedDatabase(name, nodeEnvironment, callback) {
   }
 }
 
+async function verifyPersistentStorageBoundary() {
+  // 启动检查必须在一个全新 Node 进程中执行，因为脚本会直接读取环境变量。
+  // 全部路径都位于同一个系统临时根，测试绝不会创建或探测正式数据库目录。
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-storage-check-"));
+  const volumeDirectory = path.join(temporaryDirectory, "volume");
+  const outsideDirectory = path.join(temporaryDirectory, "ephemeral-container");
+  const cleanEnvironment = { ...process.env, NODE_ENV: "production" };
+  delete cleanEnvironment.RAILWAY_ENVIRONMENT;
+  delete cleanEnvironment.RAILWAY_SERVICE_ID;
+  delete cleanEnvironment.RAILWAY_VOLUME_MOUNT_PATH;
+  delete cleanEnvironment.TIMETABLING_DATABASE_PATH;
+
+  function runStorageCheck(environment) {
+    return spawnSync(process.execPath, [persistentStorageScriptPath], {
+      cwd: projectRoot,
+      encoding: "utf8",
+      env: { ...cleanEnvironment, ...environment },
+    });
+  }
+
+  try {
+    const localResult = runStorageCheck({
+      TIMETABLING_DATABASE_PATH: path.join(temporaryDirectory, "local", "test.sqlite"),
+    });
+    assert.equal(localResult.status, 0, localResult.stderr);
+
+    const missingVolumeResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      TIMETABLING_DATABASE_PATH: path.join(outsideDirectory, "test.sqlite"),
+    });
+    assert.notEqual(missingVolumeResult.status, 0);
+    assert.match(missingVolumeResult.stderr, /persistent volume is missing/i);
+
+    const absentMountResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+    });
+    assert.notEqual(absentMountResult.status, 0);
+    assert.match(absentMountResult.stderr, /volume path is unavailable/i);
+
+    await mkdir(volumeDirectory, { recursive: true });
+    const outsideVolumeResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+      TIMETABLING_DATABASE_PATH: path.join(outsideDirectory, "test.sqlite"),
+    });
+    assert.notEqual(outsideVolumeResult.status, 0);
+    assert.match(outsideVolumeResult.stderr, /must stay inside/i);
+
+    const danglingLinkPath = path.join(volumeDirectory, "linked.sqlite");
+    await symlink(path.join(outsideDirectory, "created-after-check.sqlite"), danglingLinkPath);
+    const danglingLinkResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+      TIMETABLING_DATABASE_PATH: danglingLinkPath,
+    });
+    assert.notEqual(danglingLinkResult.status, 0);
+    assert.match(danglingLinkResult.stderr, /must not be a symbolic link/i);
+
+    await mkdir(outsideDirectory, { recursive: true });
+    const directoryLinkPath = path.join(volumeDirectory, "escape");
+    await symlink(outsideDirectory, directoryLinkPath);
+    const escapedSubdirectory = path.join(outsideDirectory, "must-not-be-created");
+    const directoryLinkResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+      TIMETABLING_DATABASE_PATH: path.join(directoryLinkPath, "must-not-be-created", "test.sqlite"),
+    });
+    assert.notEqual(directoryLinkResult.status, 0);
+    assert.match(directoryLinkResult.stderr, /directory resolves outside/i);
+    await assert.rejects(access(escapedSubdirectory));
+
+    const defaultVolumeResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+    });
+    assert.equal(defaultVolumeResult.status, 0, defaultVolumeResult.stderr);
+
+    const insideVolumeResult = runStorageCheck({
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+      TIMETABLING_DATABASE_PATH: path.join(volumeDirectory, "sqlite", "test.sqlite"),
+    });
+    assert.equal(insideVolumeResult.status, 0, insideVolumeResult.stderr);
+    assert.match(insideVolumeResult.stdout, /storage is writable/i);
+    report("Railway 缺卷或卷外数据库路径会拒绝启动，卷内路径可正常通过");
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 await withIsolatedDatabase("schema", "production", async (databasePath) => {
   const initializationError = new Error("forced fresh schema initialization failure");
   const scenario = { failInitializationOnce: true, initializationError, failSeedOnce: false };
@@ -258,5 +351,7 @@ await withIsolatedDatabase("global", "production", async (databasePath) => {
   assertHealthyDatabase(databasePath);
   report("热重载迁移失败不会误关全局连接，旧版本保留并由同一连接重试");
 });
+
+await verifyPersistentStorageBoundary();
 
 console.log("Database initialization failure verification passed.");

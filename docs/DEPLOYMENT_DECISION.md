@@ -26,7 +26,7 @@
 
 1. Next.js standalone 生产构建和不泄露业务数据的只读健康检查接口均已完成。
 2. 在 Railway 把仓库根目录设为 `web/`，连接当前 GitHub 分支或合并后的主分支。
-3. 为应用挂载 `/data` 持久卷；Railway 会自动提供 `RAILWAY_VOLUME_MOUNT_PATH`，应用会把数据库保存为 `/data/timetabling.db`。如确需其他位置，可用 `TIMETABLING_DATABASE_PATH` 覆盖。
+3. 为应用挂载 `/data` 持久卷；Railway 会自动提供 `RAILWAY_VOLUME_MOUNT_PATH`，应用会把数据库保存为 `/data/timetabling.db`。如需使用卷内其他文件名或子目录，可用 `TIMETABLING_DATABASE_PATH` 覆盖，但启动检查会拒绝卷外路径。
 4. 首次部署后导入 Teaching Members，并通过界面建立管理员账号；不把本机测试账号写进代码或镜像。
 5. 开启每日和每周卷备份，在上线前实际执行一次恢复演练。
 6. 使用两个账号、两个浏览器执行跨地点协作验收，再把网址交给真实排课团队。

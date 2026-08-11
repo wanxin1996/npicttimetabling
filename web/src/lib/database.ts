@@ -1,5 +1,16 @@
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -303,41 +314,299 @@ function assertDatabaseIntegrity(db: DatabaseInstance, stage: string) {
   if (foreignKeyProblems.length > 0) throw new Error(`${stage} failed foreign-key check.`);
 }
 
-export async function createVerifiedSystemBackup() {
-  // 每次下载都创建独立的系统临时目录，避免多人同时导出时文件互相覆盖，
-  // 也确保临时副本不会混放在正式数据库旁边。
+const storedPasswordHashPattern = /^[0-9a-f]{32}:[0-9a-f]{128}$/i;
+const storedSessionHashPattern = /^[0-9a-f]{64}$/i;
+const requiredRuleKeys = [
+  "lunch_break",
+  "max_continuous",
+  "prefer_9am",
+  "same_block",
+  "separate_weekly_sessions",
+  "student_daily_limit",
+  "teacher_daily_limit",
+] as const;
+
+function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
+  // SQLite 的 CHECK 与外键只能保护单行或直接引用，无法表达“课次时长必须等于课程
+  // 时长”“规则键必须恰好七个”等跨表业务条件。完整备份必须额外验证这些条件，
+  // 否则一个结构正常的损坏文件仍可能让资料在 UI 中消失或在恢复后才报错。
+  const rowChecks: Array<{ area: string; sql: string }> = [
+    {
+      area: "teachers",
+      sql: `SELECT 1 FROM teachers WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(name) <> 'text' OR trim(name) = '' OR
+        staff_type NOT IN ('FT', 'PT') OR
+        typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' OR
+        typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "student groups",
+      sql: `SELECT 1 FROM student_groups WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(code) <> 'text' OR trim(code) = '' OR
+        typeof(year) <> 'integer' OR year NOT IN (1, 2, 3) OR
+        typeof(program) <> 'text' OR trim(program) = '' OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' OR
+        typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "rooms",
+      sql: `SELECT 1 FROM rooms WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(code) <> 'text' OR trim(code) = '' OR
+        typeof(capacity) <> 'integer' OR capacity <= 0 OR
+        typeof(has_multi_projector) <> 'integer' OR has_multi_projector NOT IN (0, 1) OR
+        typeof(is_lab) <> 'integer' OR is_lab NOT IN (0, 1) OR
+        typeof(is_smart_classroom) <> 'integer' OR is_smart_classroom NOT IN (0, 1) OR
+        typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        (is_smart_classroom = 1 AND has_multi_projector <> 1) OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' OR
+        typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "courses",
+      sql: `SELECT 1 FROM courses WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(code) <> 'text' OR trim(code) = '' OR
+        (duration_hours IS NOT NULL AND
+          (typeof(duration_hours) <> 'integer' OR duration_hours NOT BETWEEN 2 AND 4)) OR
+        typeof(sessions_per_week) <> 'integer' OR sessions_per_week NOT IN (1, 2) OR
+        (primary_year IS NOT NULL AND
+          (typeof(primary_year) <> 'integer' OR primary_year NOT IN (1, 2, 3))) OR
+        (minimum_room_capacity IS NOT NULL AND
+          (typeof(minimum_room_capacity) <> 'integer' OR minimum_room_capacity <= 0)) OR
+        typeof(requires_lab) <> 'integer' OR requires_lab NOT IN (0, 1) OR
+        typeof(requires_multi_projector) <> 'integer' OR requires_multi_projector NOT IN (0, 1) OR
+        typeof(requires_smart_classroom) <> 'integer' OR requires_smart_classroom NOT IN (0, 1) OR
+        typeof(separate_sections_across_days) <> 'integer' OR separate_sections_across_days NOT IN (0, 1) OR
+        week_pattern NOT IN ('ALL', 'W1_4', 'W5_8') OR
+        (week_start IS NULL) <> (week_end IS NULL) OR
+        (week_start IS NOT NULL AND
+          (typeof(week_start) <> 'integer' OR typeof(week_end) <> 'integer' OR
+           week_start < 1 OR week_end > 52 OR week_start > week_end)) OR
+        (week_pattern = 'W1_4' AND (week_start IS NOT 1 OR week_end IS NOT 4)) OR
+        (week_pattern = 'W5_8' AND (week_start IS NOT 5 OR week_end IS NOT 8)) OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' OR
+        typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "teaching allocations",
+      sql: `SELECT 1 FROM teaching_allocations WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(course_id) <> 'text' OR trim(course_id) = '' OR
+        typeof(teacher_id) <> 'text' OR trim(teacher_id) = '' OR
+        typeof(assigned_group_count) <> 'integer' OR assigned_group_count <= 0 LIMIT 1`,
+    },
+    {
+      area: "course sections",
+      sql: `SELECT 1 FROM course_sections WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(course_id) <> 'text' OR trim(course_id) = '' OR
+        typeof(sequence) <> 'integer' OR sequence < 1 OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
+        (allocation_teacher_id IS NOT NULL AND allocation_teacher_id IS NOT teacher_id) LIMIT 1`,
+    },
+    {
+      area: "section sequence",
+      sql: `SELECT 1 FROM course_sections GROUP BY course_id
+        HAVING MIN(sequence) <> 1 OR MAX(sequence) <> COUNT(*) LIMIT 1`,
+    },
+    {
+      area: "scheduled lessons",
+      sql: `SELECT 1 FROM scheduled_lessons lessons
+        JOIN course_sections sections ON sections.id = lessons.section_id
+        JOIN courses ON courses.id = sections.course_id
+        WHERE typeof(lessons.id) <> 'text' OR trim(lessons.id) = '' OR
+          typeof(lessons.occurrence) <> 'integer' OR
+          lessons.occurrence < 1 OR lessons.occurrence > courses.sessions_per_week OR
+          typeof(lessons.day_of_week) <> 'integer' OR lessons.day_of_week NOT BETWEEN 1 AND 5 OR
+          typeof(lessons.start_hour) <> 'integer' OR lessons.start_hour NOT BETWEEN 8 AND 17 OR
+          typeof(lessons.duration_hours) <> 'integer' OR lessons.duration_hours NOT BETWEEN 2 AND 4 OR
+          courses.duration_hours IS NULL OR lessons.duration_hours <> courses.duration_hours OR
+          lessons.start_hour + lessons.duration_hours > 18 OR
+          courses.primary_year NOT IN (1, 2, 3) OR
+          typeof(lessons.revision) <> 'integer' OR lessons.revision < 1 LIMIT 1`,
+    },
+    {
+      area: "teacher unavailable windows",
+      sql: `SELECT 1 FROM teacher_unavailable_windows WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(day_of_week) <> 'integer' OR day_of_week NOT BETWEEN 1 AND 5 OR
+        typeof(start_hour) <> 'integer' OR start_hour NOT BETWEEN 8 AND 17 OR
+        typeof(end_hour) <> 'integer' OR end_hour NOT BETWEEN 9 AND 18 OR
+        end_hour <= start_hour LIMIT 1`,
+    },
+    {
+      area: "year blocked windows",
+      sql: `SELECT 1 FROM year_blocked_windows WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(year) <> 'integer' OR year NOT IN (1, 2, 3) OR
+        typeof(day_of_week) <> 'integer' OR day_of_week NOT BETWEEN 1 AND 5 OR
+        typeof(start_hour) <> 'integer' OR start_hour NOT BETWEEN 8 AND 17 OR
+        typeof(end_hour) <> 'integer' OR end_hour NOT BETWEEN 9 AND 18 OR
+        end_hour <= start_hour LIMIT 1`,
+    },
+    {
+      area: "rule settings",
+      sql: `SELECT 1 FROM rule_settings WHERE
+        typeof(rule_key) <> 'text' OR trim(rule_key) = '' OR
+        typeof(is_enabled) <> 'integer' OR is_enabled NOT IN (0, 1) LIMIT 1`,
+    },
+    {
+      area: "accounts",
+      sql: `SELECT 1 FROM app_users WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(username) <> 'text' OR length(trim(username)) NOT BETWEEN 3 AND 64 OR
+        typeof(password_hash) <> 'text' OR
+        typeof(is_admin) <> 'integer' OR is_admin NOT IN (0, 1) OR
+        typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' LIMIT 1`,
+    },
+    {
+      area: "authentication sessions",
+      sql: `SELECT 1 FROM auth_sessions WHERE
+        typeof(token_hash) <> 'text' OR
+        typeof(user_id) <> 'text' OR trim(user_id) = '' OR
+        typeof(expires_at) <> 'text' OR trim(expires_at) = '' OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' LIMIT 1`,
+    },
+    {
+      area: "cycle backups",
+      sql: `SELECT 1 FROM schedule_backups WHERE
+        typeof(id) <> 'text' OR trim(id) = '' OR
+        typeof(snapshot_json) <> 'text' OR
+        typeof(created_at) <> 'text' OR trim(created_at) = '' LIMIT 1`,
+    },
+  ];
+
+  for (const check of rowChecks) {
+    if (db.prepare(check.sql).get()) throw new Error(`${stage} failed ${check.area} business checks.`);
+  }
+
+  // 规则列表是封闭集合；缺一条会让旧实现尝试在恢复提交后补写默认值，正是
+  // “资料已经替换但 API 报 500”最危险的窗口之一。
+  const storedRules = (db.prepare("SELECT rule_key FROM rule_settings ORDER BY rule_key").all() as Array<{ rule_key: string }>)
+    .map((row) => row.rule_key);
+  if (JSON.stringify(storedRules) !== JSON.stringify(requiredRuleKeys)) {
+    throw new Error(`${stage} failed required-rule checks.`);
+  }
+
+  const accounts = db.prepare("SELECT password_hash FROM app_users").all() as Array<{ password_hash: string }>;
+  if (accounts.some((account) => !storedPasswordHashPattern.test(account.password_hash))) {
+    throw new Error(`${stage} failed account password-hash checks.`);
+  }
+  const sessions = db.prepare("SELECT token_hash FROM auth_sessions").all() as Array<{ token_hash: string }>;
+  if (sessions.some((session) => !storedSessionHashPattern.test(session.token_hash))) {
+    throw new Error(`${stage} failed authentication-session checks.`);
+  }
+
+  // warning JSON 会被页面直接解析，紧急周期 JSON 又可能稍后覆盖五张周期表；两者都要
+  // 在完整备份阶段证明可读，不能把延迟爆炸的 JSON 留给未来某次页面或恢复操作。
+  const lessonWarnings = db.prepare("SELECT warnings_json FROM scheduled_lessons").all() as Array<{ warnings_json: string }>;
+  for (const lesson of lessonWarnings) {
+    try {
+      const warnings: unknown = JSON.parse(lesson.warnings_json);
+      if (!Array.isArray(warnings) || !warnings.every((warning) => typeof warning === "string")) {
+        throw new Error("warnings must be an array of strings");
+      }
+    } catch {
+      throw new Error(`${stage} failed scheduled-lesson warning checks.`);
+    }
+  }
+  const cycleBackups = db.prepare("SELECT snapshot_json FROM schedule_backups").all() as Array<{ snapshot_json: string }>;
+  if (cycleBackups.length > 1) throw new Error(`${stage} failed emergency-cycle backup count checks.`);
+  for (const backup of cycleBackups) {
+    if (!parseCycleSnapshot(backup.snapshot_json)) {
+      throw new Error(`${stage} failed emergency-cycle backup checks.`);
+    }
+  }
+}
+
+function assertUsableAdministrator(db: DatabaseInstance) {
+  const administrators = db.prepare("SELECT password_hash FROM app_users WHERE is_admin = 1 AND is_active = 1").all() as Array<{ password_hash: string }>;
+  if (!administrators.some((administrator) => storedPasswordHashPattern.test(administrator.password_hash))) {
+    throw new SystemBackupValidationError("The selected backup has no usable active administrator account.");
+  }
+}
+
+function assertNoAuthenticationSessions(db: DatabaseInstance, stage: string) {
+  const remainingSessions = db.prepare("SELECT COUNT(*) AS count FROM auth_sessions").get() as { count: number };
+  if (remainingSessions.count !== 0) throw new Error(`${stage} retained authentication sessions.`);
+}
+
+async function createVerifiedBackupFromDatabase(sourceDatabase: DatabaseInstance) {
+  // 调用者可以传入普通应用连接，也可以传入已被另一条 IMMEDIATE 连接保护的只读连接。
+  // 两种情况都由 SQLite 在线备份 API 生成一致文件，绝不直接复制 live.db 或 WAL。
   const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-backup-"));
   const backupPath = path.join(temporaryDirectory, "timetabling.sqlite");
   let backupDatabase: DatabaseInstance | undefined;
 
   try {
-    // 先检查源数据库，再使用 SQLite 的在线备份接口生成一致副本。
-    // 不能直接复制正在使用的数据库文件及其预写日志，否则可能得到不完整的数据。
-    const sourceDatabase = database();
-    assertDatabaseIntegrity(sourceDatabase, "Source database");
     await sourceDatabase.backup(backupPath);
-
-    // 浏览器登录会话属于敏感的运行凭证，不属于需要备份的院系业务数据。
-    // 从副本删除会话后执行 VACUUM，重建文件页面，避免已删除凭证残留在空闲页中。
     backupDatabase = new Database(backupPath);
     backupDatabase.pragma("foreign_keys = ON");
+    const expectedBackupToken = systemStateToken(backupDatabase);
     backupDatabase.prepare("DELETE FROM auth_sessions").run();
+    assertNoAuthenticationSessions(backupDatabase, "Generated backup");
     backupDatabase.exec("VACUUM");
-
-    // 对最终提供下载的脱敏文件本身做完整性检查；读取文件字节前先关闭数据库，
-    // 让 SQLite 的所有写入都刷新到磁盘，确保响应内容完整。
     assertDatabaseIntegrity(backupDatabase, "Generated backup");
+    assertDatabaseBusinessInvariants(backupDatabase, "Generated backup");
+    assertUsableAdministrator(backupDatabase);
+    if (systemStateToken(backupDatabase) !== expectedBackupToken) {
+      throw new Error("Generated backup did not preserve the source system data.");
+    }
     backupDatabase.close();
     backupDatabase = undefined;
     const contents = readFileSync(backupPath);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     return { contents, filename: `timetabling-backup-${timestamp}.sqlite` };
   } finally {
-    // 响应对象已经持有内存中的文件内容，因此无论成功还是校验报错，
-    // 都可以立即删除包含业务数据的临时文件，减少敏感副本在磁盘上的停留时间。
-    backupDatabase?.close();
+    try {
+      backupDatabase?.close();
+    } catch (error) {
+      console.error("A temporary verified backup database could not be closed.", error);
+    }
     rmSync(temporaryDirectory, { recursive: true, force: true });
   }
+}
+
+function createVerifiedBackupSynchronously(sourceDatabase: DatabaseInstance) {
+  // restore 持有跨进程写锁期间不能 await：同进程另一条同步 SQLite 写入可能占住
+  // JavaScript 线程，让异步 backup 无法推进。serialize 在当前线程一次完成一致快照，
+  // 再把快照载入可写内存库完成会话清除、VACUUM 和最终校验。
+  let backupDatabase: DatabaseInstance | undefined;
+  try {
+    backupDatabase = new Database(sourceDatabase.serialize());
+    backupDatabase.pragma("foreign_keys = ON");
+    const expectedBackupToken = systemStateToken(backupDatabase);
+    backupDatabase.prepare("DELETE FROM auth_sessions").run();
+    assertNoAuthenticationSessions(backupDatabase, "Generated backup");
+    backupDatabase.exec("VACUUM");
+    assertDatabaseIntegrity(backupDatabase, "Generated backup");
+    assertDatabaseBusinessInvariants(backupDatabase, "Generated backup");
+    assertUsableAdministrator(backupDatabase);
+    if (systemStateToken(backupDatabase) !== expectedBackupToken) {
+      throw new Error("Generated backup did not preserve the source system data.");
+    }
+    const contents = backupDatabase.serialize();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return { contents, filename: `timetabling-backup-${timestamp}.sqlite` };
+  } finally {
+    try {
+      backupDatabase?.close();
+    } catch (error) {
+      console.error("The in-memory restore safety database could not be closed.", error);
+    }
+  }
+}
+
+export async function createVerifiedSystemBackup() {
+  const sourceDatabase = database();
+  assertDatabaseIntegrity(sourceDatabase, "Source database");
+  return createVerifiedBackupFromDatabase(sourceDatabase);
 }
 
 export class SystemBackupValidationError extends Error {
@@ -349,6 +618,15 @@ export class SystemBackupValidationError extends Error {
   }
 }
 
+export class SystemStateChangedError extends Error {
+  readonly code = "SYSTEM_STATE_CHANGED";
+
+  constructor() {
+    super("The current system data changed after you reviewed it. Refresh the restore page, review the latest data, and confirm again.");
+    this.name = "SystemStateChangedError";
+  }
+}
+
 type TableColumn = { cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number };
 type ComparableTableColumn = Omit<TableColumn, "cid">;
 type TableShape = { name: string; columns: ComparableTableColumn[] };
@@ -357,6 +635,55 @@ function quoteIdentifier(value: string) {
   // 表名虽然来自 SQLite 自己的元数据，仍然要进行安全引用。
   // 这样即使出现特殊字符，也不会改变恢复语句原本要执行的 SQL 命令。
   return `"${value.replaceAll('"', '""')}"`;
+}
+
+type SystemStateValue = null | number | string | bigint | Buffer;
+
+function normalizedSystemStateValue(value: SystemStateValue) {
+  // JSON 已能区分 string／number／null；额外标记 bigint 和 BLOB，避免不同 SQLite
+  // storage class 在规范化后碰撞。-0 在 SQLite 中等同于 0，也统一成普通零。
+  if (Buffer.isBuffer(value)) return { type: "blob", value: value.toString("base64") };
+  if (typeof value === "bigint") return { type: "integer", value: value.toString() };
+  if (typeof value === "number" && Object.is(value, -0)) return 0;
+  return value;
+}
+
+function systemStateToken(db: DatabaseInstance) {
+  // 完整恢复确认值只描述业务表资料，不包含登录会话。表、列与主键顺序都来自 SQLite
+  // 元数据后再稳定排序，因此 ALTER 造成的物理列顺序差异不会改变相同资料的 token。
+  // 每张表逐行送入 SHA-256，避免把整个数据库再复制成一份巨大 JavaScript 字符串。
+  const hash = createHash("sha256");
+  const tables = db.prepare(`SELECT name FROM main.sqlite_schema
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'auth_sessions'
+    ORDER BY name`).all() as Array<{ name: string }>;
+
+  hash.update(JSON.stringify({ version: 1, tables: tables.map((table) => table.name) }));
+  for (const { name } of tables) {
+    const tableColumns = db.prepare(`PRAGMA main.table_info(${quoteIdentifier(name)})`).all() as TableColumn[];
+    const columns = tableColumns.map((column) => column.name)
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    const primaryKeyColumns = tableColumns.filter((column) => column.pk > 0)
+      .sort((left, right) => left.pk - right.pk)
+      .map((column) => column.name);
+    const orderColumns = primaryKeyColumns.length > 0 ? primaryKeyColumns : columns;
+    const selectedColumns = columns.map(quoteIdentifier).join(", ");
+    const orderClause = orderColumns.map(quoteIdentifier).join(", ");
+    const rows = db.prepare(`SELECT ${selectedColumns} FROM main.${quoteIdentifier(name)} ORDER BY ${orderClause}`).all() as Array<Record<string, SystemStateValue>>;
+
+    hash.update(JSON.stringify({ table: name, columns, primaryKeyColumns }));
+    for (const row of rows) {
+      hash.update(JSON.stringify(columns.map((column) => normalizedSystemStateValue(row[column]))));
+    }
+  }
+  return hash.digest("hex");
+}
+
+export function systemBackupStatus() {
+  const db = database();
+  // 元数据和所有业务表必须来自同一个 DEFERRED 读取快照；否则并发提交可能让 token
+  // 混合两个版本，管理员即使没有再改资料也会收到无法解释的 409。
+  const readStatus = db.transaction(() => ({ currentToken: systemStateToken(db) }));
+  return readStatus.deferred();
 }
 
 function tableShapes(db: DatabaseInstance) {
@@ -384,15 +711,22 @@ function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseIn
     throw new SystemBackupValidationError("The selected file does not match this version of the timetabling system.");
   }
 
-  // 恢复后所有旧会话都会被删除，因此上传文件中必须至少保留一个启用状态的管理员，
-  // 并且密码哈希格式有效，保证恢复完成后仍有人能够重新登录。
-  const administrators = source.prepare("SELECT password_hash FROM app_users WHERE is_admin = 1 AND is_active = 1").all() as Array<{ password_hash: string }>;
-  const validPasswordHash = /^[0-9a-f]{32}:[0-9a-f]{128}$/i;
-  if (!administrators.some((administrator) => validPasswordHash.test(administrator.password_hash))) {
-    throw new SystemBackupValidationError("The selected backup has no usable active administrator account.");
-  }
+  assertDatabaseBusinessInvariants(source, "Uploaded backup");
+  // 恢复后所有旧会话都会被删除，因此至少要保留一位可重新登录的启用管理员。
+  assertUsableAdministrator(source);
 
   return sourceShapes.map((table) => table.name);
+}
+
+function synchronizeDirectory(directory: string) {
+  // fsync 文件只保证文件内容；rename 所在目录也需要 fsync，突然断电或容器崩溃后
+  // 文件名才有持久化保证。Railway 的持久卷和本地 APFS/ext4 都支持目录同步。
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function saveRestoreSafetyCopy(contents: Buffer, sourceFilename: string) {
@@ -401,30 +735,59 @@ function saveRestoreSafetyCopy(contents: Buffer, sourceFilename: string) {
   const livePath = databaseFilePath();
   const databaseName = path.basename(livePath, path.extname(livePath));
   const safetyDirectory = path.join(path.dirname(livePath), `${databaseName}-restore-safety`);
-  mkdirSync(safetyDirectory, { recursive: true });
-  const safetyFilename = `pre-restore-${randomBytes(4).toString("hex")}-${sourceFilename}`;
-  writeFileSync(path.join(safetyDirectory, safetyFilename), contents, { flag: "wx", mode: 0o600 });
-  return safetyFilename;
+  mkdirSync(safetyDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(safetyDirectory, 0o700);
+  synchronizeDirectory(path.dirname(safetyDirectory));
+
+  const safeSourceFilename = path.basename(sourceFilename);
+  const safetyFilename = `pre-restore-${randomBytes(8).toString("hex")}-${safeSourceFilename}`;
+  const finalPath = path.join(safetyDirectory, safetyFilename);
+  const temporaryPath = path.join(safetyDirectory, `.${safetyFilename}.${randomBytes(8).toString("hex")}.part`);
+  let temporaryCreated = false;
+  try {
+    // 先把完整内容写进同目录临时文件并同步，再原子改名；最终名称永远不会指向
+    // 一份只写了一半的 SQLite。0600／0700 防止同机其他用户读取账号与排课资料。
+    const descriptor = openSync(temporaryPath, "wx", 0o600);
+    temporaryCreated = true;
+    try {
+      writeFileSync(descriptor, contents);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporaryPath, finalPath);
+    temporaryCreated = false;
+    synchronizeDirectory(safetyDirectory);
+    return safetyFilename;
+  } finally {
+    if (temporaryCreated) rmSync(temporaryPath, { force: true });
+  }
 }
 
-export async function restoreVerifiedSystemBackup(contents: Buffer) {
+export async function restoreVerifiedSystemBackup(contents: Buffer, expectedCurrentToken: string) {
   // 上传内容只在独立临时文件中停留到 SQLite 完成校验和读取为止。
   // 文件权限限制其他本机用户访问，降低业务数据在服务器上泄露的风险。
   const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "timetabling-restore-"));
   const uploadedPath = path.join(temporaryDirectory, "uploaded.sqlite");
-  writeFileSync(uploadedPath, contents, { mode: 0o600 });
   let uploadedDatabase: DatabaseInstance | undefined;
-  let restoreAttached = false;
-  const liveDatabase = database();
+  let maintenanceDatabase: DatabaseInstance | undefined;
+  let safetySourceDatabase: DatabaseInstance | undefined;
+  let restoreTransactionOpen = false;
 
   try {
+    // 写入上传文件和初始化 live 连接也必须在统一 finally 内；即使磁盘此刻满了或
+    // 数据库初始化失败，本轮已经建立的独立临时目录仍会被可靠清理。
+    writeFileSync(uploadedPath, contents, { mode: 0o600 });
+    const liveDatabase = database();
     let tableNames: string[];
+    let expectedRestoredToken: string;
     try {
       // 只读方式打开上传文件，防止校验过程自动修复或改写管理员选择的原文件；
       // 如果内容不是有效 SQLite 数据，则转换成可预期的 400 请求错误。
       uploadedDatabase = new Database(uploadedPath, { readonly: true, fileMustExist: true });
       uploadedDatabase.pragma("query_only = ON");
       tableNames = assertRestorableSystemBackup(uploadedDatabase, liveDatabase);
+      expectedRestoredToken = systemStateToken(uploadedDatabase);
     } catch (error) {
       if (error instanceof SystemBackupValidationError) throw error;
       throw new SystemBackupValidationError("The selected file is not a valid verified timetabling backup.");
@@ -433,57 +796,113 @@ export async function restoreVerifiedSystemBackup(contents: Buffer) {
       uploadedDatabase = undefined;
     }
 
-    // 在覆盖现有数据这种高风险操作之前，先生成并验证一份当前状态的持久化快照。
-    // 快照刻意排除正在使用的登录会话凭证。
-    const safetyBackup = await createVerifiedSystemBackup();
-    const safetyBackupFilename = saveRestoreSafetyCopy(safetyBackup.contents, safetyBackup.filename);
-
-    // 把已通过校验的上传数据库附加到当前连接，并在一个同步事务中替换全部业务表。
-    // 任何复制错误或约束错误都会让整个事务回滚，避免只恢复了一部分数据。
-    liveDatabase.prepare("ATTACH DATABASE ? AS restore_source").run(uploadedPath);
-    restoreAttached = true;
-    liveDatabase.pragma("foreign_keys = OFF");
+    // 恢复使用独立连接，避免改变全局应用连接的 foreign_keys 状态。上传库先附加，
+    // 再以 IMMEDIATE 取得跨进程写锁；从这一刻到 COMMIT，没有任何 writer 能夹进
+    // “安全副本已经完成、正式资料尚未替换”的窗口。
+    maintenanceDatabase = new Database(databaseFilePath(), { fileMustExist: true });
+    maintenanceDatabase.pragma("busy_timeout = 5000");
+    maintenanceDatabase.pragma("foreign_keys = OFF");
+    maintenanceDatabase.prepare("ATTACH DATABASE ? AS restore_source").run(uploadedPath);
+    maintenanceDatabase.exec("BEGIN IMMEDIATE");
+    restoreTransactionOpen = true;
     try {
-      const restoreAllTables = liveDatabase.transaction(() => {
-        for (const tableName of tableNames) liveDatabase.prepare(`DELETE FROM main.${quoteIdentifier(tableName)}`).run();
-        for (const tableName of tableNames) {
-          // 全新库和经过多次 ALTER TABLE 的旧库可能拥有不同物理列顺序；两边已经按
-          // 排序后的列定义通过安全检查，因此这里使用 live 表的真实列名明确映射。
-          const columns = (liveDatabase.prepare(`PRAGMA main.table_info(${quoteIdentifier(tableName)})`).all() as TableColumn[])
-            .sort((left, right) => left.cid - right.cid)
-            .map((column) => quoteIdentifier(column.name));
-          const columnList = columns.join(", ");
-          liveDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} (${columnList}) SELECT ${columnList} FROM restore_source.${quoteIdentifier(tableName)}`).run();
+
+      // 文件选择或确认期间只要有任一业务资料提交，管理员看到的状态就已经过期。
+      // 必须在写锁内、建立 safety 目录和任何 DELETE 之前重算；冲突因而是零资料变化、
+      // 零安全文件的可重试 409，而不是静默覆盖一份普通管理员无法自行找回的资料。
+      if (systemStateToken(maintenanceDatabase) !== expectedCurrentToken) {
+        throw new SystemStateChangedError();
+      }
+
+      // IMMEDIATE 允许只读连接取得同一已提交版本，却阻止其他进程提交新写入。
+      // 因此安全副本必然包含锁前所有成功写入；锁后到达的 writer 会等恢复提交后继续，
+      // 不会既不在副本里、又被恢复覆盖而永久丢失。
+      safetySourceDatabase = new Database(databaseFilePath(), { readonly: true, fileMustExist: true });
+      assertDatabaseIntegrity(safetySourceDatabase, "Pre-restore database");
+      assertDatabaseBusinessInvariants(safetySourceDatabase, "Pre-restore database");
+      assertUsableAdministrator(safetySourceDatabase);
+      // 取得锁之后到 COMMIT 之间保持完全同步，避免同进程同步 writer 阻塞异步备份进度。
+      const safetyBackup = createVerifiedBackupSynchronously(safetySourceDatabase);
+      // serialize 完成后立即关闭只读源连接，再开始修改 main。若一直保留到 COMMIT，
+      // rollback-journal 模式下它自己的 SHARED lock 会让 maintenance 连接等自己退出。
+      safetySourceDatabase.close();
+      safetySourceDatabase = undefined;
+      const safetyBackupFilename = saveRestoreSafetyCopy(safetyBackup.contents, safetyBackup.filename);
+
+      for (const tableName of tableNames) {
+        maintenanceDatabase.prepare(`DELETE FROM main.${quoteIdentifier(tableName)}`).run();
+      }
+      for (const tableName of tableNames) {
+        // 全新库和经过多次 ALTER TABLE 的旧库可能拥有不同物理列顺序；两边已经按
+        // 排序后的列定义通过安全检查，因此这里使用 live 表的真实列名明确映射。
+        const columns = (maintenanceDatabase.prepare(`PRAGMA main.table_info(${quoteIdentifier(tableName)})`).all() as TableColumn[])
+          .sort((left, right) => left.cid - right.cid)
+          .map((column) => quoteIdentifier(column.name));
+        const columnList = columns.join(", ");
+        maintenanceDatabase.prepare(`INSERT INTO main.${quoteIdentifier(tableName)} (${columnList}) SELECT ${columnList} FROM restore_source.${quoteIdentifier(tableName)}`).run();
+      }
+
+      // 当前数据库和上传数据库中的会话全部撤销。业务、关系和文件完整性检查以及
+      // 响应计数都在 COMMIT 前读取；任一步失败，下面 catch 会回滚完整替换。
+      maintenanceDatabase.prepare("DELETE FROM main.auth_sessions").run();
+      assertNoAuthenticationSessions(maintenanceDatabase, "Restored system data");
+      assertDatabaseBusinessInvariants(maintenanceDatabase, "Restored database");
+      assertUsableAdministrator(maintenanceDatabase);
+      assertDatabaseIntegrity(maintenanceDatabase, "Restored database");
+      // Business/FK/integrity 可以遗漏“值仍合法但已被手工 trigger 改写”的情况。
+      // 使用与确认页相同的稳定规范化逐表比较，证明提交内容逐字段等于上传目标；
+      // auth_sessions 按设计在两边都不参与 token，且 main 中已经明确删除。
+      if (systemStateToken(maintenanceDatabase) !== expectedRestoredToken) {
+        throw new Error("Restored system data did not exactly match the verified backup.");
+      }
+      const counts = maintenanceDatabase.prepare(`SELECT
+        (SELECT COUNT(*) FROM teachers) AS teachers,
+        (SELECT COUNT(*) FROM courses) AS courses,
+        (SELECT COUNT(*) FROM course_sections) AS sections,
+        (SELECT COUNT(*) FROM scheduled_lessons) AS lessons,
+        (SELECT COUNT(*) FROM app_users) AS accounts`).get() as { teachers: number; courses: number; sections: number; lessons: number; accounts: number };
+
+      maintenanceDatabase.exec("COMMIT");
+      restoreTransactionOpen = false;
+      return { safetyBackupFilename, ...counts };
+    } catch (error) {
+      if (restoreTransactionOpen) {
+        try {
+          maintenanceDatabase.exec("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("System restore rollback failed; the maintenance connection will be closed.", rollbackError);
         }
-
-        // 当前数据库和上传数据库中的登录会话都不能在完整恢复后继续有效。
-        // 外键检查也放在事务内执行，一旦失败，前面复制的所有表都会一起回滚。
-        liveDatabase.prepare("DELETE FROM main.auth_sessions").run();
-        const relationshipProblems = liveDatabase.pragma("foreign_key_check") as unknown[];
-        if (relationshipProblems.length > 0) throw new Error("Restored data failed foreign-key check.");
-      });
-      restoreAllTables();
+        restoreTransactionOpen = false;
+      }
+      throw error;
     } finally {
-      liveDatabase.pragma("foreign_keys = ON");
+      try {
+        safetySourceDatabase?.close();
+      } catch (error) {
+        // COMMIT 之后的清理故障不得把已经成功的恢复报告成失败。关闭连接不会改变
+        // 已提交数据；日志仍保留给部署管理员检查临时资源清理。
+        console.error("The pre-restore backup connection could not be closed.", error);
+      }
+      safetySourceDatabase = undefined;
     }
-
-    // 恢复提交后补齐可重复执行的默认规则，并再次校验正式数据库。
-    // 只有所有检查通过，API 才会通知浏览器恢复成功。
-    initializeTables(liveDatabase);
-    assertDatabaseIntegrity(liveDatabase, "Restored database");
-    const counts = liveDatabase.prepare(`SELECT
-      (SELECT COUNT(*) FROM teachers) AS teachers,
-      (SELECT COUNT(*) FROM courses) AS courses,
-      (SELECT COUNT(*) FROM course_sections) AS sections,
-      (SELECT COUNT(*) FROM scheduled_lessons) AS lessons,
-      (SELECT COUNT(*) FROM app_users) AS accounts`).get() as { teachers: number; courses: number; sections: number; lessons: number; accounts: number };
-    return { safetyBackupFilename, ...counts };
   } finally {
-    // 删除临时目录前先从 SQLite 连接卸载上传数据库。无论恢复成功、被拒绝还是执行失败，
-    // 都会清理上传临时文件，但不会删除恢复前保留的安全快照。
-    if (restoreAttached) liveDatabase.exec("DETACH DATABASE restore_source");
-    uploadedDatabase?.close();
-    rmSync(temporaryDirectory, { recursive: true, force: true });
+    // 专用连接 close 会自动卸载上传库；无论恢复成功还是回滚，都不再使用它。
+    // 提交后的清理错误只记录，绝不能制造“资料已恢复但 API 返回 500”的假失败。
+    try {
+      maintenanceDatabase?.close();
+    } catch (error) {
+      console.error("The system-restore maintenance connection could not be closed.", error);
+    }
+    try {
+      uploadedDatabase?.close();
+    } catch (error) {
+      console.error("The uploaded backup validation connection could not be closed.", error);
+    }
+    try {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    } catch (error) {
+      console.error("The temporary system-restore directory could not be removed.", error);
+    }
   }
 }
 
@@ -1181,27 +1600,143 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
   };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isIntegerBetween(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
+}
+
+function isNullableNonEmptyString(value: unknown) {
+  return value === null || isNonEmptyString(value);
+}
+
+function isWarningsJson(value: unknown) {
+  if (typeof value !== "string") return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every((warning) => typeof warning === "string");
+  } catch {
+    return false;
+  }
+}
+
+function hasUniqueValues(values: string[]) {
+  return new Set(values).size === values.length;
+}
+
 function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
-  // 紧急备份是数据库内部 JSON，但升级、磁盘损坏或人工维护都可能留下无效内容。
-  // 这里只接受具有五个必需数组的对象；读取状态时把无效备份隐藏，恢复时则返回明确冲突。
+  // 紧急备份以后会直接重建五张 live 表，因此不能只检查“五个数组存在”。这里验证
+  // 每个字段的业务 domain、稳定 ID、数组间引用和 section 连续性；损坏快照在 Cycle
+  // 状态页被隐藏，在 Restore 则成为明确 409，绝不会先清空当前周期再发现问题。
   try {
     const parsed: unknown = JSON.parse(snapshotJson);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (!isPlainRecord(parsed)) return null;
     const candidate = parsed as Partial<Record<keyof CycleSnapshot, unknown>>;
     if (![candidate.courses, candidate.allocations, candidate.sections, candidate.sectionGroups, candidate.lessons].every(Array.isArray)) return null;
     const snapshot = candidate as CycleSnapshot;
+    if (snapshot.courses.length === 0) return null;
 
-    // 老版本或人工损坏的 JSON 可能在结构上仍有五个数组，却让已排课程引用一个
-    // primary_year 为空的课程。恢复后这类 lesson 会从三张年级总表全部消失，
-    // 因此必须在删除当前周期之前验证跨数组关系，而不能只依赖外键。
-    const primaryYearByCourse = new Map(snapshot.courses.map((course) => [course.id, course.primary_year]));
-    const courseBySection = new Map(snapshot.sections.map((section) => [section.id, section.course_id]));
-    const everyLessonHasVisibleYear = snapshot.lessons.every((lesson) => {
-      const courseId = courseBySection.get(lesson.section_id);
-      if (!courseId) return false;
-      return [1, 2, 3].includes(primaryYearByCourse.get(courseId) ?? 0);
+    const coursesAreValid = snapshot.courses.every((course: unknown) => {
+      if (!isPlainRecord(course)) return false;
+      // 早期 cycle JSON 只有 week_pattern；恢复代码会把两个历史半学期值推导成数字范围。
+      const weekStart = course.week_start
+        ?? (course.week_pattern === "W1_4" ? 1 : course.week_pattern === "W5_8" ? 5 : null);
+      const weekEnd = course.week_end
+        ?? (course.week_pattern === "W1_4" ? 4 : course.week_pattern === "W5_8" ? 8 : null);
+      const weeksAreValid = (weekStart === null && weekEnd === null)
+        || (isIntegerBetween(weekStart, 1, 52)
+          && isIntegerBetween(weekEnd, 1, 52)
+          && Number(weekStart) <= Number(weekEnd));
+      return isNonEmptyString(course.id)
+        && isNonEmptyString(course.code)
+        && (course.catalog === null || typeof course.catalog === "string")
+        && (course.revision === undefined || isIntegerBetween(course.revision, 1, Number.MAX_SAFE_INTEGER))
+        && (course.duration_hours === null || isIntegerBetween(course.duration_hours, 2, 4))
+        && isIntegerBetween(course.sessions_per_week, 1, 2)
+        && (course.primary_year === null || isIntegerBetween(course.primary_year, 1, 3))
+        && (course.minimum_room_capacity === null || isIntegerBetween(course.minimum_room_capacity, 1, Number.MAX_SAFE_INTEGER))
+        && [course.requires_lab, course.requires_multi_projector, course.requires_smart_classroom,
+          course.separate_sections_across_days].every((value) => value === 0 || value === 1)
+        && ["ALL", "W1_4", "W5_8"].includes(String(course.week_pattern))
+        && weeksAreValid
+        && (course.week_pattern !== "W1_4" || (weekStart === 1 && weekEnd === 4))
+        && (course.week_pattern !== "W5_8" || (weekStart === 5 && weekEnd === 8))
+        && isNonEmptyString(course.created_at)
+        && isNonEmptyString(course.updated_at);
     });
-    if (!everyLessonHasVisibleYear) return null;
+    if (!coursesAreValid) return null;
+    if (!hasUniqueValues(snapshot.courses.map((course) => course.id))) return null;
+    if (!hasUniqueValues(snapshot.courses.map((course) => course.code))) return null;
+    const courseById = new Map(snapshot.courses.map((course) => [course.id, course]));
+
+    const allocationsAreValid = snapshot.allocations.every((allocation: unknown) => isPlainRecord(allocation)
+      && isNonEmptyString(allocation.id)
+      && isNonEmptyString(allocation.course_id)
+      && courseById.has(allocation.course_id)
+      && isNonEmptyString(allocation.teacher_id)
+      && isIntegerBetween(allocation.assigned_group_count, 1, Number.MAX_SAFE_INTEGER));
+    if (!allocationsAreValid) return null;
+    if (!hasUniqueValues(snapshot.allocations.map((allocation) => allocation.id))) return null;
+    if (!hasUniqueValues(snapshot.allocations.map((allocation) => `${allocation.course_id}\u0000${allocation.teacher_id}`))) return null;
+
+    const sectionsAreValid = snapshot.sections.every((section: unknown) => isPlainRecord(section)
+      && isNonEmptyString(section.id)
+      && isNonEmptyString(section.course_id)
+      && courseById.has(section.course_id)
+      && isIntegerBetween(section.sequence, 1, Number.MAX_SAFE_INTEGER)
+      && isNullableNonEmptyString(section.teacher_id)
+      && (section.allocation_teacher_id === undefined || isNullableNonEmptyString(section.allocation_teacher_id))
+      && (section.allocation_teacher_id === undefined || section.allocation_teacher_id === null
+        || section.allocation_teacher_id === section.teacher_id)
+      && (section.revision === undefined || isIntegerBetween(section.revision, 1, Number.MAX_SAFE_INTEGER)));
+    if (!sectionsAreValid) return null;
+    if (!hasUniqueValues(snapshot.sections.map((section) => section.id))) return null;
+    if (!hasUniqueValues(snapshot.sections.map((section) => `${section.course_id}\u0000${section.sequence}`))) return null;
+    const sectionById = new Map(snapshot.sections.map((section) => [section.id, section]));
+    const sequencesByCourse = new Map<string, number[]>();
+    for (const section of snapshot.sections) {
+      const sequences = sequencesByCourse.get(section.course_id) ?? [];
+      sequences.push(section.sequence);
+      sequencesByCourse.set(section.course_id, sequences);
+    }
+    for (const sequences of sequencesByCourse.values()) {
+      sequences.sort((left, right) => left - right);
+      if (sequences.some((sequence, index) => sequence !== index + 1)) return null;
+    }
+
+    const sectionGroupsAreValid = snapshot.sectionGroups.every((assignment: unknown) => isPlainRecord(assignment)
+      && isNonEmptyString(assignment.section_id)
+      && sectionById.has(assignment.section_id)
+      && isNonEmptyString(assignment.student_group_id));
+    if (!sectionGroupsAreValid) return null;
+    if (!hasUniqueValues(snapshot.sectionGroups.map((assignment) => `${assignment.section_id}\u0000${assignment.student_group_id}`))) return null;
+
+    const lessonsAreValid = snapshot.lessons.every((lesson: unknown) => {
+      if (!isPlainRecord(lesson) || !isNonEmptyString(lesson.section_id)) return false;
+      const section = sectionById.get(lesson.section_id);
+      const course = section ? courseById.get(section.course_id) : undefined;
+      return isNonEmptyString(lesson.id)
+        && Boolean(section && course)
+        && isIntegerBetween(lesson.occurrence, 1, course?.sessions_per_week ?? 0)
+        && isIntegerBetween(lesson.day_of_week, 1, 5)
+        && isIntegerBetween(lesson.start_hour, 8, 17)
+        && isIntegerBetween(lesson.duration_hours, 2, 4)
+        && lesson.duration_hours === course?.duration_hours
+        && Number(lesson.start_hour) + Number(lesson.duration_hours) <= 18
+        && isIntegerBetween(course?.primary_year, 1, 3)
+        && isNullableNonEmptyString(lesson.room_id)
+        && isWarningsJson(lesson.warnings_json)
+        && isIntegerBetween(lesson.revision, 1, Number.MAX_SAFE_INTEGER);
+    });
+    if (!lessonsAreValid) return null;
+    if (!hasUniqueValues(snapshot.lessons.map((lesson) => lesson.id))) return null;
+    if (!hasUniqueValues(snapshot.lessons.map((lesson) => `${lesson.section_id}\u0000${lesson.occurrence}`))) return null;
     return snapshot;
   } catch {
     return null;

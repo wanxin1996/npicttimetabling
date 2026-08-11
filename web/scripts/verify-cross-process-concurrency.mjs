@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,6 +23,7 @@ let administratorSetupToken;
 let administratorCookie = "";
 let cleanupPromise;
 const serverHandles = [];
+const externalWriterHandles = new Set();
 const activeRaceReleases = new Map();
 
 function report(message) {
@@ -242,17 +243,19 @@ async function requestApi(server, pathname, options = {}) {
   const {
     method = "GET",
     json,
+    body: requestBody,
+    requestHeaders = {},
     expectedStatus = 200,
     authenticated = true,
     cookie = "",
   } = options;
-  const headers = new Headers();
+  const headers = new Headers(requestHeaders);
   if (authenticated && cookie) headers.set("Cookie", cookie);
   if (json !== undefined) headers.set("Content-Type", "application/json");
   const response = await fetch(new URL(pathname, server.baseUrl), {
     method,
     headers,
-    body: json === undefined ? undefined : JSON.stringify(json),
+    body: json === undefined ? requestBody : JSON.stringify(json),
     redirect: "error",
     signal: AbortSignal.timeout(requestTimeoutMilliseconds),
   });
@@ -414,10 +417,10 @@ function readRetainedSnapshot() {
   }
 }
 
-function readFullBusinessSnapshot() {
+function readFullBusinessSnapshotFrom(databasePath) {
   // Candidate 失败属于纯读取。14 张业务表在同一个 DEFERRED 快照中逐字段读取，
   // 能发现 revision、warning、会话或备份的任何隐藏写入，而不只是比较行数。
-  const db = new Database(testDatabasePath, { readonly: true });
+  const db = new Database(databasePath, { readonly: true });
   try {
     const snapshot = db.transaction(() => ({
       courses: db.prepare("SELECT * FROM courses ORDER BY id").all(),
@@ -441,6 +444,10 @@ function readFullBusinessSnapshot() {
   }
 }
 
+function readFullBusinessSnapshot() {
+  return readFullBusinessSnapshotFrom(testDatabasePath);
+}
+
 function readDatabaseValue(sql, ...parameters) {
   // 简短精确断言使用独立只读连接；调用结束立即关闭，不与后续写入争抢资源。
   const db = new Database(testDatabasePath, { readonly: true });
@@ -451,11 +458,11 @@ function readDatabaseValue(sql, ...parameters) {
   }
 }
 
-async function waitForPendingRollbackJournalWriter(description) {
+async function waitForPendingRollbackJournalWriter(description, timeoutMilliseconds = 3_000) {
   // DELETE journal 中，writer 完成业务 SQL 并开始 COMMIT 时会先取得 PENDING 锁，
   // 阻止新的 reader 加入，再等待旧 SHARED reader 退出。用 busy_timeout=0 的新连接
   // 观察真实 SQLITE_BUSY，比固定 sleep 更能证明 writer 已到达 COMMIT 边界。
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + timeoutMilliseconds;
   while (Date.now() < deadline) {
     let observer;
     try {
@@ -1566,6 +1573,313 @@ async function verifyAuthenticationRaces(serverA, serverB, fixture) {
   await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: reenabledLogin.cookie });
 }
 
+function fullRestoreForm(contents, expectedCurrentToken) {
+  const form = new FormData();
+  form.append("backupFile", new Blob([contents], { type: "application/vnd.sqlite3" }), "cross-process-source.sqlite");
+  form.append("understandReplace", "on");
+  form.append("understandSignOut", "on");
+  form.append("confirmation", "RESTORE FULL BACKUP");
+  form.append("expectedCurrentToken", expectedCurrentToken);
+  return form;
+}
+
+async function pathExists(filename) {
+  try {
+    await stat(filename);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function waitForRestoreLockBeforeSafetyDirectory(safetyDirectory, restoreSettled) {
+  // 合法 cycle JSON 中放入较大 catalog 后，锁内同步 serialize/VACUUM 会持续足够久。
+  // 新实现必须先持 IMMEDIATE，再开始建立 safety 目录；旧实现先异步 backup/落文件、
+  // 后开事务，会在这里看到目录先于锁，从而稳定失败而不是依赖微秒级窗口。
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    assert.equal(restoreSettled(), false, "Full restore finished before its write lock was observed.");
+    let probe;
+    let lockIsHeld = false;
+    try {
+      probe = new Database(testDatabasePath);
+      probe.pragma("busy_timeout = 0");
+      probe.exec("BEGIN IMMEDIATE");
+      probe.exec("ROLLBACK");
+    } catch (error) {
+      if (error?.code === "SQLITE_BUSY" || error?.code === "SQLITE_LOCKED") lockIsHeld = true;
+      else throw error;
+    } finally {
+      probe?.close();
+    }
+    if (lockIsHeld) {
+      assert.equal(await pathExists(safetyDirectory), false,
+        "The restore safety directory appeared before the cross-process write lock was acquired.");
+      return;
+    }
+    assert.equal(await pathExists(safetyDirectory), false,
+      "The restore safety directory appeared while another writer could still commit.");
+    await delay(2);
+  }
+  throw new Error("Full restore never acquired its pre-safety IMMEDIATE lock.");
+}
+
+async function waitForDurableSafetyFileUnderRestoreLock(safetyDirectory, restoreSettled) {
+  // 某些 SQLite 版本会在 COMMIT 前的 integrity_check 就等待既有 reader，未必先出现
+  // 可观察的 PENDING lock。安全文件完成且 IMMEDIATE 仍在，已经是启动竞争 writer
+  // 所需的准确边界，不必把实现绑死在某个 rollback-journal 内部阶段。
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    assert.equal(restoreSettled(), false, "Full restore finished before its safety file was observed.");
+    let filenames;
+    try {
+      filenames = await readdir(safetyDirectory);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      filenames = [];
+    }
+    const safetyFilename = filenames.find((filename) => filename.startsWith("pre-restore-") && filename.endsWith(".sqlite"));
+    if (safetyFilename) {
+      const probe = new Database(testDatabasePath);
+      try {
+        probe.pragma("busy_timeout = 0");
+        assert.throws(
+          () => probe.exec("BEGIN IMMEDIATE"),
+          (error) => error?.code === "SQLITE_BUSY" || error?.code === "SQLITE_LOCKED",
+          "Restore released its write lock before the safety file became durable.",
+        );
+      } finally {
+        probe.close();
+      }
+      return safetyFilename;
+    }
+    await delay(10);
+  }
+  throw new Error("Full restore did not persist its safety file while holding the write lock.");
+}
+
+function startExternalTeacherWriter(id, name) {
+  // 使用第三个真实 Node 进程直接连接同一临时 SQLite。它代表已经通过 HTTP proxy
+  // 授权、但在 restore 取得锁之后才到达写事务的在途请求；不能在测试进程同步等待，
+  // 否则会阻塞负责释放 reader 的事件循环。
+  const source = `
+    import Database from "better-sqlite3";
+    const db = new Database(process.env.TIMETABLING_RACE_DATABASE_PATH);
+    try {
+      const parameters = [process.env.TIMETABLING_RACE_TEACHER_ID, process.env.TIMETABLING_RACE_TEACHER_NAME];
+      const sql = "INSERT INTO teachers (id, name, staff_type) VALUES (?, ?, 'FT')";
+      db.pragma("busy_timeout = 0");
+      try {
+        db.prepare(sql).run(...parameters);
+        process.stdout.write("WROTE_WITHOUT_BUSY\\n");
+        process.exitCode = 2;
+      } catch (error) {
+        if (error?.code !== "SQLITE_BUSY" && error?.code !== "SQLITE_LOCKED") throw error;
+        process.stdout.write("FIRST_BUSY\\n");
+        db.pragma("busy_timeout = 20000");
+        db.prepare(sql).run(...parameters);
+      }
+    } finally {
+      db.close();
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      TIMETABLING_RACE_DATABASE_PATH: testDatabasePath,
+      TIMETABLING_RACE_TEACHER_ID: id,
+      TIMETABLING_RACE_TEACHER_NAME: name,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let settled = false;
+  let output = "";
+  let firstBusyObserved = false;
+  let resolveFirstBusy;
+  let rejectFirstBusy;
+  const firstBusy = new Promise((resolve, reject) => {
+    resolveFirstBusy = resolve;
+    rejectFirstBusy = reject;
+  });
+  child.stdout.on("data", (chunk) => {
+    output = `${output}${String(chunk)}`.slice(-4_000);
+    if (!firstBusyObserved && output.includes("FIRST_BUSY")) {
+      firstBusyObserved = true;
+      resolveFirstBusy();
+    }
+  });
+  child.stderr.on("data", (chunk) => { output = `${output}${String(chunk)}`.slice(-4_000); });
+  const promise = new Promise((resolve, reject) => {
+    child.once("error", (error) => {
+      settled = true;
+      if (!firstBusyObserved) rejectFirstBusy(error);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      settled = true;
+      if (!firstBusyObserved) rejectFirstBusy(new Error(`External writer exited before observing restore BUSY: ${output}`));
+      if (code === 0) resolve();
+      else reject(new Error(`External restore writer exited with code=${code} signal=${signal}: ${output}`));
+    });
+  });
+  const handle = { child, firstBusy, promise, settled: () => settled };
+  // SIGINT/SIGTERM 可能恰好发生在局部 finally 之前；spawn 后立即全局登记，统一清理
+  // 会终止并等待这条第三进程，绝不让它继续持有临时 SQLite handle。
+  externalWriterHandles.add(handle);
+  const unregister = () => externalWriterHandles.delete(handle);
+  child.once("error", unregister);
+  child.once("close", unregister);
+  return handle;
+}
+
+async function verifyAtomicFullSystemRestore(serverA, serverB) {
+  // 放大一份仍然完全合法的 cycle snapshot，让测试能观察 restore 的“先锁、后 safety”顺序。
+  // 大文本只存在本轮 mkdtemp 数据库，不进入仓库或老师正式资料。
+  const padding = "R".repeat(14 * 1024 * 1024);
+  const inflationDatabase = new Database(testDatabasePath);
+  try {
+    const backup = inflationDatabase.prepare("SELECT id, snapshot_json FROM schedule_backups").get();
+    assert(backup, "Full restore concurrency fixture needs one emergency cycle backup.");
+    const snapshot = JSON.parse(backup.snapshot_json);
+    assert(snapshot.courses.length > 0);
+    snapshot.courses[0].catalog = padding;
+    inflationDatabase.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?")
+      .run(JSON.stringify(snapshot), backup.id);
+  } finally {
+    inflationDatabase.close();
+  }
+
+  const download = await fetch(new URL("/api/system-backup", serverA.baseUrl), {
+    headers: { Cookie: administratorCookie },
+    signal: AbortSignal.timeout(requestTimeoutMilliseconds),
+  });
+  assert.equal(download.status, 200);
+  const restoreSource = Buffer.from(await download.arrayBuffer());
+  assert(restoreSource.byteLength < 20 * 1024 * 1024);
+  const statusBeforeMarker = await requestApi(serverA, "/api/system-backup/status", {
+    cookie: administratorCookie,
+  });
+  assert.match(statusBeforeMarker.body.currentToken, /^[0-9a-f]{64}$/);
+
+  // 这个提交发生在 restore 请求之前，必须包含在 safety snapshot；目标备份较旧，
+  // 因而成功恢复后的 live 中不应再有它。
+  const preRestoreTeacher = (await requestApi(serverB, "/api/teachers", {
+    method: "POST",
+    cookie: administratorCookie,
+    expectedStatus: 201,
+    json: { name: "PRE RESTORE COMMITTED", staffType: "FT" },
+  })).body;
+  const beforeRestore = readFullBusinessSnapshot();
+  const safetyDirectory = path.join(path.dirname(testDatabasePath), "shared-restore-safety");
+  assert.equal(await pathExists(safetyDirectory), false);
+
+  // status 后提交的 marker 使旧确认过期。冲突判断必须在 IMMEDIATE 内发生，并且在
+  // 建立 safety 目录之前以 typed 409 返回；当前业务资料和会话逐字段保持不变。
+  const staleRestore = await requestApi(serverA, "/api/system-backup", {
+    method: "POST",
+    cookie: administratorCookie,
+    body: fullRestoreForm(restoreSource, statusBeforeMarker.body.currentToken),
+    expectedStatus: 409,
+  });
+  assert.equal(staleRestore.body.code, "SYSTEM_STATE_CHANGED");
+  assert.deepEqual(readFullBusinessSnapshot(), beforeRestore);
+  assert.equal(await pathExists(safetyDirectory), false);
+  const currentRestoreStatus = await requestApi(serverB, "/api/system-backup/status", {
+    cookie: administratorCookie,
+  });
+  assert.match(currentRestoreStatus.body.currentToken, /^[0-9a-f]{64}$/);
+  assert.notEqual(currentRestoreStatus.body.currentToken, statusBeforeMarker.body.currentToken);
+
+  // IMMEDIATE 允许既有 reader 完成本轮快照。它会在 restore 复制完成后卡住 COMMIT，
+  // 因此必须在发出 restore 前先建立 SHARED snapshot；若等观察到锁才建立，快速机器上
+  // restore 可能已经提交，测试反而会错过真正的 COMMIT 边界。
+  const reader = new Database(testDatabasePath, { readonly: true });
+  let readerTransactionOpen = false;
+  let restoreSettled = false;
+  let restorePromise;
+  const postRestoreTeacherId = `post-restore-${randomBytes(8).toString("hex")}`;
+  let externalWriter;
+  let readerPhaseSucceeded = false;
+  let observedSafetyFilename;
+  try {
+    reader.exec("BEGIN");
+    readerTransactionOpen = true;
+    reader.prepare("SELECT COUNT(*) AS count FROM teachers").get();
+    restorePromise = requestApi(serverA, "/api/system-backup", {
+      method: "POST",
+      cookie: administratorCookie,
+      body: fullRestoreForm(restoreSource, currentRestoreStatus.body.currentToken),
+    });
+    restorePromise.then(
+      () => { restoreSettled = true; },
+      () => { restoreSettled = true; },
+    );
+    await waitForRestoreLockBeforeSafetyDirectory(safetyDirectory, () => restoreSettled);
+    observedSafetyFilename = await waitForDurableSafetyFileUnderRestoreLock(safetyDirectory, () => restoreSettled);
+    externalWriter = startExternalTeacherWriter(postRestoreTeacherId, "POST RESTORE IN FLIGHT");
+    await Promise.race([
+      externalWriter.firstBusy,
+      delay(5_000).then(() => { throw new Error("The external writer did not report its first restore BUSY within five seconds."); }),
+    ]);
+    assert.equal(externalWriter.settled(), false, "The external writer exited immediately after its first restore BUSY.");
+    reader.exec("COMMIT");
+    readerTransactionOpen = false;
+    readerPhaseSucceeded = true;
+  } finally {
+    if (readerTransactionOpen) {
+      try { reader.exec("ROLLBACK"); } catch { /* close 会释放测试 SHARED lock。 */ }
+    }
+    reader.close();
+    // 任一屏障或断言失败时，本测试自己负责终止并等待第三进程；不能依赖顶层删除
+    // 临时目录让它得到 DBMOVED，也不能把一个仍持 SQLite handle 的 Node 留在后台。
+    if (!readerPhaseSucceeded && externalWriter) {
+      if (!externalWriter.settled()) await stopServer(externalWriter);
+      await externalWriter.firstBusy.catch(() => undefined);
+      await externalWriter.promise.catch(() => undefined);
+    }
+  }
+
+  assert(externalWriter, "The external restore writer was not started at the COMMIT boundary.");
+  assert(restorePromise, "The full restore request was not started.");
+  let restored;
+  try {
+    [restored] = await Promise.all([restorePromise, externalWriter.promise]);
+  } catch (error) {
+    if (!externalWriter.settled()) await stopServer(externalWriter);
+    await externalWriter.firstBusy.catch(() => undefined);
+    await externalWriter.promise.catch(() => undefined);
+    throw error;
+  }
+  assert.equal(restored.body.restored, true);
+  assert.equal(path.basename(restored.body.safetyBackupFilename), restored.body.safetyBackupFilename);
+  assert.equal(restored.body.safetyBackupFilename, observedSafetyFilename);
+
+  // 该 writer 是恢复前已获授权的在途请求，但它在线性化顺序上发生于 restore 之后；
+  // 因此最终 live = 目标备份 + 该写，而不是声称恢复响应后的资料永远精确等于目标。
+  // 核心保证是不可逆丢失为零：锁前提交在 safety，锁后写入仍在 live。
+  assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM teachers WHERE id = ?", preRestoreTeacher.id).count, 0);
+  assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM teachers WHERE id = ?", postRestoreTeacherId).count, 1);
+
+  const safetyPath = path.join(safetyDirectory, restored.body.safetyBackupFilename);
+  assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
+  assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  const expectedSafety = { ...beforeRestore, sessions: [] };
+  assert.deepEqual(readFullBusinessSnapshotFrom(safetyPath), expectedSafety);
+  const safetyDatabase = new Database(safetyPath, { readonly: true });
+  try {
+    assert.deepEqual(safetyDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(safetyDatabase.pragma("foreign_key_check"), []);
+    assert.equal(safetyDatabase.prepare("SELECT COUNT(*) AS count FROM auth_sessions").get().count, 0);
+    assert.equal(safetyDatabase.prepare("SELECT COUNT(*) AS count FROM teachers WHERE id = ?").get(preRestoreTeacher.id).count, 1);
+    assert.equal(safetyDatabase.prepare("SELECT COUNT(*) AS count FROM teachers WHERE id = ?").get(postRestoreTeacherId).count, 0);
+  } finally {
+    safetyDatabase.close();
+  }
+  report("完整系统恢复先锁后建耐久安全副本，跨进程在途写入按线性顺序零丢失");
+}
+
 function verifyFinalDatabase() {
   // 所有服务器停止后再做 SQLite 自检，避免后台连接或尚未结束的 HTTP 请求干扰结果。
   const db = new Database(testDatabasePath, { readonly: true });
@@ -1576,6 +1890,7 @@ function verifyFinalDatabase() {
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM course_sections").get().count, 2);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM scheduled_lessons").get().count, 1);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM schedule_backups").get().count, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM auth_sessions").get().count, 0);
   } finally {
     db.close();
   }
@@ -1590,6 +1905,12 @@ function cleanupTemporaryResources() {
         releaseRaceBarrier(releaseFile, nonce).catch(() => undefined)
       )));
       await Promise.allSettled(serverHandles.map((handle) => stopServer(handle)));
+      const externalWriters = [...externalWriterHandles];
+      await Promise.allSettled(externalWriters.map(async (handle) => {
+        await stopServer(handle);
+        await handle.firstBusy.catch(() => undefined);
+        await handle.promise.catch(() => undefined);
+      }));
       if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
     })();
   }
@@ -1597,7 +1918,6 @@ function cleanupTemporaryResources() {
 }
 
 function installTerminationCleanup() {
-  // 开发人员中断或 CI 终止时先释放 barrier、停止 A/B、删除临时 SQLite，再按信号退出。
   for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
     process.once(signal, () => {
       void cleanupTemporaryResources()
@@ -1685,6 +2005,7 @@ async function run() {
   await verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);
   await verifyAuthenticationRaces(serverA, serverB, fixture);
+  await verifyAtomicFullSystemRestore(serverA, serverB);
 
   await Promise.all(serverHandles.map((handle) => stopServer(handle)));
   verifyFinalDatabase();

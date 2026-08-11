@@ -1,6 +1,9 @@
-// 公共网址可放在 -- 后传入，也可通过环境变量提供。
-// 同一套检查仍支持 localhost，便于部署前在本地完整验证。
-const rawBaseUrl = process.argv[2] || process.env.TIMETABLING_DEPLOYMENT_URL || "http://127.0.0.1:3000";
+// 公共网址可放在 -- 后传入，也可通过环境变量提供。localhost 仍可用于本地诊断，
+// 但必须显式传入；缺少网址时直接失败，避免把无意检查本机误记为 Railway 发布证据。
+const rawBaseUrl = process.argv[2] || process.env.TIMETABLING_DEPLOYMENT_URL;
+if (!rawBaseUrl) {
+  throw new Error("Provide the deployment URL, for example: npm run verify:deployment -- https://service.example");
+}
 const baseUrl = new URL(rawBaseUrl);
 const isLocalhost = ["127.0.0.1", "localhost", "::1"].includes(baseUrl.hostname);
 
