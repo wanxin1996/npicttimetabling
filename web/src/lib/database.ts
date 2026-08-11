@@ -136,6 +136,8 @@ export type UnavailableWindowRecord = { id: string; kind: "Teacher" | "Year"; ow
 export type ScheduleIssueRecord = {
   id: string;
   lessonId: string;
+  sectionId: string;
+  occurrence: number;
   sectionLabel: string;
   primaryYear: number;
   dayOfWeek: number;
@@ -147,6 +149,14 @@ export type ScheduleIssueRecord = {
   category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload";
   severity: "High" | "Warning" | "Advisory";
   message: string;
+};
+
+export type YearTimetableWorkspaceRecord = {
+  lessons: ScheduledLessonRecord[];
+  unscheduledSections: UnscheduledSectionRecord[];
+  issues: ScheduleIssueRecord[];
+  teachers: TeacherRecord[];
+  rooms: RoomRecord[];
 };
 
 export type CandidateSlotRecord = {
@@ -1657,6 +1667,7 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   // 年级总表按课程的主要年级筛选；每条排课记录仍保留全部跨年级学生班级关联，
   // 因此其他年级发生重叠时仍能正确提示冲突。
   const rows = database().prepare(`
+    /* timetabling:year-workspace-lessons */
     SELECT lessons.id, lessons.section_id, courses.code, sections.sequence, teachers.id AS teacher_id, teachers.name AS teacher_name,
       lessons.day_of_week, lessons.start_hour, lessons.duration_hours, lessons.room_id,
       lessons.warnings_json, lessons.occurrence, lessons.revision, courses.sessions_per_week,
@@ -2065,6 +2076,8 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
       issues.push({
         id: `${row.id}:${index}`,
         lessonId: row.id,
+        sectionId: row.section_id,
+        occurrence: row.occurrence,
         sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`,
         primaryYear: row.primary_year,
         dayOfWeek: row.day_of_week,
@@ -2079,6 +2092,22 @@ export function listScheduleIssues(): ScheduleIssueRecord[] {
     });
   }
   return issues;
+}
+
+export function listYearTimetableWorkspace(year: number): YearTimetableWorkspaceRecord {
+  // 年级总表的卡片、待排清单、问题和下拉资料属于同一个画面。若浏览器分别调用
+  // 多个接口，另一账号可能恰好在两次读取之间 Return／重新排课，令同一课次短暂
+  // 同时出现在总表与待排区，或两边都没有。单个 DEFERRED 事务让五份结果共享
+  // 第一条 SELECT 固定的 SQLite 已提交快照，前端才能可靠判断课程的最新去向。
+  const db = database();
+  const readWorkspace = db.transaction(() => ({
+    lessons: listScheduledLessons(year),
+    unscheduledSections: listUnscheduledSections(year),
+    issues: listScheduleIssues(),
+    teachers: listTeachers(),
+    rooms: listRooms(),
+  }));
+  return readWorkspace.deferred();
 }
 
 export class CandidateSlotsInputError extends Error {
@@ -2338,7 +2367,12 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
     const conflicts = calculatePlacementWarnings({ sectionId: input.sectionId, teacherId: section.teacher_id, roomId: input.roomId, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: section.duration_hours }, warningStatements);
     const id = crypto.randomUUID();
     try {
-      db.prepare("INSERT INTO scheduled_lessons (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
+      db.prepare(`
+        /* timetabling:year-workspace-race-placement */
+        INSERT INTO scheduled_lessons
+          (id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, input.sectionId, input.occurrence, input.dayOfWeek, input.startHour, section.duration_hours, input.roomId, JSON.stringify(conflicts));
     } catch (error) {
       if (isScheduledOccurrenceUniqueError(error)) throw new ScheduledLessonPlacementConflictError();
       throw error;

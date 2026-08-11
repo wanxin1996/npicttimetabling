@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import * as XLSX from "xlsx";
+import { reconcileLessonDraft } from "../src/lib/lesson-draft-reconciliation.mjs";
 import { parseTeachingMembersWorksheet } from "../src/lib/teaching-members-workbook.mjs";
 
 // 这项回归使用刚生成的 standalone production build，而不是开发服务器。
@@ -30,6 +31,28 @@ let cleanupPromise;
 function report(message) {
   // 每完成一组业务保证就输出一行，方便基础开发人员快速知道失败发生在哪一层。
   console.log(`✓ ${message}`);
+}
+
+function verifyLessonDraftReconciliation() {
+  // 这组纯函数断言直接保护页面轮询使用的协调规则：远端同 revision 可同步派生资料，
+  // 远端改版或删除则必须原样保留当前对象。strictEqual 会在有人复制／替换草稿对象时失败。
+  const currentDraft = { id: "lesson-draft", revision: 4, warning: "local draft marker" };
+  const sameRevision = { id: "lesson-draft", revision: 4, warning: "latest warning" };
+  const changedRevision = { id: "lesson-draft", revision: 5, warning: "another scheduler" };
+
+  const synchronized = reconcileLessonDraft(currentDraft, [sameRevision]);
+  assert.equal(synchronized.stale, false);
+  assert.strictEqual(synchronized.lesson, sameRevision);
+
+  const changed = reconcileLessonDraft(currentDraft, [changedRevision]);
+  assert.equal(changed.stale, true);
+  assert.strictEqual(changed.lesson, currentDraft);
+
+  const removed = reconcileLessonDraft(currentDraft, []);
+  assert.equal(removed.stale, true);
+  assert.strictEqual(removed.lesson, currentDraft);
+  assert.deepEqual(reconcileLessonDraft(null, [sameRevision]), { lesson: null, stale: false });
+  report("Inspector 轮询保留未保存课程草稿");
 }
 
 function keepRecentServerOutput(chunk) {
@@ -764,7 +787,8 @@ async function verifyCrudAndRevisions() {
     },
   })).body;
   assert.equal(movedLesson.revision, lessonOne.revision + 1);
-  await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
+  const beforeStaleLessonMutations = readBusinessSnapshot();
+  const staleLessonPatch = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
     method: "PATCH",
     expectedStatus: 409,
     json: {
@@ -776,10 +800,15 @@ async function verifyCrudAndRevisions() {
       revision: lessonOne.revision,
     },
   });
-  await requestApi(`/api/schedule/lessons/${lessonTwo.id}?revision=${lessonTwo.revision}`, {
+  assert.equal(staleLessonPatch.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert(!/sqlite|database|constraint|scheduled_lessons|section_id|stack/i.test(JSON.stringify(staleLessonPatch.body)));
+  const staleLessonDelete = await requestApi(`/api/schedule/lessons/${lessonTwo.id}?revision=${lessonTwo.revision}`, {
     method: "DELETE",
     expectedStatus: 409,
   });
+  assert.equal(staleLessonDelete.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert(!/sqlite|database|constraint|scheduled_lessons|section_id|stack/i.test(JSON.stringify(staleLessonDelete.body)));
+  assert.deepEqual(readBusinessSnapshot(), beforeStaleLessonMutations);
 
   // 不存在的教室与新改派的停用教室都必须在写入前被拒绝；两次失败不能改变
   // 原教室、时间或 revision，也不能把 SQLite 外键文字发送到浏览器。
@@ -963,7 +992,7 @@ async function verifyCrudAndRevisions() {
   });
   assert.equal(staleCourseSetup.body.code, "COURSE_SETUP_CHANGED");
   assert(!/sqlite|database|constraint/i.test(JSON.stringify(staleCourseSetup.body)));
-  await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
+  const staleInspectorAfterCourseSetup = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
     method: "PATCH",
     expectedStatus: 409,
     json: {
@@ -975,6 +1004,8 @@ async function verifyCrudAndRevisions() {
       revision: currentLessonOne.revision,
     },
   });
+  assert.equal(staleInspectorAfterCourseSetup.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert(!/sqlite|database|constraint|scheduled_lessons|section_id|stack/i.test(JSON.stringify(staleInspectorAfterCourseSetup.body)));
   assert.deepEqual(readBusinessSnapshot(), beforeStaleEditors);
 
   // 恢复原配置，避免改变后面 CRUD 场景的课程长度；恢复本身也是一次真实变化，
@@ -1143,6 +1174,27 @@ async function verifyCrudAndRevisions() {
   await requestApi(`/api/schedule/lessons/${concurrentWinner.id}?revision=${concurrentWinner.revision}`, { method: "DELETE" });
   const unscheduled = (await requestApi("/api/schedule/unscheduled?year=1")).body;
   assert(unscheduled.some((item) => item.id === `${secondSection.id}:1`));
+
+  // 年级页面现在一次读取完整 workspace。生产接口必须返回与各只读接口相同的五份资料，
+  // 并且同一个 section + occurrence 不能同时出现在总表和待排区；否则多人 Return／重排
+  // 正好夹在两个请求之间时，浏览器会依据不存在的混合状态给出错误提示。
+  const workspace = (await requestApi("/api/schedule/workspace?year=1")).body;
+  const [workspaceLessons, workspaceUnscheduled, workspaceIssues, workspaceTeachers, workspaceRooms] = await Promise.all([
+    requestApi("/api/schedule/lessons?year=1"),
+    requestApi("/api/schedule/unscheduled?year=1"),
+    requestApi("/api/issues"),
+    requestApi("/api/teachers"),
+    requestApi("/api/rooms"),
+  ]);
+  assert.deepEqual(workspace.lessons, workspaceLessons.body);
+  assert.deepEqual(workspace.unscheduledSections, workspaceUnscheduled.body);
+  assert.deepEqual(workspace.issues, workspaceIssues.body);
+  assert.deepEqual(workspace.teachers, workspaceTeachers.body);
+  assert.deepEqual(workspace.rooms, workspaceRooms.body);
+  const scheduledOccurrenceKeys = new Set(workspace.lessons.map((lesson) => `${lesson.sectionId}:${lesson.occurrence}`));
+  assert(workspace.unscheduledSections.every((section) => !scheduledOccurrenceKeys.has(section.id)));
+  await requestApi("/api/schedule/workspace?year=4", { expectedStatus: 400 });
+
   await requestApi(`/api/courses/${course.id}/sections`, { method: "PATCH", json: { sectionCount: 1 } });
   assert.equal((await requestApi(`/api/courses/${course.id}/sections`)).body.length, 1);
   report("教师、班级、教室、课程、班次、排课和多人 revision CRUD");
@@ -1741,6 +1793,7 @@ async function run() {
   } catch {
     throw new Error("Standalone build is missing. Run `npm run build` before this verification script.");
   }
+  verifyLessonDraftReconciliation();
 
   // 每次执行都创建全新临时数据库和随机端口，确保测试结果不依赖上一次状态。
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-api-crud-"));

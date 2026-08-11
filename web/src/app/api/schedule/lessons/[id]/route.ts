@@ -58,7 +58,11 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     }));
   } catch (error) {
     if (error instanceof ScheduledLessonNotFoundError) return Response.json({ error: error.message }, { status: 404 });
-    if (error instanceof ScheduledLessonRevisionConflictError) return Response.json({ error: error.message }, { status: 409 });
+    if (error instanceof ScheduledLessonRevisionConflictError) {
+      // 稳定 code 让浏览器只对“旧 Inspector”执行重新载入流程；未来若接口增加其他
+      // 409，前端不会误把不同业务问题都说成另一位老师已经修改课程。
+      return Response.json({ code: "SCHEDULED_LESSON_CHANGED", error: error.message }, { status: 409 });
+    }
     if (error instanceof ScheduledLessonUpdateInputError) return Response.json({ error: error.message }, { status: 400 });
     // warning 重算或 SQLite 发生未知故障时只在服务器保留技术细节，浏览器收到通用 500。
     console.error("Scheduled lesson update failed", error);
@@ -75,7 +79,11 @@ export async function DELETE(request: Request, context: { params: Promise<{ id: 
     return Response.json({ error: "Lesson revision is required." }, { status: 400 });
   }
   try {
-    if (!removeScheduledLesson(id, revision)) return Response.json({ error: "This lesson changed before it could be returned. Review the latest timetable." }, { status: 409 });
+    if (!removeScheduledLesson(id, revision)) {
+      // Return to tray 与普通编辑使用同一并发 code，前端便能统一重载最新卡片，
+      // 同时仍用不同文字说明这次操作原本要把课程退回待排区。
+      return Response.json({ code: "SCHEDULED_LESSON_CHANGED", error: "This lesson changed before it could be returned. Review the latest timetable." }, { status: 409 });
+    }
     return Response.json({ ok: true });
   } catch (error) {
     // 删除和 warning 重算位于同一事务；任何未知失败都会回滚，并只返回安全通用信息。

@@ -538,31 +538,26 @@ async function verifyReadPerformance(schedulerCookies) {
     assert(candidateMedian <= limits.candidateMedianMilliseconds, `Candidate median ${formatMilliseconds(candidateMedian)} exceeded ${limits.candidateMedianMilliseconds} ms.`);
     report(`30 间教室候选位置中位 ${formatMilliseconds(candidateMedian)}`);
 
-    // 模拟三个年级页面真实的五秒轮询：每个账号同时读取总表、待排区、问题、教师和教室。
+    // 模拟三个年级页面真实的五秒轮询：每个账号只请求一次聚合工作区；服务端会在
+    // 同一个 SQLite 快照中读取总表、待排区、问题、教师和教室，既减少请求也避免混合版本。
     const pollWalls = [];
     const pollRequestDurations = [];
     const runPollBurst = async () => {
       const startedAt = performance.now();
       const requests = schedulerCookies.flatMap((cookie, index) => {
         const year = assignedYears[index];
-        return [
-          requestApi(`/api/schedule/lessons?year=${year}`, { cookie }),
-          requestApi(`/api/schedule/unscheduled?year=${year}`, { cookie }),
-          requestApi("/api/issues", { cookie }),
-          requestApi("/api/teachers", { cookie }),
-          requestApi("/api/rooms", { cookie }),
-        ];
+        return [requestApi(`/api/schedule/workspace?year=${year}`, { cookie })];
       });
       const results = await Promise.all(requests);
-      // flatMap 保证每个账号依次返回总表、待排、问题、教师和教室；逐项锁定固定资料量。
+      // 每个账号返回一份完整工作区；逐项锁定固定资料量，防止错误空响应因为更快而让性能门槛假绿。
       for (let accountIndex = 0; accountIndex < schedulerCookies.length; accountIndex += 1) {
-        const offset = accountIndex * 5;
         const year = assignedYears[accountIndex];
-        assert.equal(results[offset].body.length, scheduledLessonsPerYear[year]);
-        assert.equal(results[offset + 1].body.length, unscheduledSectionsPerYear[year]);
-        assert.equal(results[offset + 2].body.length, scale.initialIssues);
-        assert.equal(results[offset + 3].body.length, scale.teachers);
-        assert.equal(results[offset + 4].body.length, scale.rooms);
+        const workspace = results[accountIndex].body;
+        assert.equal(workspace.lessons.length, scheduledLessonsPerYear[year]);
+        assert.equal(workspace.unscheduledSections.length, unscheduledSectionsPerYear[year]);
+        assert.equal(workspace.issues.length, scale.initialIssues);
+        assert.equal(workspace.teachers.length, scale.teachers);
+        assert.equal(workspace.rooms.length, scale.rooms);
       }
       return { wall: performance.now() - startedAt, durations: results.map((result) => result.durationMilliseconds) };
     };
@@ -576,7 +571,7 @@ async function verifyReadPerformance(schedulerCookies) {
     const pollP95 = percentile(pollRequestDurations, 0.95);
     assert(pollWallMedian <= limits.pollWallMilliseconds, `Poll wall median ${formatMilliseconds(pollWallMedian)} exceeded ${limits.pollWallMilliseconds} ms.`);
     assert(pollP95 <= limits.pollP95Milliseconds, `Poll request p95 ${formatMilliseconds(pollP95)} exceeded ${limits.pollP95Milliseconds} ms.`);
-    report(`六账号 30 请求轮询：整轮中位 ${formatMilliseconds(pollWallMedian)}；请求 p95 ${formatMilliseconds(pollP95)}`);
+    report(`六账号 6 请求一致快照轮询：整轮中位 ${formatMilliseconds(pollWallMedian)}；请求 p95 ${formatMilliseconds(pollP95)}`);
 
     // trigger 建立后才记录 data_version；整个纯读阶段不能提交任何数据库变化。
     assert.equal(observer.pragma("data_version", { simple: true }), dataVersionBefore);
@@ -685,30 +680,32 @@ async function verifyWarningWritePerformance(schedulerCookies) {
   assert(warningRefreshMedian <= limits.warningRefreshMedianMilliseconds, `Warning refresh median ${formatMilliseconds(warningRefreshMedian)} exceeded ${limits.warningRefreshMedianMilliseconds} ms.`);
   report(`360 条课次 warning 全量重算中位 ${formatMilliseconds(warningRefreshMedian)}`);
 
-  // 一个账号写入时，其余五个账号各读取 Issues 和所属年级总表；SQLite 必须串行保持一致，
-  // 但不能出现 500、503 或超过宽松门槛的锁等待。
+  // 一个账号写入时，其余五个账号各读取真实页面使用的聚合 workspace。每份响应都要
+  // 在同一 SQLite 快照内包含总表、待排区、问题、教师和教室，且不能出现锁错误或超时。
   const mixedWalls = [];
   for (let round = 0; round < 3; round += 1) {
     const target = lesson.startHour === originalStartHour ? alternateStartHour : originalStartHour;
     const startedAt = performance.now();
     const writerPromise = moveLesson(schedulerCookies[0], target);
-    const readerPromises = schedulerCookies.slice(1).flatMap((cookie, index) => [
-      requestApi("/api/issues", { cookie }),
-      requestApi(`/api/schedule/lessons?year=${(index % 3) + 1}`, { cookie }),
-    ]);
+    const readerPromises = schedulerCookies.slice(1).map((cookie, index) => requestApi(
+      `/api/schedule/workspace?year=${(index % 3) + 1}`,
+      { cookie },
+    ));
     const [, ...readers] = await Promise.all([writerPromise, ...readerPromises]);
     for (let readerIndex = 0; readerIndex < schedulerCookies.length - 1; readerIndex += 1) {
-      const issuesResult = readers[readerIndex * 2];
-      const yearResult = readers[readerIndex * 2 + 1];
       const year = (readerIndex % 3) + 1;
-      assert(issuesResult.body.length > 0, "Mixed read/write burst returned an empty issue list.");
-      assert.equal(yearResult.body.length, scheduledLessonsPerYear[year]);
+      const workspace = readers[readerIndex].body;
+      assert.equal(workspace.lessons.length, scheduledLessonsPerYear[year]);
+      assert.equal(workspace.unscheduledSections.length, unscheduledSectionsPerYear[year]);
+      assert(workspace.issues.length > 0, "Mixed read/write burst returned an empty issue list.");
+      assert.equal(workspace.teachers.length, scale.teachers);
+      assert.equal(workspace.rooms.length, scale.rooms);
     }
     mixedWalls.push(performance.now() - startedAt);
   }
   const mixedMedian = median(mixedWalls);
   assert(mixedMedian <= limits.mixedBurstMedianMilliseconds, `Mixed burst median ${formatMilliseconds(mixedMedian)} exceeded ${limits.mixedBurstMedianMilliseconds} ms.`);
-  report(`一个 warning 写入 + 十个读取中位 ${formatMilliseconds(mixedMedian)}`);
+  report(`一个 warning 写入 + 五个一致快照读取中位 ${formatMilliseconds(mixedMedian)}`);
 
   // 最终检查资料仍完整；性能测试只允许改变目标课程的位置和 revision。
   const db = new Database(testDatabasePath, { readonly: true });

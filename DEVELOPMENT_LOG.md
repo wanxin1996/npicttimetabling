@@ -2247,3 +2247,48 @@
 1. 增加两个真实浏览器会话的 Course Configure／Inspector 冲突验收，确认服务端 409 之外的重新载入、焦点和提示在老师实际操作中也清楚。
 2. 统一首次排课、班次编辑等剩余写入口在超过 SQLite busy timeout 时的安全 503／Retry-After 语义，并建立旧数据库双进程冷启动迁移专项。
 3. 在规模资料明显增长前加入 Candidate 镜像大小／RSS趋势报告；若超过当前院系规模，再评估 worker 或经过规则依赖审计的白名单内存快照。
+
+## 2026-08-11｜保护多人编辑草稿、统一年级工作区快照并补齐真实并发验收
+
+### 已完成
+
+- Course Configure 与 Inspector 都以 revision 作为多人编辑令牌。服务端的旧版 Scheduled Lesson PATCH／DELETE 409 现在带稳定 `SCHEDULED_LESSON_CHANGED` code；浏览器只在状态和 code 同时匹配时进入协作冲突流程，其他 409 不会被误判。
+- 新增独立 `lesson-draft-reconciliation` helper：五秒轮询看到相同 revision 时同步服务器派生资料；看到更高 revision 或课程已被退回时，保留老师当前打开的同一个草稿对象并显示 stale 提醒，不再用新 key 静默重建星期、时间、教师、教室和学生班级字段。
+- Inspector 的 Save、Return 和已排课程拖动共用同步 ref 锁与可见 state。快速双击、Save／Return 交叉、保存中拖动、切换 Workspace／年级／账号／问题或再开待排表单都被阻止，完成后才恢复入口。
+- 已排课程拖动在 drag-start 保存完整课程和当时的 revision；drop 不会借五秒轮询刚收到的新版 revision 覆盖另一位老师已经完成的移动。
+- 冲突刷新会区分四种真实去向：原 lesson 仍在、同一个 `section + occurrence` 已用新 ID 重新排入、确实退回当前年级待排区、或已离开当前年级／周期。提示、Inspector／待排抽屉状态和焦点分别与去向一致。
+- Return 200 后也不再无条件宣称“已进入待排区”。系统会重新读取一致工作区；若另一账号已经立即重排，则打开新 lesson；若课程改年级，则给出中性准确说明。
+- Course Configure 保存使用同步锁，保存中停用会卸载表单或切换资料的入口。成功和 409 都按稳定 course ID 恢复到同一门课程的 Configure 按钮；刷新失败时回到课程搜索框，不会重开仍带旧 revision 的不可信表单。
+- Course Configure 打开后聚焦 Duration；Inspector 从隐藏状态因冲突重开时聚焦 Day。新增一次性 `pendingInspectorFocusRef`，让唯一 opening Effect 决定 Day 或 Close，消除了两个 `requestAnimationFrame` 先后抢焦点的竞态。
+- 主动换年级、保存后刷新和冲突重载拥有高于五秒轮询的 generation。主动请求开始前废弃旧轮询，主动请求在途时新 tick 不领取号码；旧成功和旧失败都不能倒灌或覆盖新提示。
+- 新增 `/api/schedule/workspace`。服务端在一个 SQLite `DEFERRED` 只读事务中读取已排课程、待排课程、问题、教师和教室，五份资料共享第一条 SELECT 固定的已提交快照。`openTimetable`、年级轮询和从问题清单打开课程全部改用这一份聚合 payload。
+- 聚合接口解决了独立 `/lessons` 与 `/unscheduled` 请求的既有边界：另一账号恰好 Return／重排时，同一个逻辑课次不会在单次页面刷新中同时出现于总表和待排区，也不会因为混合两个版本而两边都缺失。
+- 从问题清单打开课程现在也复用主动 `openTimetable` 流程；Schedule Issue 增加稳定 `sectionId + occurrence`，可以识别 Return 后立刻重建的新 lesson ID，同时受到相同 generation 保护。
+- 年级页面每个账号的一次五秒轮询从5个 HTTP 请求减少为1个聚合请求。性能门槛相应改成六账号6请求，并在写入并发阶段真实执行5个聚合 workspace 读取，不再测试旧页面请求形状。
+- 所有新增／修改的生产、测试和脚本区块都加入面向基础开发人员的中文注释，说明业务原因、事务边界、竞态时序和失败清理。老师尚未提交的 package UX 两条命令、两份 UX 脚本和两份 UX 文档保持不动，未纳入本次提交。
+
+### 真实浏览器验收
+
+- 使用一个真实应用内浏览器和一个拥有独立 Cookie 的第二排课账号／API actor，在隔离临时 SQLite 上验证多人操作；没有连接正式数据库，也没有把单浏览器测试误写成两个浏览器 context。
+- Course Configure：浏览器保留容量77草稿，第二账号先保存容量41；浏览器随后收到409、旧表单关闭、焦点回到准确的 `Configure BROWSER101`，重开后显示赢家41且 Duration 获焦。
+- Inspector：浏览器保留 Thursday 14:00 草稿与当前 Start 焦点，第二账号改为 Friday 08:00；跨过一次五秒轮询后本地草稿和焦点仍保留并出现 stale 提醒，Save 409 后载入 Friday 08:00且 Day 获焦。
+- 远端 Return：本地13:00草稿跨轮询保留；浏览器 Return 409 后 Inspector 关闭、待排区打开、焦点落在待排 Close，提示准确说明已退回。
+- Return 后立即重排：旧 lesson ID 保存得到404后，浏览器按相同 `section + occurrence` 找到新 ID、打开 Wednesday 10:00最新版并聚焦 Day，没有误报待排。
+- 课程主年级从Y1改到Y2后，旧Y1 Inspector 冲突不会打开Y1待排区；提示说明课程可能已移到其他年级。切换Y2并跨过轮询仍停在Y2，新 lesson 正常可见。
+- 验收结束已关闭临时浏览器标签，并删除 `/private/tmp/timetabling-browser.CY0wdw` 中不可恢复但完全可丢弃的测试数据库与 Cookie。
+
+### 自动回归与结果
+
+- CRUD 回归新增 reconciliation 的对象身份断言，并锁定 Scheduled Lesson stale PATCH、stale DELETE、Course Setup 提高 lesson revision 后旧 Inspector 三条路径的稳定 code、安全正文和完整业务表零变化。
+- 双 standalone 新增同一 lesson／同一 revision 的 PATCH 竞态：两个真实进程必须严格得到一个200和一个409；赢家整组字段、lesson revision和section revision只增加一次，败方顺序重试仍409且14张业务表零变化。
+- 年级 workspace 新增确定性快照竞态。A 在真实旧 lessons `.all()` 后暂停；B 在真实 INSERT 后暂停。释放B后，测试用 `busy_timeout=0` 的新只读连接观察 DELETE journal 的真实 `SQLITE_BUSY／PENDING`，证明 B 已到 COMMIT且正被 A 的 SHARED snapshot 挡住，再释放A。A必须返回完整旧版，随后A／B都返回完整新版；没有固定 sleep 假阳性。
+- `git diff --check`、独立 TypeScript、ESLint、production build、`npm run test:concurrency` 和最终 `npm run test:release` 全部通过。测试共构建25个页面／API路由，并覆盖身份、Excel、Teaching allocation、CRUD／revision、warning 原子回滚、完整备份、Cycle、Candidate故障、跨进程和SQLite外键。
+- 最新374班次规模结果：Issues p95中位 `19.0 ms`、Year endpoint p95 `99.5 ms`、30间教室 Candidate中位 `166.8 ms`、六账号6请求一致快照轮询整轮中位 `30.6 ms`／请求p95 `33.0 ms`、360条 warning重算 `77.8 ms`、一个写入加5个一致快照读取 `118.6 ms`。
+- Prepared Statement审计仍为 Candidate `16 prepare／12,600 execute`、最高复用900倍；全量 warning刷新 `16／5,288`、最高600倍。
+- 正式 `web/data/timetabling.db` 最终仍为 `2026-08-11 04:45:51`、544,768 bytes，`integrity_check=ok` 且 `foreign_key_check` 为空。自动化只使用 `os.tmpdir()` 临时库，收尾未发现 `timetabling-api-*` 或 `timetabling-db-init-*` 残留。
+
+### 下一步
+
+1. 若之后引入 Playwright／浏览器测试框架，把本轮 Course Configure 与 Inspector 的 `document.activeElement`、stale banner 和五字段草稿保护固化成一键 UI 回归；当前已完成真实浏览器人工验收和底层纯函数门槛。
+2. 为聚合 workspace 等剩余只读路由统一 SQLite `BUSY／LOCKED` 的安全503与 `Retry-After: 1`，并继续保持正式部署单应用实例。
+3. 继续本地完善排课功能和易用性；所有功能稳定后再进入免费／低频上线方案，不需要为了本轮测试提前部署。

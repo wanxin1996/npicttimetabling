@@ -448,6 +448,28 @@ function readDatabaseValue(sql, ...parameters) {
   }
 }
 
+async function waitForPendingRollbackJournalWriter(description) {
+  // DELETE journal 中，writer 完成业务 SQL 并开始 COMMIT 时会先取得 PENDING 锁，
+  // 阻止新的 reader 加入，再等待旧 SHARED reader 退出。用 busy_timeout=0 的新连接
+  // 观察真实 SQLITE_BUSY，比固定 sleep 更能证明 writer 已到达 COMMIT 边界。
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    let observer;
+    try {
+      observer = new Database(testDatabasePath, { readonly: true });
+      observer.pragma("busy_timeout = 0");
+      observer.prepare("SELECT COUNT(*) AS count FROM scheduled_lessons").get();
+    } catch (error) {
+      if (error?.code === "SQLITE_BUSY" || error?.code === "SQLITE_LOCKED") return;
+      throw error;
+    } finally {
+      observer?.close();
+    }
+    await delay(25);
+  }
+  throw new Error(`${description} never reached the rollback-journal PENDING lock before timeout.`);
+}
+
 function assertCandidateSnapshot(body, fixture, expectedCapacity) {
   // 旧快照容量20不满足课程最低30，所以必须没有候选；新快照容量40时，
   // 午餐规则会排除12:00，留下每天七个2小时整点位置，共35项。
@@ -738,6 +760,148 @@ async function verifyCandidateFailureBoundaries(serverA, fixture) {
   report("Candidate 的真实 BUSY 503 与内部故障500均固定、安全且零写入");
 }
 
+async function verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture) {
+  // Section 1 尚未排课。先锁定完整旧版：总表没有目标课次，待排区必须有它。
+  const sectionId = fixture.sections[0].id;
+  const sessionId = `${sectionId}:1`;
+  const workspacePath = "/api/schedule/workspace?year=1";
+  const oldWorkspace = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  assert(!oldWorkspace.body.lessons.some((lesson) => lesson.sectionId === sectionId && lesson.occurrence === 1));
+  assert(oldWorkspace.body.unscheduledSections.some((section) => section.id === sessionId));
+
+  const snapshotNonce = randomBytes(16).toString("hex");
+  const placementNonce = randomBytes(16).toString("hex");
+  const snapshotControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "A",
+    nonce: snapshotNonce,
+    year: 1,
+    sectionId,
+  };
+  const placementControl = {
+    version: 1,
+    runToken: authRaceRunToken,
+    label: "B",
+    nonce: placementNonce,
+    sectionId,
+    occurrence: 1,
+  };
+  const files = {
+    snapshotArm: path.join(authRaceControlDirectory, "year-workspace-arm-A.json"),
+    snapshotTemporary: path.join(authRaceControlDirectory, `year-workspace-arm-A-${snapshotNonce}.tmp`),
+    snapshotReady: path.join(authRaceControlDirectory, `year-workspace-ready-A-${snapshotNonce}.json`),
+    snapshotRelease: path.join(authRaceControlDirectory, `year-workspace-release-${snapshotNonce}.txt`),
+    placementArm: path.join(authRaceControlDirectory, "year-workspace-placement-arm-B.json"),
+    placementTemporary: path.join(authRaceControlDirectory, `year-workspace-placement-arm-B-${placementNonce}.tmp`),
+    placementReady: path.join(authRaceControlDirectory, `year-workspace-placement-ready-B-${placementNonce}.json`),
+    placementRelease: path.join(authRaceControlDirectory, `year-workspace-placement-release-${placementNonce}.txt`),
+  };
+  activeRaceReleases.set(files.snapshotRelease, snapshotNonce);
+  activeRaceReleases.set(files.placementRelease, placementNonce);
+  await writeFile(files.snapshotTemporary, JSON.stringify(snapshotControl), { flag: "wx", mode: 0o600 });
+  await rename(files.snapshotTemporary, files.snapshotArm);
+
+  let workspaceSettled = false;
+  let placementSettled = false;
+  let placementResult;
+  let pendingPlacement;
+  const pendingWorkspace = requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+  pendingWorkspace.then(
+    () => { workspaceSettled = true; },
+    () => { workspaceSettled = true; },
+  );
+  try {
+    await waitForRaceReady(
+      serverA,
+      files.snapshotReady,
+      snapshotControl,
+      () => workspaceSettled,
+      "Year workspace snapshot consistency",
+      "the materialized old lessons query",
+    );
+
+    await writeFile(files.placementTemporary, JSON.stringify(placementControl), { flag: "wx", mode: 0o600 });
+    await rename(files.placementTemporary, files.placementArm);
+    pendingPlacement = requestApi(serverB, "/api/schedule/lessons", {
+      method: "POST",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: 201,
+      json: { sectionId, occurrence: 1, dayOfWeek: 3, startHour: 10, roomId: null },
+    });
+    pendingPlacement.then(
+      () => { placementSettled = true; },
+      () => { placementSettled = true; },
+    );
+    await waitForRaceReady(
+      serverB,
+      files.placementReady,
+      placementControl,
+      () => placementSettled,
+      "Year workspace placement",
+      "the applied scheduled lesson INSERT",
+    );
+
+    // B 已真实 INSERT。先只释放 B 的测试暂停点；正式 DELETE journal 下，如果 A 的
+    // DEFERRED 快照仍覆盖后续四份查询，B 的 COMMIT 必须继续等待 A 释放读事务。
+    await releaseRaceBarrier(files.placementRelease, placementNonce);
+    await waitForPendingRollbackJournalWriter("Year workspace placement");
+    assert.equal(placementSettled, false, "The writer committed while the year workspace snapshot should still hold its read transaction.");
+    assert.equal(workspaceSettled, false, "The workspace request left its snapshot barrier before the writer reached COMMIT.");
+
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce);
+    const completedRequests = await Promise.all([pendingWorkspace, pendingPlacement]);
+    const raceWorkspace = completedRequests[0];
+    placementResult = completedRequests[1];
+    assert.equal(placementResult.response.status, 201);
+    // A 必须完整返回写入前版本；不能同时缺少目标课次，也把它从待排区移除。
+    assert.deepEqual(raceWorkspace.body, oldWorkspace.body);
+    const savedDuringSnapshot = readDatabaseValue(
+      "SELECT id, revision FROM scheduled_lessons WHERE section_id = ? AND occurrence = 1",
+      sectionId,
+    );
+    assert.equal(savedDuringSnapshot.id, placementResult.body.id);
+
+    // A 结束后两个 standalone 都必须看到完整新版：目标只在总表，不能仍留在 tray。
+    const [newWorkspaceA, newWorkspaceB] = await Promise.all([
+      requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie }),
+      requestApi(serverB, workspacePath, { cookie: fixture.schedulerBCookie }),
+    ]);
+    assert.deepEqual(newWorkspaceA.body, newWorkspaceB.body);
+    assert(newWorkspaceA.body.lessons.some((lesson) => lesson.id === placementResult.body.id));
+    assert(!newWorkspaceA.body.unscheduledSections.some((section) => section.id === sessionId));
+
+    // 恢复 fixture，后面的“两个账号同时首次排课”仍从同一待排状态开始。
+    await requestApi(serverB, `/api/schedule/lessons/${placementResult.body.id}?revision=${placementResult.body.revision}`, {
+      method: "DELETE",
+      cookie: fixture.schedulerBCookie,
+    });
+    placementResult = undefined;
+    const restoredWorkspace = await requestApi(serverA, workspacePath, { cookie: fixture.schedulerACookie });
+    assert(!restoredWorkspace.body.lessons.some((lesson) => lesson.sectionId === sectionId && lesson.occurrence === 1));
+    assert(restoredWorkspace.body.unscheduledSections.some((section) => section.id === sessionId));
+  } finally {
+    // 失败时先释放两侧同步等待，再尽量退回测试课次；不能留下 child 或 SQLite 锁。
+    await releaseRaceBarrier(files.placementRelease, placementNonce).catch(() => undefined);
+    await releaseRaceBarrier(files.snapshotRelease, snapshotNonce).catch(() => undefined);
+    activeRaceReleases.delete(files.placementRelease);
+    activeRaceReleases.delete(files.snapshotRelease);
+    await pendingWorkspace.catch(() => undefined);
+    await pendingPlacement?.catch(() => undefined);
+    if (placementResult?.body?.id) {
+      const saved = readDatabaseValue("SELECT revision FROM scheduled_lessons WHERE id = ?", placementResult.body.id);
+      if (saved) {
+        await requestApi(serverB, `/api/schedule/lessons/${placementResult.body.id}?revision=${saved.revision}`, {
+          method: "DELETE",
+          cookie: fixture.schedulerBCookie,
+        }).catch(() => undefined);
+      }
+    }
+    await Promise.all(Object.values(files).map((filename) => rm(filename, { force: true }).catch(() => undefined)));
+  }
+  report("年级聚合工作区跨进程只返回完整旧版或完整新版，不会混合总表与待排区");
+}
+
 async function verifyConcurrentFirstPlacement(serverA, serverB, fixture) {
   // 两个进程为同一个班次、同一个 weekly occurrence 选择不同位置；数据库唯一键
   // 和 IMMEDIATE 顺序必须产生一个明确赢家，而不是两条记录或通用 500。
@@ -921,6 +1085,144 @@ async function verifyConcurrentCourseSetup(serverA, serverB, fixture) {
   assert.deepEqual(readCycleSnapshot(), snapshotBeforeStaleRetry);
   fixture.setupRevision = savedCourse.revision;
   report("跨进程 Course Setup 严格得到一个 200 和一个 409");
+}
+
+async function verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture) {
+  // Course Setup 已经把这一课次的 revision 提高一次。现在让两个独立服务拿着
+  // 同一个最新 revision，同时把星期、时间、教室、教师和学生班级改成两套完全
+  // 不同的组合；最终资料必须完整来自同一个赢家，不能混入败方的任何字段。
+  const lessonBeforeUpdate = readDatabaseValue(
+    "SELECT * FROM scheduled_lessons WHERE section_id = ? AND occurrence = 1",
+    fixture.sections[0].id,
+  );
+  const sectionBeforeUpdate = readDatabaseValue(
+    "SELECT * FROM course_sections WHERE id = ?",
+    fixture.sections[0].id,
+  );
+  assert(lessonBeforeUpdate);
+  assert(sectionBeforeUpdate);
+  assert.equal(sectionBeforeUpdate.teacher_id, null);
+  assert.deepEqual(
+    readCycleSnapshot().sectionGroups.filter((link) => link.section_id === fixture.sections[0].id),
+    [],
+  );
+
+  const updateCandidates = [
+    {
+      dayOfWeek: 3,
+      startHour: 8,
+      roomId: fixture.candidateRoom.id,
+      teacherId: fixture.candidateTeacher.id,
+      studentGroupIds: [],
+      revision: lessonBeforeUpdate.revision,
+    },
+    {
+      dayOfWeek: 5,
+      startHour: 13,
+      roomId: null,
+      teacherId: null,
+      studentGroupIds: [fixture.candidateGroup.id],
+      revision: lessonBeforeUpdate.revision,
+    },
+  ];
+  const results = await runWhileBothWritersAreBlocked(
+    "Concurrent Scheduled Lesson update",
+    serverA,
+    serverB,
+    () => requestApi(serverA, `/api/schedule/lessons/${lessonBeforeUpdate.id}`, {
+      method: "PATCH",
+      cookie: fixture.schedulerACookie,
+      expectedStatus: [200, 409],
+      json: updateCandidates[0],
+    }),
+    () => requestApi(serverB, `/api/schedule/lessons/${lessonBeforeUpdate.id}`, {
+      method: "PATCH",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: [200, 409],
+      json: updateCandidates[1],
+    }),
+  );
+  assert.deepEqual(results.map((result) => result.response.status).sort(), [200, 409]);
+  const winnerIndex = results.findIndex((result) => result.response.status === 200);
+  const loserIndex = 1 - winnerIndex;
+  const winner = results[winnerIndex];
+  const loser = results[loserIndex];
+  const winnerInput = updateCandidates[winnerIndex];
+  assert.deepEqual(Object.keys(loser.body).sort(), ["code", "error"]);
+  assert.equal(loser.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert(
+    !/sqlite|database|constraint|scheduled_lessons|course_sections|section_student_groups|revision\s*=|stack/i.test(JSON.stringify(loser.body)),
+  );
+
+  // HTTP 赢家必须逐字段反映自己的完整输入，并且 revision 只能增加一次。
+  // warning 也与数据库保存值核对，避免接口返回成功但事务只写入部分资料。
+  assert.deepEqual(
+    {
+      id: winner.body.id,
+      sectionId: winner.body.sectionId,
+      occurrence: winner.body.occurrence,
+      dayOfWeek: winner.body.dayOfWeek,
+      startHour: winner.body.startHour,
+      roomId: winner.body.roomId,
+      teacherId: winner.body.teacherId,
+      studentGroupIds: winner.body.studentGroupIds,
+      revision: winner.body.revision,
+    },
+    {
+      id: lessonBeforeUpdate.id,
+      sectionId: lessonBeforeUpdate.section_id,
+      occurrence: lessonBeforeUpdate.occurrence,
+      dayOfWeek: winnerInput.dayOfWeek,
+      startHour: winnerInput.startHour,
+      roomId: winnerInput.roomId,
+      teacherId: winnerInput.teacherId,
+      studentGroupIds: winnerInput.studentGroupIds,
+      revision: lessonBeforeUpdate.revision + 1,
+    },
+  );
+
+  const lessonAfterUpdate = readDatabaseValue(
+    "SELECT * FROM scheduled_lessons WHERE id = ?",
+    lessonBeforeUpdate.id,
+  );
+  assert.equal(lessonAfterUpdate.section_id, lessonBeforeUpdate.section_id);
+  assert.equal(lessonAfterUpdate.occurrence, lessonBeforeUpdate.occurrence);
+  assert.equal(lessonAfterUpdate.day_of_week, winnerInput.dayOfWeek);
+  assert.equal(lessonAfterUpdate.start_hour, winnerInput.startHour);
+  assert.equal(lessonAfterUpdate.duration_hours, lessonBeforeUpdate.duration_hours);
+  assert.equal(lessonAfterUpdate.room_id, winnerInput.roomId);
+  assert.equal(lessonAfterUpdate.revision, lessonBeforeUpdate.revision + 1);
+  assert.deepEqual(JSON.parse(lessonAfterUpdate.warnings_json), winner.body.warnings);
+
+  // 两套候选都会真实改变一项共享分配，所以 section revision 也只应增加一次；
+  // 教师和学生班级必须同时来自赢家，不能出现 A 的教师配上 B 的班级。
+  const sectionAfterUpdate = readDatabaseValue(
+    "SELECT * FROM course_sections WHERE id = ?",
+    fixture.sections[0].id,
+  );
+  assert.equal(sectionAfterUpdate.teacher_id, winnerInput.teacherId);
+  assert.equal(sectionAfterUpdate.revision, sectionBeforeUpdate.revision + 1);
+  const savedStudentGroupIds = readCycleSnapshot().sectionGroups
+    .filter((link) => link.section_id === fixture.sections[0].id)
+    .map((link) => link.student_group_id);
+  assert.deepEqual(savedStudentGroupIds, winnerInput.studentGroupIds);
+
+  // 锁释放后让败方用原请求顺序重试，必须稳定返回同一业务409；完整14表快照
+  // 前后相同，证明旧 revision 不会再次增加版本或留下半完成的共享分配。
+  const snapshotBeforeStaleRetry = readFullBusinessSnapshot();
+  const staleRetry = await requestApi(loserIndex === 0 ? serverA : serverB, `/api/schedule/lessons/${lessonBeforeUpdate.id}`, {
+    method: "PATCH",
+    cookie: loserIndex === 0 ? fixture.schedulerACookie : fixture.schedulerBCookie,
+    expectedStatus: 409,
+    json: updateCandidates[loserIndex],
+  });
+  assert.deepEqual(Object.keys(staleRetry.body).sort(), ["code", "error"]);
+  assert.equal(staleRetry.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert(
+    !/sqlite|database|constraint|scheduled_lessons|course_sections|section_student_groups|revision\s*=|stack/i.test(JSON.stringify(staleRetry.body)),
+  );
+  assert.deepEqual(readFullBusinessSnapshot(), snapshotBeforeStaleRetry);
+  report("跨进程 Scheduled Lesson PATCH 严格得到一个 200 和一个 409");
 }
 
 async function verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture) {
@@ -1282,8 +1584,10 @@ async function run() {
 
   await verifyCandidateSnapshotConsistency(serverA, serverB, fixture);
   await verifyCandidateFailureBoundaries(serverA, fixture);
+  await verifyYearWorkspaceSnapshotConsistency(serverA, serverB, fixture);
   await verifyConcurrentFirstPlacement(serverA, serverB, fixture);
   await verifyConcurrentCourseSetup(serverA, serverB, fixture);
+  await verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);
   await verifyAuthenticationRaces(serverA, serverB, fixture);
 
@@ -1394,6 +1698,8 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
     courseId: course.id,
     setupRevision: initialSetup.body.revision,
     sections,
+    candidateTeacher,
+    candidateGroup,
     candidateRoom,
     candidateSectionId: sections[1].id,
     schedulerACookie: schedulerA.cookie,

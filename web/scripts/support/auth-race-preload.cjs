@@ -44,6 +44,8 @@ const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 const candidateEntrySqlMarker = "/* timetabling:candidate-entry */";
 const candidateSnapshotSqlMarker = "/* timetabling:candidate-snapshot */";
 const candidateRoomUpdateSqlMarker = "/* timetabling:candidate-race-room-update */";
+const yearWorkspaceLessonsSqlMarker = "/* timetabling:year-workspace-lessons */";
+const yearWorkspacePlacementSqlMarker = "/* timetabling:year-workspace-race-placement */";
 const databaseInitializationSqlMarker = "/* timetabling:database-initialization */";
 let pendingInitializationClose;
 
@@ -120,6 +122,53 @@ function consumeCandidateSnapshotArm(rooms) {
     waitForRaceRelease(releaseFile, control.nonce, "candidate snapshot");
   } catch (error) {
     // arm 不存在表示普通候选请求；已经被同一请求消费也可直接继续。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeYearWorkspaceSnapshotArm(rows, year) {
+  // A 已经把旧版 lessons 完整物化后才暂停。正式 DELETE journal 配置下，只要
+  // workspace 的 DEFERRED 事务仍在，B 就能执行 INSERT，但 COMMIT 必须等待 A 读完。
+  if (processLabel !== "A") return;
+  const workspaceArmFile = path.join(controlDirectory, "year-workspace-arm-A.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(workspaceArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel || control.year !== year) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    if (typeof control.sectionId !== "string" || !Array.isArray(rows)) return;
+    // 本轮 fixture 的目标课次起初必须仍在待排区；若首条查询已经看到它，不能用错误
+    // 基线生成 ready 并让一致性测试假绿。
+    if (rows.some((row) => row && row.section_id === control.sectionId)) return;
+    const readyFile = path.join(controlDirectory, `year-workspace-ready-A-${control.nonce}.json`);
+    fs.renameSync(workspaceArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `year-workspace-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "year workspace snapshot");
+  } catch (error) {
+    // 没有 arm 的普通总表或聚合工作区读取保持透明；损坏控制文件必须让测试失败。
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function consumeYearWorkspacePlacementArm(sectionId, occurrence, changes) {
+  // B 的首次排课 INSERT 已在 IMMEDIATE 事务内真实执行后才暂停。主测试先释放 B，
+  // 再证明它仍因 A 的 workspace 读事务无法 COMMIT；不能只靠请求启动时间猜测并发。
+  if (processLabel !== "B" || changes !== 1) return;
+  const placementArmFile = path.join(controlDirectory, "year-workspace-placement-arm-B.json");
+  try {
+    const control = JSON.parse(fs.readFileSync(placementArmFile, "utf8"));
+    if (!control || typeof control !== "object" || control.version !== 1) return;
+    if (control.runToken !== runToken || control.label !== processLabel) return;
+    if (control.sectionId !== sectionId || control.occurrence !== occurrence) return;
+    if (typeof control.nonce !== "string" || !/^[a-f0-9]{32}$/.test(control.nonce)) return;
+    const readyFile = path.join(controlDirectory, `year-workspace-placement-ready-B-${control.nonce}.json`);
+    fs.renameSync(placementArmFile, readyFile);
+    const releaseFile = path.join(controlDirectory, `year-workspace-placement-release-${control.nonce}.txt`);
+    waitForRaceRelease(releaseFile, control.nonce, "year workspace placement");
+  } catch (error) {
+    // 没有 arm 的普通首次排课保持透明；损坏控制文件必须让测试失败。
     if (error && error.code === "ENOENT") return;
     throw error;
   }
@@ -215,8 +264,8 @@ function patchBetterSqlite3(Database) {
     return result;
   };
   Database.prototype.prepare = function testAwarePrepare(...argumentsList) {
-    // 只包装三个 Statement marker：Candidate 首条读取、Active rooms 读取，以及本回归
-    // 使用的教室 UPDATE。数据库初始化使用上方 exec marker，其余 SQL 保持透明。
+    // 只包装五个 Statement marker：Candidate 首条读取、Active rooms 读取、候选竞态
+    // 教室 UPDATE，以及年级 workspace 的首条读取和测试首次排课。其余 SQL 保持透明。
     const statement = Reflect.apply(originalPrepare, this, argumentsList);
     const [sql] = argumentsList;
     if (typeof sql !== "string") return statement;
@@ -243,6 +292,22 @@ function patchBetterSqlite3(Database) {
         const result = Reflect.apply(originalRun, this, runArguments);
         // 教室 ID 是 UPDATE 的最后一个参数；只有目标行确实改变后才允许写入 ready 证据。
         consumeCandidateRoomUpdateArm(runArguments.at(-1), result.changes);
+        return result;
+      };
+    }
+    if (sql.includes(yearWorkspaceLessonsSqlMarker)) {
+      const originalAll = statement.all;
+      statement.all = function yearWorkspaceAwareAll(...allArguments) {
+        const rows = Reflect.apply(originalAll, this, allArguments);
+        consumeYearWorkspaceSnapshotArm(rows, Number(allArguments[0]));
+        return rows;
+      };
+    }
+    if (sql.includes(yearWorkspacePlacementSqlMarker)) {
+      const originalRun = statement.run;
+      statement.run = function yearWorkspacePlacementAwareRun(...runArguments) {
+        const result = Reflect.apply(originalRun, this, runArguments);
+        consumeYearWorkspacePlacementArm(runArguments[1], runArguments[2], result.changes);
         return result;
       };
     }
