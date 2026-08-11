@@ -181,6 +181,7 @@ export type ScheduledLessonRecord = {
 
 export type UnscheduledSectionRecord = {
   id: string;
+  sectionId: string;
   label: string;
   teacherName: string | null;
   teacherIsActive: boolean | null;
@@ -2960,6 +2961,15 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     const currentGroupIds = currentGroups.map((group) => group.student_group_id);
     const sortedStudentGroupIds = [...studentGroupIds].sort();
     const groupsChanged = currentGroupIds.length !== sortedStudentGroupIds.length || currentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
+
+    // revision 必须先于同值判断验证，旧页面即使碰巧提交了当前值也仍然是并发冲突。
+    // 通过验证的同值表单则在任何 UPDATE 或 warning 刷新前返回，避免无意义地让其他
+    // Inspector 失效；分配差异仍取自本次事务，保持响应原有的一致快照契约。
+    if (!teacherChanged && !groupsChanged) {
+      const allocationVariances = listCourseAllocationVariances(section.course_id);
+      return { courseId: section.course_id, revision: section.revision, changed: false, allocationVariances };
+    }
+
     // revision 的比较必须出现在 UPDATE 条件中，不能只依靠前面的 SELECT；这样即使另一进程
     // 恰好在两条语句之间先保存，changes 也会变成 0，并触发明确的并发冲突。
     const updateResult = teacherChanged
@@ -2984,7 +2994,7 @@ export function updateCourseSection(id: string, input: { teacherId: string | nul
     // 分配差异是保存响应的一部分，因此必须在提交前、同一连接和同一事务快照内读取。
     // 若查询因 schema、磁盘或其他故障失败，上面的 section/revision/warning 写入会全部回滚。
     const allocationVariances = listCourseAllocationVariances(section.course_id);
-    return { courseId: section.course_id, revision: section.revision + 1, allocationVariances };
+    return { courseId: section.course_id, revision: section.revision + 1, changed: true, allocationVariances };
   });
   // IMMEDIATE 先取得写入次序，避免另一进程恰好在验证 Active 状态与保存教师之间插入停用操作。
   return transaction.immediate();
@@ -3099,7 +3109,7 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
   for (const row of rows) {
     // 每周上两次的同一班次会生成两张独立待排卡片，分别代表第一和第二次课。
     const occurrenceKey = `${row.id}:${row.occurrence}`;
-    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, teacherIsActive: row.teacher_is_active === null ? null : row.teacher_is_active === 1, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
+    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, sectionId: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, teacherIsActive: row.teacher_is_active === null ? null : row.teacher_is_active === 1, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
     if (row.group_code) section.studentGroups.push(row.group_code);
     sections.set(occurrenceKey, section);
   }
@@ -3727,7 +3737,7 @@ export function placeScheduledLesson(input: { sectionId: string; occurrence: num
   return placementTransaction.immediate();
 }
 
-export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; studentGroupIds: string[]; revision: number }): ScheduledLessonRecord {
+export function updateScheduledLesson(id: string, input: { dayOfWeek: number; startHour: number; roomId: string | null; teacherId: string | null; studentGroupIds: string[]; revision: number }): ScheduledLessonRecord & { changed: boolean } {
   // 修订版本检查防止多人编辑时静默覆盖；教师、学生班级和课程位置一起保存，
   // 确保重新计算的冲突始终与界面显示的卡片资料一致。读取、验证和写入全部
   // 放进 IMMEDIATE 事务，另一服务进程不能在验证教师或教室后抢先改变状态。
@@ -3739,7 +3749,14 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
   const updateTransaction = db.transaction(() => {
     // 先在写锁内读取课程、当前 revision、共享教师和原教室；学生班级属于班次，
     // 后面还要同步更新同班次的其他每周课次。
-    const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision, lessons.room_id AS lesson_room_id, courses.code, sections.sequence, sections.teacher_id AS section_teacher_id, courses.duration_hours, courses.sessions_per_week, courses.week_start, courses.week_end FROM scheduled_lessons lessons JOIN course_sections sections ON sections.id = lessons.section_id JOIN courses ON courses.id = sections.course_id WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; lesson_room_id: string | null; code: string; sequence: number; section_teacher_id: string | null; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
+    const lesson = db.prepare(`SELECT lessons.section_id, lessons.occurrence, lessons.revision,
+      lessons.day_of_week, lessons.start_hour, lessons.room_id AS lesson_room_id, lessons.warnings_json,
+      courses.code, sections.sequence, sections.teacher_id AS section_teacher_id, courses.duration_hours,
+      courses.sessions_per_week, courses.week_start, courses.week_end
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      JOIN courses ON courses.id = sections.course_id
+      WHERE lessons.id = ?`).get(id) as { section_id: string; occurrence: number; revision: number; day_of_week: number; start_hour: number; lesson_room_id: string | null; warnings_json: string; code: string; sequence: number; section_teacher_id: string | null; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null } | undefined;
     if (!lesson) throw new ScheduledLessonNotFoundError();
     if (lesson.revision !== input.revision) throw new ScheduledLessonRevisionConflictError();
     if (input.dayOfWeek < 1 || input.dayOfWeek > 5 || input.startHour < 8 || input.startHour + lesson.duration_hours > 18) {
@@ -3772,6 +3789,37 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
     const sortedStudentGroupIds = [...studentGroupIds].sort();
     const groupsChanged = currentStudentGroupIds.length !== sortedStudentGroupIds.length || currentStudentGroupIds.some((groupId, index) => groupId !== sortedStudentGroupIds[index]);
     const sharedAssignmentsChanged = teacherChanged || groupsChanged;
+    const placementChanged = input.dayOfWeek !== lesson.day_of_week
+      || input.startHour !== lesson.start_hour
+      || roomChanged;
+
+    // CAS 已在上面先验证；因此只有持有当前 revision 的同值表单可走 no-op。直接复用
+    // 已提交的 warning 和关联显示资料，确保不 UPDATE lesson／section、不改 revision，
+    // 也不运行全表 warning 刷新。
+    if (!placementChanged && !sharedAssignmentsChanged) {
+      const currentWarnings = JSON.parse(lesson.warnings_json) as string[];
+      return {
+        id,
+        sectionId: lesson.section_id,
+        sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`,
+        courseCode: lesson.code,
+        teacherId: teacher?.id ?? null,
+        teacherName: teacher?.name ?? null,
+        dayOfWeek: lesson.day_of_week,
+        startHour: lesson.start_hour,
+        durationHours: lesson.duration_hours,
+        roomId: lesson.lesson_room_id,
+        roomCode: room?.code ?? null,
+        studentGroupIds: currentStudentGroups.map((group) => group.id),
+        studentGroups: currentStudentGroups.map((group) => group.code),
+        occurrence: lesson.occurrence,
+        sessionsPerWeek: lesson.sessions_per_week,
+        revision: lesson.revision,
+        warnings: currentWarnings,
+        warningSeverity: highestIssueSeverity(currentWarnings),
+        changed: false,
+      } satisfies ScheduledLessonRecord & { changed: boolean };
+    }
 
     // 拖动课程也会把未改变的教师和班级原样提交；只有共享分配真的变化时才修改班次 revision。
     // 教师改变才清除 Excel 来源，纯粹移动时间、改教室或只改班级都不会误伤教师来源资料。
@@ -3800,7 +3848,7 @@ export function updateScheduledLesson(id: string, input: { dayOfWeek: number; st
     const currentLessonWarnings = refreshAllScheduleWarnings(db).get(id) ?? [];
     const studentGroupAssignments = listSectionStudentGroupAssignments(db, lesson.section_id);
     // 返回结构与普通时间表查询保持一致，使 Inspector 保存后立即拥有完整关联资料。
-    return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: currentLessonWarnings, warningSeverity: highestIssueSeverity(currentLessonWarnings) } satisfies ScheduledLessonRecord;
+    return { id, sectionId: lesson.section_id, sectionLabel: `${lesson.code}_${String(lesson.sequence).padStart(2, "0")}${lesson.sessions_per_week > 1 ? ` · Session ${lesson.occurrence}` : ""}${weekRangeSuffix(lesson.week_start, lesson.week_end)}`, courseCode: lesson.code, teacherId: teacher?.id ?? null, teacherName: teacher?.name ?? null, dayOfWeek: input.dayOfWeek, startHour: input.startHour, durationHours: lesson.duration_hours, roomId: input.roomId, roomCode: room?.code ?? null, studentGroupIds: studentGroupAssignments.map((group) => group.id), studentGroups: studentGroupAssignments.map((group) => group.code), occurrence: lesson.occurrence, sessionsPerWeek: lesson.sessions_per_week, revision: input.revision + 1, warnings: currentLessonWarnings, warningSeverity: highestIssueSeverity(currentLessonWarnings), changed: true } satisfies ScheduledLessonRecord & { changed: boolean };
   });
   return updateTransaction.immediate();
 }

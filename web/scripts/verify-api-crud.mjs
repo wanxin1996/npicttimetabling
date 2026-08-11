@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import * as XLSX from "xlsx";
+import { candidateSlotRequestMatches } from "../src/lib/candidate-slot-request.mjs";
 import { reconcileLessonDraft } from "../src/lib/lesson-draft-reconciliation.mjs";
 import {
   maximumTeachingMembersCompressionRatio,
@@ -59,6 +60,19 @@ function verifyLessonDraftReconciliation() {
   assert.strictEqual(removed.lesson, currentDraft);
   assert.deepEqual(reconcileLessonDraft(null, [sameRevision]), { lesson: null, stale: false });
   report("Inspector 轮询保留未保存课程草稿");
+}
+
+function verifyCandidateSlotRequestIdentity() {
+  const requestA = { requestNumber: 1, sectionId: "section:A", occurrence: 1 };
+  const requestB = { requestNumber: 2, sectionId: "section:B", occurrence: 2 };
+
+  // B 已开始后，A 的迟到响应失效而 B 仍可应用；关闭面板把 current 设为 null，
+  // 两个响应都必须失效。额外的 occurrence 断言防止同班次另一课次串入当前面板。
+  assert.equal(candidateSlotRequestMatches(requestB, requestA), false);
+  assert.equal(candidateSlotRequestMatches(requestB, requestB), true);
+  assert.equal(candidateSlotRequestMatches(null, requestB), false);
+  assert.equal(candidateSlotRequestMatches(requestB, { ...requestB, occurrence: 1 }), false);
+  report("候选时段请求按 generation、班次与课次淘汰迟到响应");
 }
 
 function keepRecentServerOutput(chunk) {
@@ -1613,6 +1627,7 @@ async function verifyCrudAndRevisions() {
     json: { teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: section.revision },
   });
   assert.equal(firstAssignment.body.revision, 2);
+  assert.equal(firstAssignment.body.changed, true);
 
   // 无效教师或学生班级必须在事务内被拒绝，且不能消耗当前 revision。
   await requestApi(`/api/course-sections/${section.id}`, {
@@ -1659,6 +1674,7 @@ async function verifyCrudAndRevisions() {
     json: { teacherId: teacherB.id, studentGroupIds: [studentGroup.id], revision: firstAssignment.body.revision },
   });
   assert.equal(winningAssignment.body.revision, 3);
+  assert.equal(winningAssignment.body.changed, true);
   await requestApi(`/api/course-sections/${section.id}`, {
     method: "PATCH",
     expectedStatus: 409,
@@ -1793,6 +1809,127 @@ async function verifyCrudAndRevisions() {
     },
   })).body;
   assert.equal(movedLesson.revision, lessonOne.revision + 1);
+  assert.equal(movedLesson.changed, true);
+
+  // 同值请求也必须先执行 CAS：班次和课程位置分别携带旧 revision、但 desired
+  // 完全等于当前数据库内容时，仍返回 409，不能被 no-op 分支错误地当成成功。
+  const sectionAfterLessonMove = (await requestApi(`/api/courses/${course.id}/sections`)).body
+    .find((item) => item.id === section.id);
+  assert(sectionAfterLessonMove, "The moved lesson section could not be reloaded.");
+  const beforeStaleSameValueUpdates = readBusinessSnapshot();
+  const staleSameSection = await requestApi(`/api/course-sections/${section.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: {
+      teacherId: sectionAfterLessonMove.teacherId,
+      studentGroupIds: sectionAfterLessonMove.studentGroupIds,
+      revision: winningAssignment.body.revision,
+    },
+  });
+  assert.match(staleSameSection.body.error, /changed by another scheduler/i);
+  const staleSameLesson = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: {
+      dayOfWeek: movedLesson.dayOfWeek,
+      startHour: movedLesson.startHour,
+      roomId: movedLesson.roomId,
+      teacherId: movedLesson.teacherId,
+      studentGroupIds: movedLesson.studentGroupIds,
+      revision: lessonOne.revision,
+    },
+  });
+  assert.equal(staleSameLesson.body.code, "SCHEDULED_LESSON_CHANGED");
+  assert.deepEqual(readBusinessSnapshot(), beforeStaleSameValueUpdates);
+
+  // 班次同值保存不得执行 section UPDATE，也不得刷新任何现有 lesson warning。
+  // 两个数据库 trigger 会让任一隐藏写入直接 500；完整快照再覆盖 revision、关联和 warning。
+  const beforeSectionNoOp = readBusinessSnapshot();
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_course_section_no_op_must_not_update
+    BEFORE UPDATE ON course_sections
+    BEGIN
+      SELECT RAISE(ABORT, 'course-section no-op unexpectedly executed UPDATE');
+    END;
+    CREATE TRIGGER zz_course_section_no_op_must_not_refresh_warning
+    BEFORE UPDATE OF warnings_json ON scheduled_lessons
+    BEGIN
+      SELECT RAISE(ABORT, 'course-section no-op unexpectedly refreshed warnings');
+    END;
+  `));
+  try {
+    const sectionNoOp = await requestApi(`/api/course-sections/${section.id}`, {
+      method: "PATCH",
+      json: {
+        teacherId: sectionAfterLessonMove.teacherId,
+        studentGroupIds: sectionAfterLessonMove.studentGroupIds,
+        revision: sectionAfterLessonMove.revision,
+      },
+    });
+    assert.equal(sectionNoOp.body.ok, true);
+    assert.equal(sectionNoOp.body.revision, sectionAfterLessonMove.revision);
+    assert.equal(sectionNoOp.body.changed, false);
+    assert(Array.isArray(sectionNoOp.body.allocationVariances));
+    assert.deepEqual(readBusinessSnapshot(), beforeSectionNoOp);
+  } finally {
+    executeTestDatabase((db) => db.exec(`
+      DROP TRIGGER IF EXISTS zz_course_section_no_op_must_not_update;
+      DROP TRIGGER IF EXISTS zz_course_section_no_op_must_not_refresh_warning;
+    `));
+  }
+
+  // Inspector 同值保存还需证明不会触碰共享班次、班级关联、目标／其他课次，或运行
+  // warning 刷新。四类 abort trigger 配合完整快照，比只观察 revision 更严格。
+  const beforeLessonNoOp = readBusinessSnapshot();
+  executeTestDatabase((db) => db.exec(`
+    CREATE TRIGGER zz_lesson_no_op_must_not_update_lesson
+    BEFORE UPDATE ON scheduled_lessons
+    BEGIN
+      SELECT RAISE(ABORT, 'lesson no-op unexpectedly updated a lesson or warning');
+    END;
+    CREATE TRIGGER zz_lesson_no_op_must_not_update_section
+    BEFORE UPDATE ON course_sections
+    BEGIN
+      SELECT RAISE(ABORT, 'lesson no-op unexpectedly updated its section');
+    END;
+    CREATE TRIGGER zz_lesson_no_op_must_not_delete_group
+    BEFORE DELETE ON section_student_groups
+    BEGIN
+      SELECT RAISE(ABORT, 'lesson no-op unexpectedly deleted a student group');
+    END;
+    CREATE TRIGGER zz_lesson_no_op_must_not_insert_group
+    BEFORE INSERT ON section_student_groups
+    BEGIN
+      SELECT RAISE(ABORT, 'lesson no-op unexpectedly inserted a student group');
+    END;
+  `));
+  try {
+    const lessonNoOp = await requestApi(`/api/schedule/lessons/${lessonOne.id}`, {
+      method: "PATCH",
+      json: {
+        dayOfWeek: movedLesson.dayOfWeek,
+        startHour: movedLesson.startHour,
+        roomId: movedLesson.roomId,
+        teacherId: movedLesson.teacherId,
+        studentGroupIds: movedLesson.studentGroupIds,
+        revision: movedLesson.revision,
+      },
+    });
+    const { changed: originalChanged, ...movedLessonRecord } = movedLesson;
+    const { changed: noOpChanged, ...noOpLessonRecord } = lessonNoOp.body;
+    assert.equal(originalChanged, true);
+    assert.equal(noOpChanged, false);
+    assert.deepEqual(noOpLessonRecord, movedLessonRecord);
+    assert.deepEqual(readBusinessSnapshot(), beforeLessonNoOp);
+  } finally {
+    executeTestDatabase((db) => db.exec(`
+      DROP TRIGGER IF EXISTS zz_lesson_no_op_must_not_update_lesson;
+      DROP TRIGGER IF EXISTS zz_lesson_no_op_must_not_update_section;
+      DROP TRIGGER IF EXISTS zz_lesson_no_op_must_not_delete_group;
+      DROP TRIGGER IF EXISTS zz_lesson_no_op_must_not_insert_group;
+    `));
+  }
+
   const snapshotBeforeInvalidLessonUpdates = readBusinessSnapshot();
   const invalidLessonUpdates = [
     { dayOfWeek: 2.5, startHour: 10, roomId: room.id, teacherId: teacherA.id, studentGroupIds: [studentGroup.id], revision: movedLesson.revision },
@@ -2233,8 +2370,20 @@ async function verifyCrudAndRevisions() {
     json: { sectionCount: 1, revision: courseRevision },
   });
   await requestApi(`/api/schedule/lessons/${concurrentWinner.id}?revision=${concurrentWinner.revision}`, { method: "DELETE" });
+
+  // 稳定 ID 是 opaque TEXT，不能假设其中没有冒号、空格、#、? 或 /。直接改成这类合法
+  // fixture 后，用 encodeURIComponent 请求动态路径，并确认待排 payload 另带原始 sectionId。
+  const opaqueSectionId = `${secondSection.id}:route id #?/`;
+  executeTestDatabase((db) => {
+    const updated = db.prepare("UPDATE course_sections SET id = ? WHERE id = ?").run(opaqueSectionId, secondSection.id);
+    assert.equal(updated.changes, 1);
+  });
+  const opaqueCandidate = await requestApi(`/api/course-sections/${encodeURIComponent(opaqueSectionId)}/candidates?occurrence=1`, {
+    expectedStatus: 400,
+  });
+  assert.match(opaqueCandidate.body.error, /active teacher/i);
   const unscheduled = (await requestApi("/api/schedule/unscheduled?year=1")).body;
-  assert(unscheduled.some((item) => item.id === `${secondSection.id}:1`));
+  assert(unscheduled.some((item) => item.sectionId === opaqueSectionId && item.occurrence === 1));
 
   // 年级页面现在一次读取完整 workspace。生产接口必须返回与各只读接口相同的五份资料，
   // 并且同一个 section + occurrence 不能同时出现在总表和待排区；否则多人 Return／重排
@@ -2252,8 +2401,9 @@ async function verifyCrudAndRevisions() {
   assert.deepEqual(workspace.issues, workspaceIssues.body);
   assert.deepEqual(workspace.teachers, workspaceTeachers.body);
   assert.deepEqual(workspace.rooms, workspaceRooms.body);
-  const scheduledOccurrenceKeys = new Set(workspace.lessons.map((lesson) => `${lesson.sectionId}:${lesson.occurrence}`));
-  assert(workspace.unscheduledSections.every((section) => !scheduledOccurrenceKeys.has(section.id)));
+  assert(workspace.unscheduledSections.every((section) => !workspace.lessons.some((lesson) => (
+    lesson.sectionId === section.sectionId && lesson.occurrence === section.occurrence
+  ))));
   await requestApi("/api/schedule/workspace?year=4", { expectedStatus: 400 });
   for (const pathname of ["/api/schedule/lessons", "/api/schedule/unscheduled", "/api/schedule/workspace"]) {
     for (const invalidYear of ["", "01", "1e0", "%2B1"]) {
@@ -2532,14 +2682,36 @@ async function verifyRulesWorkspaceContracts(ids) {
   assert.deepEqual(readBusinessSnapshot(), beforeInvalidExpected);
 
   // expected 与 current 相符且 desired 未改变时是真 no-op：不执行 UPDATE，也不刷新
-  // warning；响应显式 changed:false，完整数据库快照保持相同。
+  // warning。这里临时安装一个拒绝 rule_settings UPDATE 的 trigger：只比较前后快照
+  // 不能排除“写入了相同值”，trigger 则能证明这条路径真正在 UPDATE 之前返回。
   const beforeNoOp = readBusinessSnapshot();
-  const noOp = await requestApi("/api/rule-settings", {
-    method: "PATCH",
-    json: { key: rule.key, expectedEnabled: rule.enabled, enabled: rule.enabled },
-  });
-  assert.deepEqual(noOp.body, { ok: true, enabled: rule.enabled, changed: false });
-  assert.deepEqual(readBusinessSnapshot(), beforeNoOp);
+  const noOpGuardDatabase = new Database(testDatabasePath);
+  noOpGuardDatabase.exec(`
+    CREATE TRIGGER zz_rule_setting_no_op_must_not_update
+    BEFORE UPDATE ON rule_settings
+    BEGIN
+      SELECT RAISE(ABORT, 'rule-setting no-op unexpectedly executed UPDATE');
+    END;
+    CREATE TRIGGER zz_rule_setting_no_op_must_not_refresh_warning
+    BEFORE UPDATE OF warnings_json ON scheduled_lessons
+    BEGIN
+      SELECT RAISE(ABORT, 'rule-setting no-op unexpectedly refreshed warnings');
+    END;
+  `);
+  try {
+    const noOp = await requestApi("/api/rule-settings", {
+      method: "PATCH",
+      json: { key: rule.key, expectedEnabled: rule.enabled, enabled: rule.enabled },
+    });
+    assert.deepEqual(noOp.body, { ok: true, enabled: rule.enabled, changed: false });
+    assert.deepEqual(readBusinessSnapshot(), beforeNoOp);
+  } finally {
+    noOpGuardDatabase.exec(`
+      DROP TRIGGER IF EXISTS zz_rule_setting_no_op_must_not_update;
+      DROP TRIGGER IF EXISTS zz_rule_setting_no_op_must_not_refresh_warning;
+    `);
+    noOpGuardDatabase.close();
+  }
 
   const toggled = await requestApi("/api/rule-settings", {
     method: "PATCH",
@@ -3808,6 +3980,7 @@ async function run() {
     throw new Error("Standalone build is missing. Run `npm run build` before this verification script.");
   }
   verifyLessonDraftReconciliation();
+  verifyCandidateSlotRequestIdentity();
 
   // 每次执行都创建全新临时数据库和随机端口，确保测试结果不依赖上一次状态。
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "timetabling-api-crud-"));

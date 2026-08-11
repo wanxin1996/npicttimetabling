@@ -866,12 +866,17 @@ async function verifyPreparedStatementReuse(schedulerCookies) {
 
   await runStatementAudit("warning-refresh", "全量警告刷新", schedulerCookies[1], async (cookie) => {
     const lesson = readEditableLesson();
+    // 同值 PATCH 现在是真正的 no-op，不会重算 warning。结构审计必须明确移动一小时，
+    // 才能证明实际写入路径仍只 prepare 一批语句并在整次刷新中重复执行。
+    const auditedStartHour = lesson.startHour + lesson.durationHours < 18
+      ? lesson.startHour + 1
+      : lesson.startHour - 1;
     const result = await requestApi(`/api/schedule/lessons/${lesson.id}`, {
       method: "PATCH",
       cookie,
       json: {
         dayOfWeek: lesson.dayOfWeek,
-        startHour: lesson.startHour,
+        startHour: auditedStartHour,
         teacherId: lesson.teacherId,
         roomId: lesson.roomId,
         studentGroupIds: lesson.studentGroupIds,
@@ -879,6 +884,7 @@ async function verifyPreparedStatementReuse(schedulerCookies) {
       },
     });
     assert.equal(result.body.revision, lesson.revision + 1);
+    assert.equal(result.body.changed, true);
   });
 
   // TypeScript 强制每次计算显式接收 PlacementWarningStatements；再用一个小型源码守卫

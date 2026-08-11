@@ -1,6 +1,7 @@
 "use client";
 
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { candidateSlotRequestMatches, type CandidateSlotRequestIdentity } from "@/lib/candidate-slot-request.mjs";
 import { reconcileLessonDraft } from "@/lib/lesson-draft-reconciliation.mjs";
 import {
   COURSE_CATALOG_MAX_LENGTH,
@@ -78,7 +79,7 @@ type DataManagementWorkspace = { teachers: Teacher[]; groups: StudentGroup[]; ro
 type CourseSectionsWorkspace = { currentCourse: Course; sections: CourseSection[]; allocationVariances: AllocationVariance[] };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type TimetableLoadResult = { loaded: boolean; reopenedLesson: ScheduledLesson | null; unscheduledSections: UnscheduledSection[] };
-type UnscheduledSection = { id: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
+type UnscheduledSection = { id: string; sectionId: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionId: string; occurrence: number; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type YearTimetableWorkspace = { lessons: ScheduledLesson[]; unscheduledSections: UnscheduledSection[]; issues: ScheduleIssue[]; teachers: Teacher[]; rooms: Room[] };
@@ -95,6 +96,27 @@ class RulesWorkspaceRequestError extends Error {
     super("Rules workspace request failed.");
     this.name = "RulesWorkspaceRequestError";
   }
+}
+
+function requireArrayPayload<T>(value: unknown, message: string): T[] {
+  // 服务器聚合响应必须整批到达。只靠 TypeScript 的 `as` 不会检查真实 JSON；若代理
+  // 意外返回 HTML、null 或缺少数组，这里会在任何 React state 写入前拒绝整批资料。
+  if (!Array.isArray(value)) throw new Error(message);
+  return value as T[];
+}
+
+function parseYearTimetableWorkspace(payload: unknown): YearTimetableWorkspace {
+  if (typeof payload !== "object" || payload === null) {
+    throw new Error("The year timetable workspace response was invalid.");
+  }
+  const candidate = payload as Record<string, unknown>;
+  return {
+    lessons: requireArrayPayload<ScheduledLesson>(candidate.lessons, "The year timetable lessons were missing."),
+    unscheduledSections: requireArrayPayload<UnscheduledSection>(candidate.unscheduledSections, "The unscheduled sessions were missing."),
+    issues: requireArrayPayload<ScheduleIssue>(candidate.issues, "The year timetable issues were missing."),
+    teachers: requireArrayPayload<Teacher>(candidate.teachers, "The year timetable teachers were missing."),
+    rooms: requireArrayPayload<Room>(candidate.rooms, "The year timetable rooms were missing."),
+  };
 }
 
 const timetableDays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
@@ -560,6 +582,10 @@ export default function Home() {
   const [candidateSection, setCandidateSection] = useState<UnscheduledSection | null>(null);
   const [candidateSlots, setCandidateSlots] = useState<CandidateSlot[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
+  // 候选请求可与关闭／切换班次交错返回。递增序号负责淘汰旧请求，显式班次身份
+  // 再防止 A 班次的迟到响应写进 B 班次面板或成为可点击的候选项。
+  const candidateSlotRequestNumber = useRef(0);
+  const candidateSectionIdentityRef = useRef<CandidateSlotRequestIdentity | null>(null);
   const [recentlySavedLesson, setRecentlySavedLesson] = useState<{ id: string; requestNumber: number } | null>(null);
   const savedLessonRequestNumber = useRef(0);
   const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup" | "Room">("Teacher");
@@ -608,6 +634,19 @@ export default function Home() {
     setNoticeTone(tone);
     setShowNoticeToast(true);
     setNoticeRequestNumber((current) => current + 1);
+  }
+
+  const clearCandidateSlotWorkspace = useCallback(() => {
+    candidateSlotRequestNumber.current += 1;
+    candidateSectionIdentityRef.current = null;
+    setCandidateSection(null);
+    setCandidateSlots([]);
+    setCandidatesLoading(false);
+  }, []);
+
+  function candidateSlotRequestIsCurrent(requestNumber: number, sectionId: string, occurrence: number) {
+    return requestNumber === candidateSlotRequestNumber.current
+      && candidateSlotRequestMatches(candidateSectionIdentityRef.current, { requestNumber, sectionId, occurrence });
   }
 
   function beginManagementMutation(key: string) {
@@ -729,8 +768,7 @@ export default function Home() {
     setEditingLesson(null);
     setLessonDraftIsStale(false);
     setPlacingSection(null);
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    clearCandidateSlotWorkspace();
     pendingInspectorFocusRef.current = null;
     setShowTimetableInspector(false);
     window.requestAnimationFrame(() => inspectorToggleButtonRef.current?.focus());
@@ -791,7 +829,7 @@ export default function Home() {
     setView(nextView);
   }
 
-  function clearSessionBoundWorkspace() {
+  const clearSessionBoundWorkspace = useCallback(() => {
     // React 在登录画面出现时不会卸载这个组件。退出、会话过期或完整恢复后必须显式
     // 清除管理员账号清单、恢复指纹和上一个账号读取的业务资料；否则下一位普通排课
     // 账号登录后会先看到旧 Accounts 页面或旧课表，直到后台刷新才被替换。
@@ -818,8 +856,7 @@ export default function Home() {
     setEditingLesson(null);
     setLessonDraftIsStale(false);
     setPlacingSection(null);
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    clearCandidateSlotWorkspace();
     setPersonalOwnerId("");
     setPersonalLessons([]);
     setUnavailableWindows([]);
@@ -830,7 +867,7 @@ export default function Home() {
     setShowTimetableInspector(false);
     setShowUnscheduledDrawer(true);
     setView("Year timetables");
-  }
+  }, [clearCandidateSlotWorkspace]);
 
   function openView(nextView: View) {
     // 切换资料页面时清除上一页专用的编辑对象、筛选和课程详情，防止旧状态被错误带到新的表格。
@@ -856,8 +893,7 @@ export default function Home() {
     setAllocationVariances([]);
     setEditingLesson(null);
     setPlacingSection(null);
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    clearCandidateSlotWorkspace();
   }
 
   async function openTimetable(
@@ -880,7 +916,10 @@ export default function Home() {
       }
       // 服务端已在一个 DEFERRED 事务内读取全部资料；解析成功前不修改任何 state，
       // 因此 Return／重新排课夹在请求中间时也不会拼出“不可能存在”的总表和待排组合。
+      // 保留清楚的聚合响应类型，再立即执行运行时数组验证；`as` 只帮助 TypeScript，
+      // 下一行才负责拒绝 200 HTML、null 或缺字段 JSON，且发生在任何 state 写入之前。
       const workspace = await workspaceResponse.json() as YearTimetableWorkspace;
+      parseYearTimetableWorkspace(workspace);
       const nextLessons = workspace.lessons;
       const nextUnscheduledSections = workspace.unscheduledSections;
       // 请求开始后若已有更新批次完成或开始，这一批就是旧响应，不能覆盖较新的画面。
@@ -907,8 +946,7 @@ export default function Home() {
       editingLessonRef.current = reopenedLesson;
       setLessonDraftIsStale(false);
       setPlacingSection(null);
-      setCandidateSection(null);
-      setCandidateSlots([]);
+      clearCandidateSlotWorkspace();
       return { loaded: true, reopenedLesson, unscheduledSections: nextUnscheduledSections };
     } catch {
       // 断网或服务器重启时 fetch 会直接抛错；保持当前画面并允许老师稍后重试。
@@ -950,8 +988,7 @@ export default function Home() {
 
   function closeCandidateResults() {
     // 候选结果关闭时一并清除旧选项，并恢复到稳定存在的 Inspector Close，避免焦点落到页面背景。
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    clearCandidateSlotWorkspace();
     window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
   }
 
@@ -980,8 +1017,9 @@ export default function Home() {
       // 只有同一个 section + occurrence 确实出现在当前年级待排清单时，才能断言
       // 另一位老师执行了 Return to tray。课程改到另一年级或 Cycle 被替换时，同年
       // lessons 也找不到 ID，但绝不能误导老师说它已经进入这张年级的待排区。
-      const matchingUnscheduledId = `${lessonSnapshot.sectionId}:${lessonSnapshot.occurrence}`;
-      const returnedToCurrentTray = timetableResult.unscheduledSections.some((section) => section.id === matchingUnscheduledId);
+      const returnedToCurrentTray = timetableResult.unscheduledSections.some((section) => (
+        section.sectionId === lessonSnapshot.sectionId && section.occurrence === lessonSnapshot.occurrence
+      ));
       setShowTimetableInspector(false);
       if (returnedToCurrentTray) {
         setShowUnscheduledDrawer(true);
@@ -1043,8 +1081,7 @@ export default function Home() {
     // openTimetable 已原子应用五份最新资料；这里只负责把找到的课程交给标准编辑器。
     openLessonEditor(linkedLesson);
     setPlacingSection(null);
-    setCandidateSection(null);
-    setCandidateSlots([]);
+    clearCandidateSlotWorkspace();
     // 从问题清单进入编辑时，先收起左侧待排抽屉，给右侧 Inspector 和五天总表留下足够空间。
     setShowUnscheduledDrawer(false);
     setShowTimetableInspector(true);
@@ -1235,7 +1272,10 @@ export default function Home() {
         }
         return;
       }
-      const nextPersonalLessons = await response.json() as ScheduledLesson[];
+      const nextPersonalLessons = requireArrayPayload<ScheduledLesson>(
+        await response.json(),
+        "The personal timetable response was invalid.",
+      );
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
       // 只有新课表完整到达后才更新选择器和页面，失败时保留老师仍可阅读的上一版画面。
       setPersonalKind(kind);
@@ -1256,7 +1296,7 @@ export default function Home() {
 
   async function requestLessonPlacement(input: { sectionId: string; occurrence: number; dayOfWeek: number; startHour: number; roomId: string | null }) {
     // 拖放、Inspector 表单和 Clear slots 都通过这里建立新课次，保证它们使用相同的防重复、409 刷新和断网处理。
-    const sessionKey = `${input.sectionId}:${input.occurrence}`;
+    const sessionKey = JSON.stringify([input.sectionId, input.occurrence]);
     if (placingSessionKeyRef.current) {
       setNotice("Another session placement is still in progress. Wait for it to finish before placing the next session.", "warning");
       return null;
@@ -1335,7 +1375,7 @@ export default function Home() {
       try {
         // 移动课程只改变星期和时间，但 PATCH 接口会整体保存班次资料；因此必须把拖动开始时
         // 的教师、教室和学生班级原样带回，避免移动误清关联或绕过并发 revision。
-        const response = await fetch(`/api/schedule/lessons/${lessonId}`, {
+        const response = await fetch(`/api/schedule/lessons/${encodeURIComponent(lessonId)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1381,10 +1421,9 @@ export default function Home() {
       }
       return;
     }
-    const draggedSession = event.dataTransfer.getData("text/plain");
-    if (!draggedSession) return;
-    const [sectionId, occurrenceText] = draggedSession.split(":");
-    const occurrence = Number(occurrenceText ?? 1);
+    const sectionId = event.dataTransfer.getData("text/plain");
+    const occurrence = Number(event.dataTransfer.getData("application/x-unscheduled-occurrence"));
+    if (!sectionId || ![1, 2].includes(occurrence)) return;
     const placement = await requestLessonPlacement({ sectionId, occurrence, dayOfWeek, startHour, roomId: null });
     if (!placement) return;
     const body = placement.lesson;
@@ -1397,42 +1436,50 @@ export default function Home() {
   }
 
   async function findCandidateSlots(section: UnscheduledSection) {
-    // 只有老师点击 Clear slots 时才计算候选时段，并用新班次结果替换旧结果，避免数百个班次的建议同时挤满侧栏。
+    // 每次开始、切换或关闭都会提高 generation；响应必须同时匹配号码和显式
+    // sectionId + occurrence，旧班次的慢响应才不会覆盖当前候选面板。
+    const requestNumber = ++candidateSlotRequestNumber.current;
+    const { sectionId, occurrence } = section;
+    candidateSectionIdentityRef.current = { requestNumber, sectionId, occurrence };
     setCandidateSection(section);
     setPlacingSection(null);
     setEditingLesson(null);
     setCandidateSlots([]);
     setCandidatesLoading(true);
-    const [sectionId] = section.id.split(":");
     try {
-      const response = await fetch(`/api/course-sections/${sectionId}/candidates?occurrence=${section.occurrence}`);
-      const body = await response.json();
+      const response = await fetch(`/api/course-sections/${encodeURIComponent(sectionId)}/candidates?occurrence=${occurrence}`);
+      const body = await response.json() as { error?: string; slots?: CandidateSlot[] };
+      if (!candidateSlotRequestIsCurrent(requestNumber, sectionId, occurrence)) return;
       if (!response.ok) {
         // 教师缺失或停用等资料问题不应伪装成“没有空位”；返回原排课表单后，老师仍可手工放课并接受警告。
-        setCandidateSection(null);
+        clearCandidateSlotWorkspace();
         setPlacingSection(section);
         return setNotice(body.error ?? "Candidate slots could not be calculated.", "error");
       }
+      if (!Array.isArray(body.slots)) throw new Error("Candidate slot response was incomplete.");
       setCandidateSlots(body.slots);
       setNotice(
         body.slots.length ? `${body.slots.length} completely clear room and time options found for ${section.label}.` : `No completely clear options found for ${section.label}. Check its assignments and restrictions.`,
         body.slots.length ? "success" : "warning",
       );
     } catch {
+      if (!candidateSlotRequestIsCurrent(requestNumber, sectionId, occurrence)) return;
       // 网络中断也要恢复面板和 loading 状态，不能把 Inspector 永久留在 Checking 状态。
-      setCandidateSection(null);
+      clearCandidateSlotWorkspace();
       setPlacingSection(section);
       setNotice("Candidate slots could not be calculated. Check the connection and try again.", "error");
     } finally {
-      setCandidatesLoading(false);
+      if (candidateSlotRequestIsCurrent(requestNumber, sectionId, occurrence)) setCandidatesLoading(false);
     }
   }
 
   async function placeCandidate(slot: CandidateSlot) {
     // 候选项已经包含校验过的教室，老师可一次点击完成排课；正式保存时接口仍会再次运行警告引擎，防止候选生成后资料发生变化。
     if (!candidateSection) return;
-    const [sectionId] = candidateSection.id.split(":");
-    const placement = await requestLessonPlacement({ sectionId, occurrence: candidateSection.occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId });
+    const { sectionId, occurrence } = candidateSection;
+    const currentIdentity = candidateSectionIdentityRef.current;
+    if (currentIdentity?.sectionId !== sectionId || currentIdentity.occurrence !== occurrence || candidatesLoading) return;
+    const placement = await requestLessonPlacement({ sectionId, occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId });
     if (!placement) return;
     const body = placement.lesson;
     if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
@@ -1448,9 +1495,8 @@ export default function Home() {
     event.preventDefault();
     if (!placingSection) return;
     const data = new FormData(event.currentTarget);
-    const [sectionId] = placingSection.id.split(":");
     const placement = await requestLessonPlacement({
-      sectionId,
+      sectionId: placingSection.sectionId,
       occurrence: placingSection.occurrence,
       dayOfWeek: Number(data.get("dayOfWeek")),
       startHour: Number(data.get("startHour")),
@@ -1483,7 +1529,7 @@ export default function Home() {
     // getAll 会保留每个复选框的值；没有勾选时传空数组，服务器就会把该班次明确设为“学生班级待分配”。
     const studentGroupIds = data.getAll("studentGroupIds").map(String);
     try {
-      const response = await fetch(`/api/schedule/lessons/${lessonAtSubmit.id}`, {
+      const response = await fetch(`/api/schedule/lessons/${encodeURIComponent(lessonAtSubmit.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1546,7 +1592,7 @@ export default function Home() {
     lessonMutationIdRef.current = lessonAtSubmit.id;
     setLessonMutation({ id: lessonAtSubmit.id, action: "return" });
     try {
-      const response = await fetch(`/api/schedule/lessons/${lessonAtSubmit.id}?revision=${lessonAtSubmit.revision}`, { method: "DELETE" });
+      const response = await fetch(`/api/schedule/lessons/${encodeURIComponent(lessonAtSubmit.id)}?revision=${lessonAtSubmit.revision}`, { method: "DELETE" });
       const body = await response.json() as { code?: string; error?: string; ok?: boolean };
       if (response.status === 409 && body.code === "SCHEDULED_LESSON_CHANGED") {
         await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson was changed by another scheduler.", true);
@@ -1582,8 +1628,9 @@ export default function Home() {
         return;
       }
 
-      const returnedSessionId = `${lessonAtSubmit.sectionId}:${lessonAtSubmit.occurrence}`;
-      const returnedToCurrentTray = timetableResult.unscheduledSections.some((section) => section.id === returnedSessionId);
+      const returnedToCurrentTray = timetableResult.unscheduledSections.some((section) => (
+        section.sectionId === lessonAtSubmit.sectionId && section.occurrence === lessonAtSubmit.occurrence
+      ));
       setShowTimetableInspector(false);
       if (returnedToCurrentTray) {
         setShowUnscheduledDrawer(true);
@@ -1875,56 +1922,66 @@ export default function Home() {
         }
         return;
       }
-      if (!active || responses.length === 0) return;
-      if (responses.some((response) => response.status === 401)) {
-        clearSessionBoundWorkspace();
-        setAuthScreen("login");
-        return setNotice("Your session expired. Please sign in again.", "error");
-      }
-      if (responses.some((response) => !response.ok)) return;
-      const payloads = await Promise.all(responses.map((response) => response.json()));
-      // 较新的轮询或显式 openTimetable 已经开始后，旧响应只能丢弃；否则慢网络会
-      // 把保存前的课表倒灌回来，让刚移动的卡短暂回到原位置。
-      if (!active || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
-      if (view === "Year timetables") {
-        const workspace = payloads[0] as YearTimetableWorkspace;
-        const nextLessons = workspace.lessons;
-        const nextUnscheduledSections = workspace.unscheduledSections;
-        setLessons(nextLessons);
-        setUnscheduledSections(nextUnscheduledSections);
-        setScheduleIssues(workspace.issues);
-        setTeachers(workspace.teachers);
-        setRooms(workspace.rooms);
-
-        // Inspector 里的星期／时间／班级属于老师尚未提交的本地草稿。另一账号提高
-        // revision 后，不能让五秒轮询替换 editingLesson 并利用 form key 重建表单，
-        // 否则老师刚选的内容会无提示消失。这里保留旧对象并显示过期说明；Save 时
-        // 服务器 409 会阻止覆盖，再由统一流程载入最新版本。
-        const draftResult = reconcileLessonDraft(editingLessonRef.current, nextLessons);
-        if (draftResult.lesson) {
-          // revision 未改变时同步 warning 等服务器派生资料；改变或删除时 helper 会
-          // 原样返回 current 对象，因此 form key、原生输入和受控下拉草稿都不重建。
-          editingLessonRef.current = draftResult.lesson;
-          setEditingLesson(draftResult.lesson);
-          setLessonDraftIsStale(draftResult.stale);
+      try {
+        if (!active || responses.length === 0) return;
+        if (responses.some((response) => response.status === 401)) {
+          clearSessionBoundWorkspace();
+          setAuthScreen("login");
+          return setNotice("Your session expired. Please sign in again.", "error");
         }
-        // 首次排课表单同样属于未保存操作；另一账号先放置后先保留当前对象，
-        // 让 Place／候选按钮通过稳定409给出明确去向，而不是轮询直接卸载面板。
-        setPlacingSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? current : null);
-        setCandidateSection((current) => current ? nextUnscheduledSections.find((section) => section.id === current.id) ?? current : null);
+        if (responses.some((response) => !response.ok)) return;
+        const payloads: unknown[] = await Promise.all(responses.map((response) => response.json()));
+        // 较新的轮询或显式 openTimetable 已经开始后，旧响应只能丢弃；否则慢网络会
+        // 把保存前的课表倒灌回来，让刚移动的卡短暂回到原位置。
+        if (!active || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+        if (view === "Year timetables") {
+          const workspace = parseYearTimetableWorkspace(payloads[0]);
+          const nextLessons = workspace.lessons;
+          const nextUnscheduledSections = workspace.unscheduledSections;
+          setLessons(nextLessons);
+          setUnscheduledSections(nextUnscheduledSections);
+          setScheduleIssues(workspace.issues);
+          setTeachers(workspace.teachers);
+          setRooms(workspace.rooms);
+
+          // Inspector 里的星期／时间／班级属于老师尚未提交的本地草稿。另一账号提高
+          // revision 后，不能让五秒轮询替换 editingLesson 并利用 form key 重建表单，
+          // 否则老师刚选的内容会无提示消失。这里保留旧对象并显示过期说明；Save 时
+          // 服务器 409 会阻止覆盖，再由统一流程载入最新版本。
+          const draftResult = reconcileLessonDraft(editingLessonRef.current, nextLessons);
+          if (draftResult.lesson) {
+            // revision 未改变时同步 warning 等服务器派生资料；改变或删除时 helper 会
+            // 原样返回 current 对象，因此 form key、原生输入和受控下拉草稿都不重建。
+            editingLessonRef.current = draftResult.lesson;
+            setEditingLesson(draftResult.lesson);
+            setLessonDraftIsStale(draftResult.stale);
+          }
+          // 首次排课表单同样属于未保存操作；另一账号先放置后先保留当前对象，
+          // 让 Place／候选按钮通过稳定409给出明确去向，而不是轮询直接卸载面板。
+          setPlacingSection((current) => current ? nextUnscheduledSections.find((section) => section.sectionId === current.sectionId && section.occurrence === current.occurrence) ?? current : null);
+          setCandidateSection((current) => current ? nextUnscheduledSections.find((section) => section.sectionId === current.sectionId && section.occurrence === current.occurrence) ?? current : null);
+        }
+        if (view === "Personal timetables") {
+          // 两个数组必须先全部验证成功再一起写入；若教师 payload 损坏，不能先应用
+          // 新课表而留下旧教师清单，制造数据库中从未同时存在过的混合页面。
+          const nextPersonalLessons = requireArrayPayload<ScheduledLesson>(payloads[0], "The personal timetable poll response was invalid.");
+          const nextTeachers = requireArrayPayload<Teacher>(payloads[1], "The teacher poll response was invalid.");
+          setPersonalLessons(nextPersonalLessons);
+          setTeachers(nextTeachers);
+        }
+        setLastSyncedAt(new Date());
+      } catch {
+        // 200 HTML、损坏 JSON 或缺少聚合数组都只丢弃这一轮；上一份完整画面继续可读，
+        // 下一个五秒 tick 会自然恢复，且 `void refreshVisibleWorkspace()` 不会产生未处理 rejection。
+        return;
       }
-      if (view === "Personal timetables") {
-        setPersonalLessons(payloads[0] as ScheduledLesson[]);
-        setTeachers(payloads[1] as Teacher[]);
-      }
-      setLastSyncedAt(new Date());
     }
 
     // 五秒延迟对小型排课团队已接近实时，同时在本地 SQLite MVP 阶段不需要额外维护长期 WebSocket 服务。
     void refreshVisibleWorkspace();
     const interval = window.setInterval(() => void refreshVisibleWorkspace(), 5000);
     return () => { active = false; window.clearInterval(interval); };
-  }, [authScreen, personalKind, personalOwnerId, timetableYear, view]);
+  }, [authScreen, clearSessionBoundWorkspace, personalKind, personalOwnerId, timetableYear, view]);
 
   async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
     // 首次管理员建立和日常登录共用账号密码；部署令牌只发送给 setup 接口，普通登录请求绝不携带它。
@@ -2473,7 +2530,7 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/teachers/${teacher.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: teacher.revision }) });
+      const response = await fetch(`/api/teachers/${encodeURIComponent(teacher.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: teacher.revision }) });
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
         if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
@@ -2506,7 +2563,7 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/rooms/${room.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: room.revision }) });
+      const response = await fetch(`/api/rooms/${encodeURIComponent(room.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: room.revision }) });
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
       if (!response.ok) {
         if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
@@ -2547,7 +2604,7 @@ export default function Home() {
       // 教师新增和更正共用姓名与类别字段；编辑时沿用原数据库编号，使既有课程分配不会因为改名而断开。
       const name = String(data.get("name") ?? "").trim().toUpperCase();
       if (!name) return;
-      endpoint = editingTeacher ? `/api/teachers/${editingTeacher.id}` : "/api/teachers";
+      endpoint = editingTeacher ? `/api/teachers/${encodeURIComponent(editingTeacher.id)}` : "/api/teachers";
       method = editingTeacher ? "PATCH" : "POST";
       // revision 来自打开表单时保存的完整教师快照；后台清单即使稍后刷新，也不能改写本次提交的比较基准。
       payload = { name, staffType: data.get("staffType"), ...(editingTeacher ? { revision: editingTeacher.revision } : {}) };
@@ -2558,7 +2615,7 @@ export default function Home() {
       // 学生班级更正直接更新稳定记录，已关联的班次与冲突检查仍指向同一个班级编号。
       const code = String(data.get("code") ?? "").trim().toUpperCase();
       if (!code) return;
-      endpoint = editingGroup ? `/api/student-groups/${editingGroup.id}` : "/api/student-groups";
+      endpoint = editingGroup ? `/api/student-groups/${encodeURIComponent(editingGroup.id)}` : "/api/student-groups";
       method = editingGroup ? "PATCH" : "POST";
       payload = { code, year: Number(data.get("year")), program: String(data.get("program") ?? "").trim().toUpperCase(), ...(editingGroup ? { revision: editingGroup.revision } : {}) };
       if (editingGroup) editedRecord = { view: "Student groups", id: editingGroup.id, label: editingGroup.code };
@@ -2568,7 +2625,7 @@ export default function Home() {
       // 教室容量和设施保存为结构化标记，后续候选时段和警告引擎可以准确匹配课程的多重教室要求。
       const code = String(data.get("room") ?? "").trim().toUpperCase();
       if (!code) return;
-      endpoint = editingRoom ? `/api/rooms/${editingRoom.id}` : "/api/rooms";
+      endpoint = editingRoom ? `/api/rooms/${encodeURIComponent(editingRoom.id)}` : "/api/rooms";
       method = editingRoom ? "PATCH" : "POST";
       payload = { code, capacity: Number(data.get("capacity")), hasLab: Boolean(data.get("lab")), hasMultiProjector: Boolean(data.get("projector")), isSmartClassroom: Boolean(data.get("smart")), ...(editingRoom ? { revision: editingRoom.revision } : {}) };
       if (editingRoom) editedRecord = { view: "Rooms", id: editingRoom.id, label: editingRoom.code };
@@ -2711,7 +2768,7 @@ export default function Home() {
     if (!beginManagementMutation(mutationKey)) return;
     let committed = false;
     try {
-      const response = await fetch(`/api/courses/${courseAtSubmit.id}/sections`, {
+      const response = await fetch(`/api/courses/${encodeURIComponent(courseAtSubmit.id)}/sections`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         // 课程 revision 是老师打开 Sections 面板时看到的版本。导入、课程设置或另一位
@@ -2790,7 +2847,7 @@ export default function Home() {
     const data = new FormData(event.currentTarget);
     let committed = false;
     try {
-      const response = await fetch(`/api/courses/${courseAtSubmit.id}`, {
+      const response = await fetch(`/api/courses/${encodeURIComponent(courseAtSubmit.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2874,7 +2931,7 @@ export default function Home() {
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
     try {
-      const response = await fetch(`/api/courses/${course.id}/workspace`, { cache: "no-store" });
+      const response = await fetch(`/api/courses/${encodeURIComponent(course.id)}/workspace`, { cache: "no-store" });
       if (response.status === 404) {
         // 只有新周期或另一账号移除课程后才会从既有清单点击到404；此时整张旧课程表
         // 都已知不可信，不能只关掉详情并继续允许 Configure／Sections。
@@ -2930,7 +2987,7 @@ export default function Home() {
     const courseAtStart = selectedCourse;
     let committed = false;
     try {
-      const response = await fetch(`/api/course-sections/${section.id}`, {
+      const response = await fetch(`/api/course-sections/${encodeURIComponent(section.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3278,7 +3335,8 @@ export default function Home() {
                       key={section.id}
                       draggable={placingSessionKey === null && lessonMutation === null}
                       onDragStart={(event) => {
-                        event.dataTransfer.setData("text/plain", section.id);
+                        event.dataTransfer.setData("text/plain", section.sectionId);
+                        event.dataTransfer.setData("application/x-unscheduled-occurrence", String(section.occurrence));
                         event.dataTransfer.effectAllowed = "move";
                         setCompactDragPreview(event, section.label);
                       }}
@@ -3304,7 +3362,7 @@ export default function Home() {
                             setShowTimetableInspector(true);
                             setPlacingSection(section);
                             setEditingLesson(null);
-                            setCandidateSection(null);
+                            clearCandidateSlotWorkspace();
                           }}
                           className="rounded-md bg-[#153d75] px-1.5 py-1 font-bold text-white disabled:cursor-wait disabled:opacity-50"
                           type="button"
@@ -3446,7 +3504,7 @@ export default function Home() {
                             setShowTimetableInspector(true);
                             openLessonEditor(lesson);
                             setPlacingSection(null);
-                            setCandidateSection(null);
+                            clearCandidateSlotWorkspace();
                           }}
                           className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${editingLesson !== null || lessonMutation !== null || placingSessionKey !== null ? "cursor-wait opacity-60" : ""} ${issueClasses.card}`}
                           type="button"
