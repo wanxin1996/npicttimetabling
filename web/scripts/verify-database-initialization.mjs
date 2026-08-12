@@ -228,6 +228,8 @@ const legacyFixtureIds = {
   allocation: "legacy-allocation-stable-id",
   section: "legacy-section-stable-id",
   lesson: "legacy-lesson-stable-id",
+  appUser: "legacy-account-stable-id",
+  authSession: "2".repeat(64),
 };
 
 function createLegacyMasterDataFixture(databasePath) {
@@ -355,6 +357,60 @@ function createLegacyMasterDataFixture(databasePath) {
   }
 }
 
+function createLegacyAppUserFixture(databasePath) {
+  // 账号迁移使用独立数据库，避免给后面的 master-data 边界测试预先建立用户；那组测试
+  // 需要亲自执行 createInitialAdmin。这里保留 revision 上线前的真实两表形状和外键链。
+  const db = new Database(databasePath);
+  try {
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE app_users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL,
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE auth_sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    const insert = db.transaction(() => {
+      // 固定哈希只充当格式正确的迁移夹具，不会用于登录或出现在测试日志中。
+      db.prepare(`INSERT INTO app_users
+        (id, username, password_hash, is_admin, is_active, created_at)
+        VALUES (?, 'legacy-scheduler', ?, 0, 1, '2025-01-06T03:04:05.000Z')`)
+        .run(legacyFixtureIds.appUser, `${"0".repeat(32)}:${"1".repeat(128)}`);
+      db.prepare(`INSERT INTO auth_sessions
+        (token_hash, user_id, expires_at, created_at)
+        VALUES (?, ?, '2099-01-01T00:00:00.000Z', '2025-01-07T03:04:05.000Z')`)
+        .run(legacyFixtureIds.authSession, legacyFixtureIds.appUser);
+    });
+    insert.immediate();
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+}
+
+function readLegacyAppUserState(databasePath) {
+  // 只选择新旧 schema 都有的字段，迁移前后可以逐值比较且不受 ALTER 物理列顺序影响。
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    return {
+      appUsers: db.prepare(`SELECT id, username, password_hash, is_admin, is_active, created_at
+        FROM app_users ORDER BY id`).all(),
+      authSessions: db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all(),
+    };
+  } finally {
+    db.close();
+  }
+}
+
 function readLegacyOriginalState(databasePath) {
   // 迁移前后都可读取的旧字段用明确列清单比较；新增列不参与这份快照，避免测试
   // 因 SELECT * 的物理列顺序不同而误报，同时逐字段锁定所有旧业务资料。
@@ -414,6 +470,42 @@ function assertTeachingMembersSourceIndex(databasePath) {
       db.prepare("PRAGMA index_info(teachers_teaching_members_key_key)").all().map((column) => column.name),
       ["teaching_members_key"],
     );
+  } finally {
+    db.close();
+  }
+}
+
+function assertAppUserRevisionColumn(databasePath) {
+  // fresh 建表与旧库 ALTER 必须得到同一列合同；默认值保证历史账号不会出现 NULL，
+  // CHECK 则由 production schema 和备份业务校验共同防止无效版本流入 API。
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const revision = db.prepare("PRAGMA table_info(app_users)").all()
+      .find((column) => column.name === "revision");
+    assert(revision, "Account revision column was not created.");
+    assert.equal(revision.type, "INTEGER");
+    assert.equal(revision.notnull, 1);
+    assert.equal(revision.dflt_value, "1");
+    const tableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'app_users'").get().sql;
+    assert.match(tableSql, /revision\s+INTEGER\s+NOT\s+NULL\s+DEFAULT\s+1\s+CHECK\s*\(\s*revision\s*>=\s*1\s*\)/i,
+      "Account revision did not retain its positive-value CHECK constraint.");
+  } finally {
+    db.close();
+  }
+}
+
+function assertStudentGroupYearCodeKey(databasePath) {
+  // 班级编号只在同一年级内唯一。检查真实索引列顺序，而不是只检查某个名称，
+  // 因为 fresh table constraint 会由 SQLite 使用 autoindex，旧库则来自表重建。
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const uniqueKeys = db.prepare("PRAGMA index_list(student_groups)").all()
+      .filter((index) => index.unique === 1)
+      .map((index) => db.prepare(`PRAGMA index_info(${index.name})`).all().map((column) => column.name));
+    assert(uniqueKeys.some((columns) => columns.length === 2 && columns[0] === "year" && columns[1] === "code"),
+      "Student groups do not have the Year + code unique key.");
+    assert(!uniqueKeys.some((columns) => columns.length === 1 && columns[0] === "code"),
+      "The legacy global student-group code key still exists.");
   } finally {
     db.close();
   }
@@ -590,6 +682,8 @@ await withIsolatedDatabase("schema", "production", async (databasePath) => {
   assert.equal(globalThis.timetableSchemaVersion, runtimeSchemaVersion);
   assert.deepEqual(readCounts(databasePath), { teachers: 0, studentGroups: 0, rooms: 0, rules: 7 });
   assertHealthyDatabase(databasePath);
+  assertAppUserRevisionColumn(databasePath);
+  assertStudentGroupYearCodeKey(databasePath);
   assert.equal(databaseModule.databaseHealth(), true);
   assert.equal(tracking.instances.length, 2);
   report("fresh schema 初始化失败会关闭局部连接、保持全局未发布并幂等重试");
@@ -615,6 +709,8 @@ await withIsolatedDatabase("seed", "development", async (databasePath) => {
   assert.equal(globalThis.timetableSchemaVersion, runtimeSchemaVersion);
   assert.deepEqual(readCounts(databasePath), { teachers: 4, studentGroups: 4, rooms: 3, rules: 7 });
   assertHealthyDatabase(databasePath);
+  assertAppUserRevisionColumn(databasePath);
+  assertStudentGroupYearCodeKey(databasePath);
   report("development seed 中途失败会整体回滚、关闭连接并在重试后只写一套示例资料");
 });
 
@@ -685,6 +781,98 @@ await withIsolatedDatabase("legacy-unavailable-window-keys", "production", async
   report("旧不可用时段自然键按 MIN(rowid) 去重、升级 unique 且二次初始化幂等");
 });
 
+await withIsolatedDatabase("legacy-app-users", "production", async (databasePath) => {
+  createLegacyAppUserFixture(databasePath);
+  const stateBeforeMigration = readLegacyAppUserState(databasePath);
+  const beforeColumns = new Database(databasePath, { readonly: true });
+  try {
+    assert(!beforeColumns.prepare("PRAGMA table_info(app_users)").all()
+      .some((column) => column.name === "revision"));
+  } finally {
+    beforeColumns.close();
+  }
+
+  const scenario = { failInitializationOnce: false, failSeedOnce: false };
+  const tracking = createTrackingDatabase(scenario);
+  const databaseModule = loadDatabaseSource(tracking.TrackingDatabase);
+  assert.equal(databaseModule.databaseHealth(), true);
+  assert.equal(tracking.instances.length, 1);
+  assert.equal(globalThis.timetableSchemaVersion, runtimeSchemaVersion);
+  assert.deepEqual(readLegacyAppUserState(databasePath), stateBeforeMigration);
+  assertAppUserRevisionColumn(databasePath);
+
+  const migratedDatabase = new Database(databasePath, { readonly: true });
+  try {
+    assert.deepEqual(
+      migratedDatabase.prepare("SELECT id, revision FROM app_users ORDER BY id").all(),
+      [{ id: legacyFixtureIds.appUser, revision: 1 }],
+    );
+    assert.deepEqual(
+      migratedDatabase.prepare("SELECT token_hash, user_id FROM auth_sessions ORDER BY token_hash").all(),
+      [{ token_hash: legacyFixtureIds.authSession, user_id: legacyFixtureIds.appUser }],
+    );
+    assert.deepEqual(migratedDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    migratedDatabase.close();
+  }
+  assertStudentGroupYearCodeKey(databasePath);
+
+  // 热重载第二次初始化必须保持账号、会话、revision 和所有新建空表逐字段不变。
+  const stateAfterFirstMigration = readMigratedLegacyState(databasePath);
+  globalThis.timetableSchemaVersion = runtimeSchemaVersion - 1;
+  assert.equal(databaseModule.databaseHealth(), true);
+  assert.equal(tracking.instances.length, 1);
+  assert.deepEqual(readMigratedLegacyState(databasePath), stateAfterFirstMigration);
+  assertAppUserRevisionColumn(databasePath);
+  assert.deepEqual(databaseModule.listAppUsers(), [{
+    id: legacyFixtureIds.appUser,
+    username: "legacy-scheduler",
+    isAdmin: false,
+    isActive: true,
+    revision: 1,
+  }]);
+
+  const sessionBeforeStatusNoOp = new Database(databasePath, { readonly: true });
+  try {
+    assert.equal(sessionBeforeStatusNoOp.prepare("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?")
+      .get(legacyFixtureIds.appUser).count, 1);
+  } finally {
+    sessionBeforeStatusNoOp.close();
+  }
+  // 同版本同值不写数据库或撤销会话。真实停用才提高 revision 并删除会话；旧版本
+  // 即使 desired 与当前 Inactive 相同也必须抛 ACCOUNT_CHANGED，而不是伪装 no-op。
+  assert.deepEqual(databaseModule.setAppUserStatus(legacyFixtureIds.appUser, true, 1), { revision: 1, changed: false });
+  assert.deepEqual(databaseModule.setAppUserStatus(legacyFixtureIds.appUser, false, 1), { revision: 2, changed: true });
+  assert.throws(
+    () => databaseModule.setAppUserStatus(legacyFixtureIds.appUser, false, 1),
+    (error) => error instanceof databaseModule.AppUserChangedError && error.code === "ACCOUNT_CHANGED",
+  );
+  assert.deepEqual(databaseModule.setAppUserStatus(legacyFixtureIds.appUser, true, 2), { revision: 3, changed: true });
+  const statusState = new Database(databasePath, { readonly: true });
+  try {
+    assert.deepEqual(
+      statusState.prepare("SELECT is_active, revision FROM app_users WHERE id = ?").get(legacyFixtureIds.appUser),
+      { is_active: 1, revision: 3 },
+    );
+    assert.equal(statusState.prepare("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?")
+      .get(legacyFixtureIds.appUser).count, 0);
+  } finally {
+    statusState.close();
+  }
+  for (const [isActive, expectedRevision] of [
+    ["false", 3],
+    [false, 0],
+    [false, 1.5],
+    [false, Number.MAX_SAFE_INTEGER + 1],
+  ]) {
+    assert.throws(
+      () => databaseModule.setAppUserStatus(legacyFixtureIds.appUser, isActive, expectedRevision),
+      (error) => error instanceof databaseModule.AppUserStatusInputError,
+    );
+  }
+  report("旧账号与会话迁移到 revision 1、幂等初始化并通过直接状态 CAS 边界");
+});
+
 await withIsolatedDatabase("legacy-master-data", "production", async (databasePath) => {
   createLegacyMasterDataFixture(databasePath);
   const legacyStateBeforeMigration = readLegacyOriginalState(databasePath);
@@ -727,6 +915,7 @@ await withIsolatedDatabase("legacy-master-data", "production", async (databasePa
     migratedDatabase.close();
   }
   assertTeachingMembersSourceIndex(databasePath);
+  assertAppUserRevisionColumn(databasePath);
   assertHealthyDatabase(databasePath);
 
   // 模拟开发热重载看到旧 schema version：同一连接会再执行完整 initializeTables。
@@ -738,6 +927,7 @@ await withIsolatedDatabase("legacy-master-data", "production", async (databasePa
   assert.equal(globalThis.timetableSchemaVersion, runtimeSchemaVersion);
   assert.deepEqual(readMigratedLegacyState(databasePath), stateAfterFirstMigration);
   assertTeachingMembersSourceIndex(databasePath);
+  assertAppUserRevisionColumn(databasePath);
 
   // 真实业务查询必须能沿旧稳定 ID 读取 allocation、section、学生班级和教室关系；
   // 这比只检查 PRAGMA 列更能发现迁移后 ORM/API 读取形状不兼容的问题。
@@ -756,6 +946,16 @@ await withIsolatedDatabase("legacy-master-data", "production", async (databasePa
     year: 2,
     program: "LEGACY",
   }]);
+  // 旧库的 LEGACY_01 原本锁住所有年级；升级后 Year 1／3 可各自建立同名班级，
+  // 但 Year 2 的第二条同名记录仍由组合唯一键稳定拒绝。
+  assert.equal(databaseModule.createStudentGroup("LEGACY_01", 1, "LEGACY").year, 1);
+  assert.equal(databaseModule.createStudentGroup("LEGACY_01", 3, "LEGACY").year, 3);
+  assert.throws(
+    () => databaseModule.createStudentGroup("LEGACY_01", 2, "LEGACY"),
+    (error) => error instanceof databaseModule.MasterDataUniqueConflictError
+      && /Year 2/.test(error.message),
+  );
+  assertStudentGroupYearCodeKey(databasePath);
   assert.deepEqual(databaseModule.listRooms(), [{
     id: legacyFixtureIds.room,
     revision: 1,
@@ -787,6 +987,7 @@ await withIsolatedDatabase("legacy-master-data", "production", async (databasePa
   assert.equal(legacyLesson.teacherId, legacyFixtureIds.teacher);
   assert.equal(legacyLesson.roomId, legacyFixtureIds.room);
   assert.deepEqual(legacyLesson.studentGroupIds, [legacyFixtureIds.studentGroup]);
+
 
   // Route Handler 已经验证 JSON，但维护脚本、未来 job 或另一个 server module 可以直接
   // 调用 database export。下面从真实 CommonJS 转译模块越过 route，逐项证明 DB 边界

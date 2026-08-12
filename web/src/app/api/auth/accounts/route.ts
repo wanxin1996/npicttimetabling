@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { sessionToken } from "@/lib/auth";
-import { AppUserUniqueConflictError, createAppUser, listAppUsers, resetAppUserPassword, setAppUserStatus, validateSession } from "@/lib/database";
+import { AppUserChangedError, AppUserStatusInputError, AppUserUniqueConflictError, createAppUser, listAppUsers, resetAppUserPassword, setAppUserStatus, validateSession } from "@/lib/database";
 import { passwordHasValidLength, usernameHasValidLength } from "@/lib/auth-input";
 import { safeDatabaseFailureResponse } from "@/lib/database-response";
 import { readJsonObject } from "@/lib/request-json";
@@ -55,9 +55,13 @@ export async function PATCH(request: NextRequest) {
     if (!parsed.ok) return parsed.response;
     const body = parsed.value;
     if (typeof body.userId !== "string") return Response.json({ error: "Choose an account." }, { status: 400 });
-    if (body.action === "status" && typeof body.isActive === "boolean") {
-      if (!setAppUserStatus(body.userId, body.isActive)) return Response.json({ error: "Only normal scheduler accounts can be changed." }, { status: 400 });
-      return Response.json({ ok: true });
+    if (body.action === "status" && typeof body.isActive === "boolean"
+      && Number.isSafeInteger(body.expectedRevision) && Number(body.expectedRevision) >= 1) {
+      // expectedRevision binds the command to the row shown in this administrator's browser.
+      // The database repeats this validation because non-HTTP maintenance code can call it too.
+      const saved = setAppUserStatus(body.userId, body.isActive, Number(body.expectedRevision));
+      if (!saved) return Response.json({ error: "Only normal scheduler accounts can be changed." }, { status: 400 });
+      return Response.json({ ok: true, revision: saved.revision, changed: saved.changed });
     }
     if (body.action === "resetPassword" && typeof body.password === "string" && passwordHasValidLength(body.password)) {
       if (!resetAppUserPassword(body.userId, body.password)) return Response.json({ error: "Only normal scheduler accounts can be reset." }, { status: 400 });
@@ -65,6 +69,8 @@ export async function PATCH(request: NextRequest) {
     }
     return Response.json({ error: "Account action is invalid." }, { status: 400 });
   } catch (error) {
+    if (error instanceof AppUserStatusInputError) return Response.json({ error: error.message }, { status: 400 });
+    if (error instanceof AppUserChangedError) return Response.json({ code: error.code, error: error.message }, { status: 409 });
     return safeDatabaseFailureResponse(error, "Account update failed", "The account could not be updated. Try again.");
   }
 }

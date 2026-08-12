@@ -1,0 +1,10 @@
+{
+  "viewport": "1024x768",
+  "participants": [
+    { "id": "P1", "role": "", "success": null, "timeSeconds": null, "sawSaveFeedback": null, "facilitatorIntervention": null, "notes": "" },
+    { "id": "P2", "role": "", "success": null, "timeSeconds": null, "sawSaveFeedback": null, "facilitatorIntervention": null, "notes": "" },
+    { "id": "P3", "role": "", "success": null, "timeSeconds": null, "sawSaveFeedback": null, "facilitatorIntervention": null, "notes": "" },
+    { "id": "P4", "role": "", "success": null, "timeSeconds": null, "sawSaveFeedback": null, "facilitatorIntervention": null, "notes": "" },
+    { "id": "P5", "role": "", "success": null, "timeSeconds": null, "sawSaveFeedback": null, "facilitatorIntervention": null, "notes": "" }
+  ]
+}

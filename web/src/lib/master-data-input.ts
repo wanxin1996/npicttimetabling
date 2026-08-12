@@ -237,14 +237,20 @@ export function isOpaqueResourceId(value: unknown): value is string {
 }
 
 export function isPositiveSafeInteger(value: unknown): value is number {
+  // revision、课次等 CAS 基准必须保留 JSON 原生整数类型；先 Number(...) 会把
+  // 字符串、布尔值或超大浮点数宽松转换成看似合法的业务值。
   return Number.isSafeInteger(value) && Number(value) >= 1;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
+  // 写接口只接受 JSON object；null 与数组即使在 JavaScript 中 typeof 为 object，
+  // 也不能被当作具名字段 payload 继续解析。
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function parseOptionalResourceId(value: unknown): ParsedInput<string | null> {
+  // 可选外键只允许明确 null 或完整 opaque ID；空字符串不能偷偷表示 null，
+  // 否则会绕过存在性检查后在 SQLite 外键写入阶段变成通用500。
   if (value === null) return { ok: true, value: null };
   return isOpaqueResourceId(value)
     ? { ok: true, value }
@@ -252,6 +258,8 @@ function parseOptionalResourceId(value: unknown): ParsedInput<string | null> {
 }
 
 function parseStudentGroupIds(value: unknown): ParsedInput<string[]> {
+  // 同一班次的班级关系是集合：限制总数避免巨大 SQL placeholders，拒绝重复值则
+  // 让浏览器、API 与复合主键看到完全相同的语义。
   if (!Array.isArray(value) || value.length > MAX_STUDENT_GROUP_IDS_PER_ASSIGNMENT) {
     return { ok: false, error: `Choose no more than ${MAX_STUDENT_GROUP_IDS_PER_ASSIGNMENT} student groups.` };
   }
@@ -262,6 +270,8 @@ function parseStudentGroupIds(value: unknown): ParsedInput<string[]> {
 }
 
 export function parseCourseSectionAssignmentInput(value: unknown): ParsedInput<CourseSectionAssignmentInput> {
+  // Course Sections 表单一次提交教师、全部班级和打开表单时的 revision；整包验证
+  // 后才允许数据库开始事务，任何一个字段不可信都不能产生部分关联。
   if (!isPlainObject(value)) {
     return { ok: false, error: "Teacher, student groups and revision are invalid." };
   }
@@ -274,6 +284,8 @@ export function parseCourseSectionAssignmentInput(value: unknown): ParsedInput<C
 }
 
 export function parseScheduledLessonPlacementInput(value: unknown): ParsedInput<ScheduledLessonPlacementInput> {
+  // 首次排课的星期、小时与周内课次都使用严格整数范围；课时长度仍由数据库读取
+  // 课程设置，浏览器不能自行声明较短时长来绕过结束时间或冲突检查。
   if (!isPlainObject(value)) {
     return { ok: false, error: "Section, weekly session, day, start hour and room are invalid." };
   }
@@ -298,6 +310,8 @@ export function parseScheduledLessonPlacementInput(value: unknown): ParsedInput<
 }
 
 export function parseScheduledLessonUpdateInput(value: unknown): ParsedInput<ScheduledLessonUpdateInput> {
+  // 已排课程 PATCH 是整体 CAS：位置与三类关联必须和 revision 一起通过验证，
+  // 服务端才能安全区分 no-op、真实更新和另一位老师已经先保存的旧基线。
   if (!isPlainObject(value)) {
     return { ok: false, error: "Day, start hour, teacher, room, student groups and revision are invalid." };
   }

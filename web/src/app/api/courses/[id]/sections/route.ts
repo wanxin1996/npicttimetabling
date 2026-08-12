@@ -39,7 +39,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   } catch (error) {
     if (error instanceof CourseSetupInputError) return Response.json({ error: error.message }, { status: 400 });
     if (error instanceof CourseSetupRevisionConflictError) return Response.json({ code: "COURSE_SETUP_CHANGED", error: error.message }, { status: 409 });
-    if (error instanceof CourseSectionResizeConflictError) return Response.json({ error: error.message }, { status: 409 });
+    if (error instanceof CourseSectionResizeConflictError) return Response.json({ code: "COURSE_SECTION_IN_USE", error: error.message }, { status: 409 });
     if (error instanceof CourseSetupBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
     return safeDatabaseFailureResponse(error, "Course-section resize failed", "Section count could not be changed. Try again.");
   }

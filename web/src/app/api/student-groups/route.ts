@@ -22,7 +22,7 @@ export async function POST(request: Request) {
   if (!input.ok) return Response.json({ error: input.error }, { status: 400 });
 
   try {
-    // SQLite 负责最终执行班级编号唯一规则；若重复，则向界面返回明确可处理的提示。
+    // SQLite 负责最终执行“同一年级内编号唯一”；不同年级可以各自拥有 AAA_01。
     return Response.json(createStudentGroup(input.value.code, input.value.year, input.value.program), { status: 201 });
   } catch (error) {
     if (error instanceof MasterDataInputError) return Response.json({ error: error.message }, { status: 400 });

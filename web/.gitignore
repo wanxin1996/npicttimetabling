@@ -43,5 +43,9 @@ next-env.d.ts
 
 /generated/prisma
 /data/*.db
+# SQLite 数据库、安全副本和活动日志都可能包含真实账号与排课资料；任何扩展名形式都不得进入 Git。
+/data/*.db-*
+/data/*.sqlite
+/data/*.sqlite-*
 # 完整恢复安全副本包含账号和业务资料；和主 SQLite 一样只能保留在本地或持久卷，不能提交。
 /data/*-restore-safety/

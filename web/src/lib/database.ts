@@ -187,6 +187,7 @@ export type UnscheduledSectionRecord = {
   teacherIsActive: boolean | null;
   staffType: "FT" | "PT" | null;
   durationHours: number;
+  studentGroupIds: string[];
   studentGroups: string[];
   occurrence: number;
   sessionsPerWeek: number;
@@ -246,7 +247,7 @@ export type RulesWorkspaceRecord = {
   teachers: TeacherRecord[];
 };
 
-export type AppUserRecord = { id: string; username: string; isAdmin: boolean; isActive: boolean };
+export type AppUserRecord = { id: string; username: string; isAdmin: boolean; isActive: boolean; revision: number };
 
 export type CycleStatusRecord = {
   courses: number;
@@ -291,7 +292,7 @@ const globalForDatabase = globalThis as unknown as {
 // 这个数字只在 initializeTables 的表、列或索引定义发生变化时增加。
 // 开发热重载会保留全局 SQLite 连接，但会重新载入本文件；版本不同就补做一次迁移，
 // 同一版本的普通 API 请求则直接复用连接，不再每次解析整组 CREATE／ALTER 语句。
-const runtimeSchemaVersion = 2026081103;
+const runtimeSchemaVersion = 2026081105;
 
 function databaseFilePath() {
   // 数据库路径统一从这里取得，确保正式数据库和恢复前自动生成的安全副本
@@ -430,6 +431,13 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
         typeof(revision) <> 'integer' OR revision < 1 OR
         typeof(created_at) <> 'text' OR trim(created_at) = '' OR
         typeof(updated_at) <> 'text' OR trim(updated_at) = '' LIMIT 1`,
+    },
+    {
+      area: "student-group year/code uniqueness",
+      // 班级编号会在 Year 1–3 重复使用；完整备份只应拒绝同一年级内的重复，
+      // 不能把 Year 2 的 AAA_01 错当成 Year 1 的同一批学生。
+      sql: `SELECT 1 FROM student_groups
+        GROUP BY year, code HAVING COUNT(*) > 1 LIMIT 1`,
     },
     {
       area: "rooms",
@@ -572,6 +580,7 @@ function assertDatabaseBusinessInvariants(db: DatabaseInstance, stage: string) {
         typeof(password_hash) <> 'text' OR
         typeof(is_admin) <> 'integer' OR is_admin NOT IN (0, 1) OR
         typeof(is_active) <> 'integer' OR is_active NOT IN (0, 1) OR
+        typeof(revision) <> 'integer' OR revision < 1 OR
         typeof(created_at) <> 'text' OR trim(created_at) = '' LIMIT 1`,
     },
     {
@@ -1081,12 +1090,13 @@ function initializeTables(db: DatabaseInstance) {
     );
     CREATE TABLE IF NOT EXISTS student_groups (
       id TEXT PRIMARY KEY,
-      code TEXT NOT NULL UNIQUE,
+      code TEXT NOT NULL,
       year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
       program TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+      UNIQUE(year, code)
     );
     CREATE TABLE IF NOT EXISTS rooms (
       id TEXT PRIMARY KEY,
@@ -1177,7 +1187,8 @@ function initializeTables(db: DatabaseInstance) {
       password_hash TEXT NOT NULL,
       is_admin INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
     );
     CREATE TABLE IF NOT EXISTS auth_sessions (
       token_hash TEXT PRIMARY KEY,
@@ -1211,6 +1222,54 @@ function initializeTables(db: DatabaseInstance) {
   const studentGroupColumns = db.prepare("PRAGMA table_info(student_groups)").all() as Array<{ name: string }>;
   if (!studentGroupColumns.some((column) => column.name === "revision")) {
     db.exec("ALTER TABLE student_groups ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+  }
+  // 旧版把 code 设成全校唯一，因此 Year 1 已有 AAA_01 时无法为 Year 2／3 建立
+  // 各自的 AAA_01。SQLite 不能 DROP 自动唯一约束，只能在关闭外键动作的短事务里
+  // 原样重建父表；稳定 ID 和 section_student_groups 外键值全部保留。
+  const studentGroupUniqueIndexColumns = () => (
+    (db.prepare("PRAGMA index_list(student_groups)").all() as Array<{ name: string; unique: number }>)
+      .filter((index) => index.unique === 1)
+      .map((index) => (db.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).map((column) => column.name))
+  );
+  const studentGroupKeysNeedMigration = () => {
+    const uniqueKeys = studentGroupUniqueIndexColumns();
+    const hasYearCodeKey = uniqueKeys.some((columns) => columns.length === 2 && columns[0] === "year" && columns[1] === "code");
+    const hasLegacyCodeKey = uniqueKeys.some((columns) => columns.length === 1 && columns[0] === "code");
+    return !hasYearCodeKey || hasLegacyCodeKey;
+  };
+  if (studentGroupKeysNeedMigration()) {
+    const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
+    if (foreignKeysWereEnabled) db.pragma("foreign_keys = OFF");
+    try {
+      const migrateStudentGroupKey = db.transaction(() => {
+        // 另一个 standalone 可能已在我们等待写锁时完成迁移；取得锁后必须复检，
+        // 避免无意义地再重建一次同一张父表。
+        if (!studentGroupKeysNeedMigration()) return;
+        db.exec(`
+          CREATE TABLE student_groups_year_code_migration (
+            id TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
+            program TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+            UNIQUE(year, code)
+          );
+          INSERT INTO student_groups_year_code_migration
+            (id, code, year, program, created_at, updated_at, revision)
+          SELECT id, code, year, program, created_at, updated_at, revision
+          FROM student_groups;
+          DROP TABLE student_groups;
+          ALTER TABLE student_groups_year_code_migration RENAME TO student_groups;
+        `);
+        const brokenReferences = db.pragma("foreign_key_check") as Array<unknown>;
+        if (brokenReferences.length > 0) throw new Error("Student-group key migration would break existing section assignments.");
+      });
+      migrateStudentGroupKey.immediate();
+    } finally {
+      if (foreignKeysWereEnabled) db.pragma("foreign_keys = ON");
+    }
   }
   const roomColumns = db.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>;
   if (!roomColumns.some((column) => column.name === "revision")) {
@@ -1259,6 +1318,12 @@ function initializeTables(db: DatabaseInstance) {
     // 同时编辑同一个班次时，后提交者把先提交者的选择静默覆盖。
     db.exec("ALTER TABLE course_sections ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
   }
+  const appUserColumns = db.prepare("PRAGMA table_info(app_users)").all() as Array<{ name: string }>;
+  if (!appUserColumns.some((column) => column.name === "revision")) {
+    // 旧账号的启用状态成为浏览器第一次看到的 revision 1；后续每次真实状态变化
+    // 才递增。ALTER 的 DEFAULT 同时安全填入所有现有行，不改变密码或登录会话关系。
+    db.exec("ALTER TABLE app_users ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)");
+  }
 
   // 早期版本只为自然键建立普通索引，因此同一教师／年级的完全相同时段可能被重复保存。
   // 升级必须先确定性保留最早的 rowid，再把约束升级为 unique。整个过程用 IMMEDIATE
@@ -1303,6 +1368,8 @@ function initializeTables(db: DatabaseInstance) {
       ON auth_sessions (expires_at);
     CREATE INDEX IF NOT EXISTS rooms_is_active_code_idx
       ON rooms (is_active, code);
+    CREATE INDEX IF NOT EXISTS student_groups_year_program_idx
+      ON student_groups (year, program);
     CREATE INDEX IF NOT EXISTS courses_primary_year_idx
       ON courses (primary_year);
     CREATE INDEX IF NOT EXISTS teaching_allocations_teacher_id_idx
@@ -1420,8 +1487,8 @@ export function validateSession(token: string): AppUserRecord | null {
   // 让被停用的用户或已过期的 Cookie 立即失去访问权限。
   try {
     const db = database();
-    const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number } | undefined;
-    return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) } : null;
+    const row = db.prepare(`SELECT users.id, users.username, users.is_admin, users.is_active, users.revision FROM auth_sessions sessions JOIN app_users users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1`).get(sessionHash(token), new Date().toISOString()) as { id: string; username: string; is_admin: number; is_active: number; revision: number } | undefined;
+    return row ? { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active), revision: row.revision } : null;
   } catch (error) {
     if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
@@ -1447,7 +1514,7 @@ export function createInitialAdmin(username: string, password: string) {
     if (count.count > 0) throw new InitialAdministratorAlreadyExistsError();
     const id = crypto.randomUUID();
     db.prepare("INSERT INTO app_users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(id, username, hashPassword(password));
-    return { user: { id, username, isAdmin: true, isActive: true }, session: createSession(db, id) };
+    return { user: { id, username, isAdmin: true, isActive: true, revision: 1 }, session: createSession(db, id) };
   });
   // IMMEDIATE 在读取空表前先取得写入保留锁。两个 standalone 同时 setup 时，后到者
   // 会等待前者提交，再看到已有管理员并得到稳定 409，而不是都读到 0 或冒出 BUSY 500。
@@ -1459,16 +1526,19 @@ export function loginUser(username: string, password: string) {
   // 再由浏览器通过安全 Cookie 保存原始会话令牌。
   try {
     const db = database();
-    const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number } | undefined;
+    const row = db.prepare("SELECT id, username, password_hash, is_admin, is_active, revision FROM app_users WHERE username = ? COLLATE NOCASE").get(username) as { id: string; username: string; password_hash: string; is_admin: number; is_active: number; revision: number } | undefined;
     if (!row || !row.is_active || !passwordMatches(password, row.password_hash)) return null;
 
     // Scrypt 故意在写锁外运行，避免一次登录长时间挡住排课保存；但密码验证完成后，
     // 管理员可能恰好重置密码或停用账号。因此建立会话前在 IMMEDIATE 事务内再次确认
     // Active 状态和密码哈希仍是刚才验证的版本，旧请求不能在撤销之后补回新会话。
     const finishLogin = db.transaction(() => {
-      const current = db.prepare("SELECT password_hash, is_active FROM app_users WHERE id = ?").get(row.id) as { password_hash: string; is_active: number } | undefined;
-      if (!current || current.is_active !== 1 || current.password_hash !== row.password_hash) return null;
-      return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true }, session: createSession(db, row.id) };
+      const current = db.prepare("SELECT password_hash, is_active, revision FROM app_users WHERE id = ?").get(row.id) as { password_hash: string; is_active: number; revision: number } | undefined;
+      // revision 也要保持不变：管理员若在 Scrypt 期间停用后又启用，最终 Active 虽与
+      // 首读相同，这项在途登录仍跨过了一次明确撤销，不能在撤销之后补回新会话。
+      if (!current || current.is_active !== 1 || current.password_hash !== row.password_hash
+        || current.revision !== row.revision) return null;
+      return { user: { id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: true, revision: row.revision }, session: createSession(db, row.id) };
     });
     return finishLogin.immediate();
   } catch (error) {
@@ -1486,8 +1556,8 @@ export function logoutSession(token: string) {
 
 export function listAppUsers(): AppUserRecord[] {
   // 管理员只能查看账号标识和启用状态，接口绝不返回密码哈希或登录会话资料。
-  const rows = database().prepare("SELECT id, username, is_admin, is_active FROM app_users ORDER BY username").all() as Array<{ id: string; username: string; is_admin: number; is_active: number }>;
-  return rows.map((row) => ({ id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active) }));
+  const rows = database().prepare("SELECT id, username, is_admin, is_active, revision FROM app_users ORDER BY username").all() as Array<{ id: string; username: string; is_admin: number; is_active: number; revision: number }>;
+  return rows.map((row) => ({ id: row.id, username: row.username, isAdmin: Boolean(row.is_admin), isActive: Boolean(row.is_active), revision: row.revision }));
 }
 
 export function createAppUser(username: string, password: string): AppUserRecord {
@@ -1500,7 +1570,7 @@ export function createAppUser(username: string, password: string): AppUserRecord
     if (isSqliteUniqueConstraintError(error)) throw new AppUserUniqueConflictError();
     throw error;
   }
-  return { id, username, isAdmin: false, isActive: true };
+  return { id, username, isAdmin: false, isActive: true, revision: 1 };
 }
 
 export class AppUserUniqueConflictError extends Error {
@@ -1572,15 +1642,60 @@ export function changeOwnPassword(userId: string, sessionToken: string, currentP
   }
 }
 
-export function setAppUserStatus(userId: string, isActive: boolean) {
-  // 停用账号是可恢复操作：删除现有会话，但保留用户名及历史操作归属信息。
+export class AppUserChangedError extends Error {
+  readonly code = "ACCOUNT_CHANGED";
+
+  // expectedRevision 来自管理员实际看到的账号清单。专门的409让页面刷新最新版，
+  // 而不是把另一个浏览器已经完成的启停静默改回去。
+  constructor() {
+    super("This account was changed by another administrator. Review the latest account list before trying again.");
+    this.name = "AppUserChangedError";
+  }
+}
+
+export class AppUserStatusInputError extends Error {
+  // database export 也可能被维护脚本直接调用，因此不能只依赖 HTTP route 验证版本。
+  constructor() {
+    super("Account status and revision are invalid.");
+    this.name = "AppUserStatusInputError";
+  }
+}
+
+export function setAppUserStatus(userId: string, isActive: boolean, expectedRevision: number): { revision: number; changed: boolean } | null {
+  // revision 只跟踪管理员可见的启用状态；密码哈希由独立 CAS 和会话撤销规则保护，
+  // 所以密码重置不会制造与状态无关的“账号已变化”提示。
+  if (typeof isActive !== "boolean" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+    throw new AppUserStatusInputError();
+  }
   const db = database();
-  // 停用后立即撤销活跃会话；重新启用只恢复登录资格，不会自动创建新会话。
-  return db.transaction(() => {
-    const changed = db.prepare("UPDATE app_users SET is_active = ? WHERE id = ? AND is_admin = 0").run(isActive ? 1 : 0, userId).changes > 0;
-    if (changed && !isActive) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
-    return changed;
-  })();
+  const updateStatus = db.transaction(() => {
+    const current = db.prepare("SELECT is_active, revision FROM app_users WHERE id = ? AND is_admin = 0")
+      .get(userId) as { is_active: number; revision: number } | undefined;
+    if (!current) return null;
+    // 版本检查必须早于 no-op。若另一位管理员经历停用再启用，当前值虽然再次相同，
+    // 旧页面仍然错过了中间变更和会话撤销，不能把 stale 请求报告成成功。
+    if (current.revision !== expectedRevision) throw new AppUserChangedError();
+    if (Boolean(current.is_active) === isActive) return { revision: current.revision, changed: false };
+
+    const result = db.prepare(`UPDATE app_users
+      SET is_active = ?, revision = revision + 1
+      WHERE id = ? AND is_admin = 0 AND revision = ?`)
+      .run(isActive ? 1 : 0, userId, expectedRevision);
+    if (result.changes !== 1) throw new AppUserChangedError();
+    // 停用和会话撤销属于同一个提交；DELETE 故障会回滚状态与 revision。
+    // 重新启用只恢复登录资格，不会自动建立任何会话。
+    if (!isActive) db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    return { revision: expectedRevision + 1, changed: true };
+  });
+  try {
+    // IMMEDIATE 在读取 revision 前先取得写入保留锁，跨进程请求不会都读到同一版本后
+    // 再依赖最后写入者；后到者会在前者提交后稳定得到 ACCOUNT_CHANGED。
+    return updateStatus.immediate();
+  } catch (error) {
+    if (error instanceof AppUserChangedError || error instanceof AppUserStatusInputError) throw error;
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function resetAppUserPassword(userId: string, newPassword: string) {
@@ -1742,6 +1857,17 @@ export class MasterDataRevisionConflictError extends Error {
   }
 }
 
+export class StudentGroupInUseError extends Error {
+  readonly code = "STUDENT_GROUP_IN_USE";
+
+  // 删除误建班级只能影响这一条基础资料。若当前班次或应急周期备份仍引用它，
+  // 专用409会要求老师先解除关系，绝不能依赖 ON DELETE CASCADE 静默抹掉关联。
+  constructor(message: string) {
+    super(message);
+    this.name = "StudentGroupInUseError";
+  }
+}
+
 export class MasterDataInputError extends Error {
   // 不可用时段等基础资料若引用不存在的教师，应返回明确 400，而不是暴露外键错误。
   constructor(message: string) {
@@ -1804,7 +1930,7 @@ export function createStudentGroup(code: string, year: number, program: string):
   } catch (error) {
     // 只有稳定的 SQLite 唯一键错误才代表班级编号重复；磁盘、trigger 等未知故障继续向上抛，
     // 由 API 隐藏技术细节并返回通用 500，不能误导老师继续修改一个本来并未重复的编号。
-    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError(`A student group with this code already exists in Year ${year}.`);
     if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
@@ -1836,7 +1962,59 @@ export function updateStudentGroup(id: string, input: { code: string; year: numb
     return updateTransaction.immediate();
   } catch (error) {
     if (error instanceof MasterDataRevisionConflictError) throw error;
-    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError("A student group with this code already exists.");
+    if (isSqliteUniqueConstraintError(error)) throw new MasterDataUniqueConflictError(`A student group with this code already exists in Year ${input.year}.`);
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
+}
+
+export function deleteStudentGroup(id: string, revision: number): boolean | null {
+  // 路由和数据库导出都验证稳定 ID 与 revision，避免维护脚本绕过 HTTP 后执行
+  // 宽松删除。比较 revision 必须先于“是否在用”，让 stale 请求优先得到一致的并发提示。
+  if (!isOpaqueResourceId(id) || !isPositiveSafeInteger(revision)) {
+    throw new MasterDataInputError("Student-group id and revision are invalid.");
+  }
+  const db = masterDataDatabase();
+  const deleteTransaction = db.transaction(() => {
+    const current = db.prepare("SELECT revision FROM student_groups WHERE id = ?").get(id) as { revision: number } | undefined;
+    if (!current) return null;
+    if (current.revision !== revision) throw new MasterDataRevisionConflictError();
+
+    const activeAssignment = db.prepare(
+      "SELECT 1 FROM section_student_groups WHERE student_group_id = ? LIMIT 1",
+    ).get(id);
+    if (activeAssignment) {
+      throw new StudentGroupInUseError("This student group is assigned to a course section. Clear that assignment before deleting the group.");
+    }
+
+    // Emergency Cycle 只保存 section→group ID，不复制基础资料。删除其引用会让恢复
+    // 在未来才失败，因此在删除当下解析唯一快照并给出可理解的保护提示。
+    const cycleBackups = db.prepare("SELECT snapshot_json FROM schedule_backups").all() as Array<{ snapshot_json: string }>;
+    const retainedByEmergencyBackup = cycleBackups.some((backup) => {
+      try {
+        const snapshot = JSON.parse(backup.snapshot_json) as { sectionGroups?: Array<{ student_group_id?: unknown }> };
+        return Array.isArray(snapshot.sectionGroups)
+          && snapshot.sectionGroups.some((assignment) => assignment.student_group_id === id);
+      } catch {
+        // 正常业务不变量会拒绝损坏快照；若人工维护绕过了该门槛，这里仍采取
+        // fail-closed，不能从一份不可读取的应急备份中静默删除班级。
+        return true;
+      }
+    });
+    if (retainedByEmergencyBackup) {
+      throw new StudentGroupInUseError("This student group is retained by the emergency cycle backup. Keep it until that backup is safely replaced.");
+    }
+
+    const removed = db.prepare("DELETE FROM student_groups WHERE id = ? AND revision = ?").run(id, revision);
+    if (removed.changes !== 1) throw new MasterDataRevisionConflictError();
+    return true;
+  });
+  try {
+    return deleteTransaction.immediate();
+  } catch (error) {
+    if (error instanceof MasterDataRevisionConflictError
+      || error instanceof MasterDataInputError
+      || error instanceof StudentGroupInUseError) throw error;
     if (isSqliteBusyError(error)) throw new DatabaseBusyError();
     throw error;
   }
@@ -2643,10 +2821,16 @@ export function resizeCourseSections(courseId: string, sectionCount: number, rev
   // 只调整最高序号一端的班次，保证保留下来的 LEAD_01 至 LEAD_N 标签、
   // 教师分配和学生班级关联都保持稳定。
   const resize = db.transaction(() => {
-    const course = db.prepare("SELECT id, revision FROM courses WHERE id = ?").get(courseId) as { id: string; revision: number } | undefined;
+    const course = db.prepare("SELECT id, code, revision FROM courses WHERE id = ?").get(courseId) as { id: string; code: string; revision: number } | undefined;
     if (!course) return false;
     if (course.revision !== revision) throw new CourseSetupRevisionConflictError();
-    const currentSections = db.prepare("SELECT id, sequence, teacher_id FROM course_sections WHERE course_id = ? ORDER BY sequence ASC").all(courseId) as Array<{ id: string; sequence: number; teacher_id: string | null }>;
+    const currentSections = db.prepare(`SELECT id, sequence, teacher_id, allocation_teacher_id
+      FROM course_sections WHERE course_id = ? ORDER BY sequence ASC`).all(courseId) as Array<{
+        id: string;
+        sequence: number;
+        teacher_id: string | null;
+        allocation_teacher_id: string | null;
+      }>;
     // 完全相同的数量不会更新 timestamp 或 revision，也不会让其他账号已打开的设置无故失效。
     if (sectionCount === currentSections.length) return { revision: course.revision, changed: false };
 
@@ -2662,11 +2846,15 @@ export function resizeCourseSections(courseId: string, sectionCount: number, rev
       const hasScheduledLesson = db.prepare("SELECT 1 FROM scheduled_lessons WHERE section_id = ? LIMIT 1");
       const hasStudentGroup = db.prepare("SELECT 1 FROM section_student_groups WHERE section_id = ? LIMIT 1");
       for (const section of removable) {
-        // 若要删除的班次已经排课、分配教师或关联学生班级，用户必须先明确清除资料，
-        // 防止修正数量时无提示地删除真实工作。即使班次尚未排入总表，教师也是人工决定。
-        if (hasScheduledLesson.get(section.id)) throw new CourseSectionResizeConflictError(`${section.sequence} is already scheduled. Return that section to the tray before reducing the count.`);
-        if (section.teacher_id) throw new CourseSectionResizeConflictError(`${section.sequence} has a teacher. Clear its assignments before reducing the count.`);
-        if (hasStudentGroup.get(section.id)) throw new CourseSectionResizeConflictError(`${section.sequence} has student groups. Clear its assignments before reducing the count.`);
+        const sectionLabel = `${course.code}_${String(section.sequence).padStart(2, "0")}`;
+        // 已排位置、学生班级和人工教师都是老师明确维护的工作，缩减数量不能级联丢弃。
+        // Teaching Members 自动教师则由 allocation_teacher_id 标记；用户明确修正数量时，
+        // 这类来源可随尾部班次移除，而 teaching_allocations baseline 继续保留供 mismatch 审核。
+        if (hasScheduledLesson.get(section.id)) throw new CourseSectionResizeConflictError(`${sectionLabel} is already scheduled. Return it to the tray before reducing the section count.`);
+        if (hasStudentGroup.get(section.id)) throw new CourseSectionResizeConflictError(`${sectionLabel} has student groups. Clear its assignments before reducing the section count.`);
+        const hasManuallyMaintainedTeacher = section.teacher_id !== null
+          && (section.allocation_teacher_id === null || section.teacher_id !== section.allocation_teacher_id);
+        if (hasManuallyMaintainedTeacher) throw new CourseSectionResizeConflictError(`${sectionLabel} has a manually maintained teacher. Clear that assignment before reducing the section count.`);
       }
       const removeSection = db.prepare("DELETE FROM course_sections WHERE id = ?");
       for (const section of removable) removeSection.run(section.id);
@@ -2684,6 +2872,84 @@ export function resizeCourseSections(courseId: string, sectionCount: number, rev
     return result === false ? null : result;
   } catch (error) {
     if (error instanceof CourseSetupInputError || error instanceof CourseSetupRevisionConflictError || error instanceof CourseSectionResizeConflictError || error instanceof CourseSetupBusyError) throw error;
+    if (isSqliteBusyError(error)) throw new CourseSetupBusyError();
+    throw error;
+  }
+}
+
+export class CourseChangedError extends Error {
+  // 删除使用与 Configure／section resize 相同的课程 revision，但给浏览器一个更宽泛的
+  // 稳定错误类型：导入、设置或数量任一变化都表示旧删除确认已经失效。
+  constructor() {
+    super("This course was changed by another scheduler.");
+    this.name = "CourseChangedError";
+  }
+}
+
+export class CourseInUseError extends Error {
+  readonly code = "COURSE_IN_USE";
+
+  // 只有可由老师明确清理的课程工作会使用此类型。未知 constraint、trigger 或磁盘错误
+  // 必须继续走固定 500，不能被误报成普通业务冲突。
+  constructor(message: string) {
+    super(message);
+    this.name = "CourseInUseError";
+  }
+}
+
+export function deleteCourse(id: string, revision: number): boolean | null {
+  // 课程删除会一并移除其拥有的空白／自动班次与 Teaching Members allocation baseline，
+  // 但绝不级联删除教师、学生班级、教室或不可用时段等跨课程资料。
+  if (!isOpaqueResourceId(id)) throw new CourseSetupInputError("Course id is invalid.");
+  if (!Number.isSafeInteger(revision) || revision < 1) throw new CourseSetupInputError("Course revision must be a positive whole number.");
+
+  const db = courseSetupDatabase();
+  const remove = db.transaction(() => {
+    const course = db.prepare("SELECT id, code, revision FROM courses WHERE id = ?").get(id) as { id: string; code: string; revision: number } | undefined;
+    if (!course) return null;
+    if (course.revision !== revision) throw new CourseChangedError();
+
+    // 所有保护检查都在取得 IMMEDIATE 写锁之后执行。另一 standalone 不能在检查通过后、
+    // DELETE 前再排入一节课或加入人工分配，造成未确认的数据损失。
+    const scheduled = db.prepare(`SELECT sections.sequence
+      FROM scheduled_lessons lessons
+      JOIN course_sections sections ON sections.id = lessons.section_id
+      WHERE sections.course_id = ? ORDER BY sections.sequence LIMIT 1`).get(id) as { sequence: number } | undefined;
+    if (scheduled) {
+      const label = `${course.code}_${String(scheduled.sequence).padStart(2, "0")}`;
+      throw new CourseInUseError(`${label} is scheduled. Return every lesson for this course to the tray before deleting the course.`);
+    }
+
+    const grouped = db.prepare(`SELECT sections.sequence
+      FROM section_student_groups groups
+      JOIN course_sections sections ON sections.id = groups.section_id
+      WHERE sections.course_id = ? ORDER BY sections.sequence LIMIT 1`).get(id) as { sequence: number } | undefined;
+    if (grouped) {
+      const label = `${course.code}_${String(grouped.sequence).padStart(2, "0")}`;
+      throw new CourseInUseError(`${label} has student groups. Clear every student-group assignment before deleting the course.`);
+    }
+
+    const manualTeacher = db.prepare(`SELECT sequence FROM course_sections
+      WHERE course_id = ? AND teacher_id IS NOT NULL
+        AND (allocation_teacher_id IS NULL OR teacher_id <> allocation_teacher_id)
+      ORDER BY sequence LIMIT 1`).get(id) as { sequence: number } | undefined;
+    if (manualTeacher) {
+      const label = `${course.code}_${String(manualTeacher.sequence).padStart(2, "0")}`;
+      throw new CourseInUseError(`${label} has a manually maintained teacher. Clear every manual teacher assignment before deleting the course.`);
+    }
+
+    // schedule_backups 是不可变的旧周期快照，完整拥有其中的课程子树；删除 live course
+    // 不修改也不使快照失效。未来明确 Restore 整个旧周期时，该课程可能按设计重新出现。
+    const deleted = db.prepare("DELETE FROM courses WHERE id = ? AND revision = ?").run(id, revision);
+    if (deleted.changes !== 1) throw new CourseChangedError();
+    return true;
+  });
+
+  try {
+    return remove.immediate();
+  } catch (error) {
+    if (error instanceof CourseSetupInputError || error instanceof CourseChangedError
+      || error instanceof CourseInUseError || error instanceof CourseSetupBusyError) throw error;
     if (isSqliteBusyError(error)) throw new CourseSetupBusyError();
     throw error;
   }
@@ -3088,7 +3354,7 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
     SELECT sections.id, courses.code, sections.sequence, courses.duration_hours,
       courses.sessions_per_week, courses.week_start, courses.week_end, occurrences.occurrence,
       teachers.name AS teacher_name, teachers.is_active AS teacher_is_active,
-      teachers.staff_type, student_groups.code AS group_code
+      teachers.staff_type, student_groups.id AS group_id, student_groups.code AS group_code
     FROM course_sections sections
     JOIN courses ON courses.id = sections.course_id
     JOIN (SELECT 1 AS occurrence UNION ALL SELECT 2) occurrences
@@ -3104,19 +3370,27 @@ export function listUnscheduledSections(year: number): UnscheduledSectionRecord[
       ELSE 2
     END,
       courses.code, sections.sequence, occurrences.occurrence, student_groups.code
-  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null; occurrence: number; teacher_name: string | null; teacher_is_active: number | null; staff_type: "FT" | "PT" | null; group_code: string | null }>;
+  `).all(year) as Array<{ id: string; code: string; sequence: number; duration_hours: number; sessions_per_week: number; week_start: number | null; week_end: number | null; occurrence: number; teacher_name: string | null; teacher_is_active: number | null; staff_type: "FT" | "PT" | null; group_id: string | null; group_code: string | null }>;
   const sections = new Map<string, UnscheduledSectionRecord>();
   for (const row of rows) {
     // 每周上两次的同一班次会生成两张独立待排卡片，分别代表第一和第二次课。
     const occurrenceKey = `${row.id}:${row.occurrence}`;
-    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, sectionId: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, teacherIsActive: row.teacher_is_active === null ? null : row.teacher_is_active === 1, staffType: row.staff_type, durationHours: row.duration_hours, studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
-    if (row.group_code) section.studentGroups.push(row.group_code);
+    const section = sections.get(occurrenceKey) ?? { id: occurrenceKey, sectionId: row.id, label: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, teacherName: row.teacher_name, teacherIsActive: row.teacher_is_active === null ? null : row.teacher_is_active === 1, staffType: row.staff_type, durationHours: row.duration_hours, studentGroupIds: [], studentGroups: [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week };
+    if (row.group_id && row.group_code) {
+      section.studentGroupIds.push(row.group_id);
+      section.studentGroups.push(row.group_code);
+    }
     sections.set(occurrenceKey, section);
   }
   return [...sections.values()];
 }
 
 type DailyInterval = { startHour: number; durationHours: number; block: string | null };
+
+type TeachingWeekDailyInterval = DailyInterval & {
+  weekStart: number | null;
+  weekEnd: number | null;
+};
 
 function longestContinuousHours(intervals: DailyInterval[]) {
   // 首尾相接的课程视为同一个连续教学时段；发生重叠的区间先合并，
@@ -3148,6 +3422,55 @@ function hasBackToBackBlockChange(intervals: DailyInterval[], proposed: DailyInt
   if (!proposed.block) return false;
   const proposedEnd = proposed.startHour + proposed.durationHours;
   return intervals.some((interval) => interval.block && interval.block !== proposed.block && (interval.startHour + interval.durationHours === proposed.startHour || interval.startHour === proposedEnd));
+}
+
+function dailyRuleProfileAcrossTeachingWeeks(
+  proposedWeekStart: number | null,
+  proposedWeekEnd: number | null,
+  existingIntervals: TeachingWeekDailyInterval[],
+  proposed: DailyInterval,
+) {
+  // 空白开始周和结束周代表整学期 W1–52；有限范围则包含首尾两周。
+  // 例如 W1–4 与 W4–8 会在 W4 同时上课，但 W1–4 与 W5–8 永不同时出现。
+  const firstWeek = proposedWeekStart ?? 1;
+  const lastWeek = proposedWeekEnd ?? 52;
+  let hasNoLunchHour = false;
+  let hasMoreThanFourContinuousHours = false;
+  let maximumDailyHours = 0;
+  let hasBackToBackBlockChangeAcrossWeeks = false;
+
+  for (let week = firstWeek; week <= lastWeek; week += 1) {
+    // SQL 先排除与 proposed 周次完全不相交的课程；这里再取出这个实际周
+    // 真正会上课的记录，避免把 W1–4 与 W5–8 的课时错误相加成同一天。
+    const existingThisWeek = existingIntervals.filter((interval) => {
+      const intervalFirstWeek = interval.weekStart ?? 1;
+      const intervalLastWeek = interval.weekEnd ?? 52;
+      return intervalFirstWeek <= week && week <= intervalLastWeek;
+    });
+    const combinedThisWeek = [...existingThisWeek, proposed];
+
+    hasNoLunchHour ||= !hasLunchHour(combinedThisWeek);
+    hasMoreThanFourContinuousHours ||= longestContinuousHours(combinedThisWeek) > 4;
+    maximumDailyHours = Math.max(
+      maximumDailyHours,
+      combinedThisWeek.reduce((total, lesson) => total + lesson.durationHours, 0),
+    );
+    hasBackToBackBlockChangeAcrossWeeks ||= hasBackToBackBlockChange(existingThisWeek, proposed);
+
+    // 所有规则都已经在至少一周违反后，继续扫描不会改变最终稳定文案。
+    // 提前结束让全学期课程的常见违规路径不必固定检查完 52 次。
+    if (hasNoLunchHour
+      && hasMoreThanFourContinuousHours
+      && maximumDailyHours > 7
+      && hasBackToBackBlockChangeAcrossWeeks) break;
+  }
+
+  return {
+    hasNoLunchHour,
+    hasMoreThanFourContinuousHours,
+    maximumDailyHours,
+    hasBackToBackBlockChange: hasBackToBackBlockChangeAcrossWeeks,
+  };
 }
 
 type PlacementWarningInput = {
@@ -3206,7 +3529,8 @@ function preparePlacementWarningStatements(db: DatabaseInstance) {
     roomSuitability: prepare(`SELECT rooms.code, rooms.capacity, rooms.has_multi_projector, rooms.is_lab, rooms.is_smart_classroom, rooms.is_active, courses.minimum_room_capacity, courses.requires_multi_projector, courses.requires_lab, courses.requires_smart_classroom FROM rooms JOIN course_sections sections ON sections.id = ? JOIN courses ON courses.id = sections.course_id WHERE rooms.id = ?`),
     roomBlock: prepare("SELECT block FROM rooms WHERE id = ?"),
     teacherDay: prepare(`
-      SELECT lessons.start_hour, lessons.duration_hours, rooms.block
+      SELECT lessons.start_hour, lessons.duration_hours, rooms.block,
+        occupied_courses.week_start, occupied_courses.week_end
       FROM scheduled_lessons lessons
       JOIN course_sections sections ON sections.id = lessons.section_id
       JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
@@ -3217,7 +3541,8 @@ function preparePlacementWarningStatements(db: DatabaseInstance) {
     `),
     proposedGroups: prepare("SELECT student_groups.id, student_groups.code FROM section_student_groups JOIN student_groups ON student_groups.id = section_student_groups.student_group_id WHERE section_id = ?"),
     groupDay: prepare(`
-      SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block
+      SELECT DISTINCT lessons.id, lessons.start_hour, lessons.duration_hours, rooms.block,
+        occupied_courses.week_start, occupied_courses.week_end
       FROM scheduled_lessons lessons
       JOIN course_sections sections ON sections.id = lessons.section_id
       JOIN courses occupied_courses ON occupied_courses.id = sections.course_id
@@ -3303,26 +3628,38 @@ function calculatePlacementWarnings(input: PlacementWarningInput, statements: Pl
   const proposedRoom = input.roomId ? statements.roomBlock.get(input.roomId) as { block: string | null } | undefined : undefined;
   const proposed = { startHour: input.startHour, durationHours: input.durationHours, block: proposedRoom?.block ?? null };
   if (input.teacherId) {
-    const teacherDay = statements.teacherDay.all(lessonId, input.teacherId, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ start_hour: number; duration_hours: number; block: string | null }>;
-    const existing = teacherDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
-    const combined = [...existing, proposed];
-    if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
-    if (enabledRules.has("max_continuous") && longestContinuousHours(combined) > 4) warnings.push("Teacher has more than 4 continuous hours");
-    if (enabledRules.has("teacher_daily_limit") && combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 7) warnings.push("Teacher exceeds 7 teaching hours in one day");
-    if (enabledRules.has("same_block") && hasBackToBackBlockChange(existing, proposed)) warnings.push("Teacher has back-to-back lessons in different blocks");
+    const teacherDay = statements.teacherDay.all(lessonId, input.teacherId, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ start_hour: number; duration_hours: number; block: string | null; week_start: number | null; week_end: number | null }>;
+    const existing = teacherDay.map((lesson) => ({
+      startHour: lesson.start_hour,
+      durationHours: lesson.duration_hours,
+      block: lesson.block,
+      weekStart: lesson.week_start,
+      weekEnd: lesson.week_end,
+    }));
+    const profile = dailyRuleProfileAcrossTeachingWeeks(courseRule.week_start, courseRule.week_end, existing, proposed);
+    if (enabledRules.has("lunch_break") && profile.hasNoLunchHour) warnings.push("Teacher has no free lunch hour between 12:00 and 14:00");
+    if (enabledRules.has("max_continuous") && profile.hasMoreThanFourContinuousHours) warnings.push("Teacher has more than 4 continuous hours");
+    if (enabledRules.has("teacher_daily_limit") && profile.maximumDailyHours > 7) warnings.push("Teacher exceeds 7 teaching hours in one day");
+    if (enabledRules.has("same_block") && profile.hasBackToBackBlockChange) warnings.push("Teacher has back-to-back lessons in different blocks");
   }
 
   // 每个关联学生班级都要分别评估，因为一节跨年级课程的单次排课
   // 可能同时影响多个年级总表的每日时长和连续上课限制。
   const proposedGroups = statements.proposedGroups.all(input.sectionId) as Array<{ id: string; code: string }>;
   for (const group of proposedGroups) {
-    const groupDay = statements.groupDay.all(lessonId, group.id, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null }>;
-    const existing = groupDay.map((lesson) => ({ startHour: lesson.start_hour, durationHours: lesson.duration_hours, block: lesson.block }));
-    const combined = [...existing, proposed];
-    if (enabledRules.has("lunch_break") && !hasLunchHour(combined)) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
-    if (enabledRules.has("max_continuous") && longestContinuousHours(combined) > 4) warnings.push(`${group.code} has more than 4 continuous hours`);
-    if (enabledRules.has("student_daily_limit") && combined.reduce((total, lesson) => total + lesson.durationHours, 0) > 6) warnings.push(`${group.code} exceeds 6 class hours in one day`);
-    if (enabledRules.has("same_block") && hasBackToBackBlockChange(existing, proposed)) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
+    const groupDay = statements.groupDay.all(lessonId, group.id, input.dayOfWeek, courseRule.week_start, courseRule.week_end, courseRule.week_start) as Array<{ id: string; start_hour: number; duration_hours: number; block: string | null; week_start: number | null; week_end: number | null }>;
+    const existing = groupDay.map((lesson) => ({
+      startHour: lesson.start_hour,
+      durationHours: lesson.duration_hours,
+      block: lesson.block,
+      weekStart: lesson.week_start,
+      weekEnd: lesson.week_end,
+    }));
+    const profile = dailyRuleProfileAcrossTeachingWeeks(courseRule.week_start, courseRule.week_end, existing, proposed);
+    if (enabledRules.has("lunch_break") && profile.hasNoLunchHour) warnings.push(`${group.code} has no free lunch hour between 12:00 and 14:00`);
+    if (enabledRules.has("max_continuous") && profile.hasMoreThanFourContinuousHours) warnings.push(`${group.code} has more than 4 continuous hours`);
+    if (enabledRules.has("student_daily_limit") && profile.maximumDailyHours > 6) warnings.push(`${group.code} exceeds 6 class hours in one day`);
+    if (enabledRules.has("same_block") && profile.hasBackToBackBlockChange) warnings.push(`${group.code} has back-to-back lessons in different blocks`);
   }
   return warnings;
 }

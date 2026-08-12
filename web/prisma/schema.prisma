@@ -5,8 +5,8 @@ generator client {
 }
 
 datasource db {
-  // 当前本地应用使用 SQLite。下面的字段和表映射准确对应真实 snake_case 结构，
-  // 让本文件未来能够作为可信的数据库迁移来源。
+  // 当前应用使用 SQLite。运行时建表和兼容升级仍由 database.ts 负责；本文件用于
+  // Prisma 类型与发布时 schema diff，必须由 db:check 和初始化回归持续防止两者漂移。
   provider = "sqlite"
 }
 
@@ -18,6 +18,8 @@ model AppUser {
   isAdmin      Boolean  @default(false) @map("is_admin")
   isActive     Boolean  @default(true) @map("is_active")
   createdAt    DateTime @default(now()) @map("created_at")
+  // 管理员启停账号时以这个公开版本作比较，防止两个浏览器静默覆盖彼此的状态。
+  revision     Int      @default(1)
 
   sessions AuthSession[]
 
@@ -61,7 +63,7 @@ model Teacher {
 model StudentGroup {
   // 一个学生班级代表共同上课的同一组学生，其时间表发生重叠时必须提示冲突。
   id        String   @id @default(uuid())
-  code      String   @unique
+  code      String
   year      Int
   program   String
   createdAt DateTime @default(now()) @map("created_at")
@@ -71,6 +73,8 @@ model StudentGroup {
 
   sections SectionStudentGroup[]
 
+  // 同一个班级编号会在不同年级重复使用；只有“年级 + 编号”组合必须唯一。
+  @@unique([year, code], map: "student_groups_year_code_key")
   @@map("student_groups")
 }
 

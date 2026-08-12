@@ -2348,3 +2348,154 @@
 1. 完整系统恢复仍需关闭安全副本与替换之间的跨进程写入窗口，并在提交前校验业务不变量。
 2. Teaching Members 显式零分配、三类主资料 revision CAS 与 section resize Course revision 仍需后续批次完成。
 3. 五名真实排课老师 UX 结果和 Railway 线上持久卷／HTTPS／重启／恢复证据仍不能由本地自动测试代替。
+
+## 2026-08-11｜原子化完整恢复、持久卷保护与失败后 UI 边界
+
+### 已完成
+
+- 完整系统恢复新增管理员只读状态接口。Accounts 页面先取得排除登录会话的规范 SHA-256 资料指纹，再读取账号清单；上传时提交该指纹，数据库在 `BEGIN IMMEDIATE` 锁内、建立安全副本和删除任何资料之前复核。另一账号在管理员审阅后继续写入时，恢复稳定返回 `SYSTEM_STATE_CHANGED` 409、清空确认且零替换，绝不偷偷换成用户未看过的新指纹。
+- 恢复锁内同步序列化在线库，在独立内存 SQLite 清除会话、执行 `VACUUM` 并复检业务规则、管理员、外键及完整性；安全副本使用同目录临时文件、文件 `fsync`、原子 `rename` 和目录 `fsync`。目标复制、目标与上传源规范指纹对比、会话必须为零及最终检查全部位于 COMMIT 前，任何 trigger 或复制异常都会让在线资料整体回滚。
+- 业务不变量现会拒绝非法布尔、revision、教学周、课程／课次域值、警告 JSON、缺失必需规则及损坏的应急周期快照。应急快照只深检自己的课程、班次、关联和课次；历史教师／班级／教室后来缺失时，完整系统备份仍可保存当前状态，而 Cycle Restore 会以原子 409 说明该旧快照已不可恢复。
+- Railway 启动检查现在无条件要求真实 Volume；自定义数据库路径必须在卷内。检查会在建立目录前解析最近的既有 ancestor，拒绝卷外目录 symlink、dangling 数据库 symlink、非普通文件和不存在的挂载根，防止把正式 SQLite 意外建立在临时容器或卷外路径。
+- 数据库初始化门槛新增 fresh schema、development seed、热重载迁移和 Railway 路径场景；局部连接失败会关闭且不发布，全局连接迁移失败则保持原连接和旧版本供下次重试。
+- 页面所有资料写入共用同步 ref／state 锁，并在开始写入时作废已发出的五秒轮询；Rules、Cycle、Accounts、Personal 和年级工作区读取也共享请求代际号，迟到响应不能在保存、导航、退出或身份切换后倒灌旧资料。
+- setup／login 收到 2xx 但正文损坏时会通过 `/api/auth/status` 核实会话；请求结果未知且无法核实时进入不可编辑刷新页，不再鼓励重复建立管理员或会话。新周期、规则及完整恢复在“已提交但刷新失败”或结果未知时同样冻结旧工作区，避免继续写入不可信画面。
+- 退出、改密、会话过期和完整恢复会清除账号清单、恢复指纹及全部内存业务资料并回到安全默认页；Accounts 内容还要求当前用户确为管理员，普通账号不能看到上一位管理员缓存的用户名或恢复表单。
+
+### 本次验证
+
+- `node scripts/verify-database-initialization.mjs` 通过：三组连接／事务故障和全部 Railway 卷路径、symlink 边界均按预期通过或拒绝。
+- `npx tsc --noEmit --incremental false`、`npm run lint`、`npm run build`、`node scripts/verify-api-crud.mjs`、`node scripts/verify-cross-process-concurrency.mjs`、两份脚本 `node --check` 与 `git diff --check` 全部通过。
+- CRUD 覆盖旧 token 零变化、逻辑损坏上传400、恢复 trigger 全回滚、安全副本权限／完整性／会话清除及成功恢复；双 standalone 覆盖锁后写入线性顺序、并发恢复、BUSY 和辅助进程清理。
+- 所有数据库与恢复安全文件只位于系统临时目录；测试结束无 `timetabling-*` 临时目录残留。正式 `web/data/timetabling.db` 仍为 epoch `1786394751`、`544768` bytes，本批未连接或改写正式资料。
+
+### 下一步
+
+1. Teaching Members 显式零分配、数量上限／ZIP资源上限、三类主资料 revision CAS 与 section resize Course revision 继续作为下一批关联可靠性工作。
+2. 资料管理、课程详情和 Rules 的关联读取仍需收敛为各自一致的服务端工作区；密码自改与管理员重置竞态、其余旧 GET／写路由的统一 BUSY JSON 边界也需继续审计。
+3. 五名真实排课老师 UX 结果和 Railway 线上持久卷／HTTPS／重启／恢复证据仍不能由本地自动测试代替。
+
+## 2026-08-11｜重建当前 UX 门槛并纠正发布说明
+
+### 已完成
+
+- 把 `verify-ux-workbench.mjs` 从旧版“三栏、五天同屏”断言改为当前 PRD：顶部 Workspace、待排区默认开启／关闭零占位、右侧浮动 Inspector、至少三个完整工作日、课程卡固定字号和 Student Groups、Inspector 多班级编辑、聚合 workspace 读取及 revision 草稿保护。
+- 1024px 桌面宽度门槛按真实最大列宽计算：时间轴48px、三个最繁忙日期各288px及列间距合计924px，小于扣除页面边距后的1000px；其余日期只在总表内部滚动，页面本身不能产生横向溢出。
+- 静态门槛的中文注释明确说明它只能保护源码契约，不能代替真实浏览器拖放和五位老师的理解测试；旧 marker 失效时必须同步代码／PRD，不能靠放宽断言制造假绿。
+- 五人 UX 结果验证严格要求 `1024×768`、P1–P5、真实角色、明确布尔结果和正数实测时间；成功样本还必须看见保存反馈、无主持人介入且不超过180秒。五人的90%门槛等同五人全部成功，中位时长仍要求不超过60秒。
+- 结果 JSON 只更新为当前1024×768空模板，没有填写或猜测任何参与者结果；`verify:ux-results` 会继续诚实失败，直到五位真实排课老师完成任务。
+- `test:release` 现在依次执行 lint、Prisma／SQLite结构检查、自动 UX 契约、一次 production build、CRUD、跨进程并发和374班次性能；`test:release:human` 再明确串联五人结果，自动回归不会伪装成人工验收。
+- `web/README.md` 已从 Next.js 默认模板改成中文项目说明，明确技术栈、隔离数据库、本地／production命令、数据安全、自动／人工／Railway三层门槛，以及 SQLite 不能直接部署到 Vercel 临时文件系统的原因。
+- `MVP_ACCEPTANCE.md` 按当前 PRD 补齐十项矩阵和30个 Route Handler，明确本地自动证据、五人测试与线上部署是不同层级；空人类结果和未部署 Railway 时只能称发布候选，不能写成正式发布通过。
+- `ARCHITECTURE.md` 补充聚合年级 workspace、草稿并发边界、发布命令和 API 分组；新增可提交的 `.env.example` 模板，并继续默认忽略所有可能含秘密的其他 `.env*` 文件。
+
+### 本次验证
+
+- `npm run lint`、`npm run db:check`、`npm run verify:ux`、两个 UX 脚本的 `node --check` 与 `git diff --check` 全部通过。
+- 自动 UX 门槛输出三天宽度预算 `924 / 1000px`，并确认课程卡渲染区没有重新显示 `2h／3h`。
+- `npm run verify:ux-results` 按设计失败，因为 P1–P5 仍为空；该失败是尚未完成外部验收的真实状态，不是程序错误。
+- 本任务只读取源码与文档，不打开正式 SQLite；正式数据未修改。
+
+### 下一步
+
+1. 在最终 production build 上完成1024×768与窄屏浏览器验收，再邀请五位未参与开发的真实排课老师执行固定任务。
+2. Railway 单实例、持久卷、HTTPS、重启持久化和受控恢复演练完成后，才能运行并签收线上门槛。
+3. 首次管理员高熵 setup token 已在后端安全提交中加入 `.env.example` 和部署说明；模板不保存真实 token。
+
+## 2026-08-11｜受控正式库迁移、最终浏览器验收与发布候选收口
+
+### 受控迁移与资料核对
+
+- 经资料负责人明确授权后，先停止仍持有正式 SQLite 的本地开发服务 PID `30300`；迁移、验证和最终回归结束后没有重新启动该服务，正式库也没有残留 WAL／SHM 或持有文件句柄的进程。
+- 迁移前先在同目录建立只读安全副本 `timetabling-pre-2026081104-20260811-204817.sqlite`，权限为 `0600`。本次受控迁移只为 `app_users` 增加 `revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)`；现有账号从 revision 1 开始，供账号启停使用明确的并发比较。
+- 迁移前、迁移后和安全副本以“排除新增 revision 列”的规范业务投影计算，三者摘要均为 `8436e6f6ff4b72a025a6c730e132708cb3885f1eccf8a85518f91626c56494a8`，证明本次迁移没有改变既有业务字段。迁移后正式文件 SHA-256 为 `3c504c3a3d2e01b89dccb8ac78d9bbe9722f371142d5d88cbeb029d51ec9f81c`、大小 `548864` bytes、修改时间 `2026-08-11 20:56:53 +0800`。
+- 迁移后 `integrity_check=ok`、`foreign_key_check` 为空；主要资料计数为教师87、学生班级7、教室3、课程52、Teaching allocations184、班次374、班次—学生班级关联0、已排课次19、规则7、应急周期备份1。上述事实覆盖本日志较早的 `04:45:51／544768 bytes／20课次` 历史快照；不能再用旧值描述当前正式库。
+- 最终浏览器和自动测试都使用唯一临时数据库。全部测试结束后再次只读核对，正式库的 SHA-256、大小和修改时间仍与受控迁移完成时一致。
+
+### 最终 UI 与关联验收
+
+- 在最终 production standalone、独立临时 SQLite 和 `1024×768` 真实应用内浏览器完成：首次管理员 setup／登录、教师／学生班级／教室／课程 CRUD、课程配置、班次教师与学生班级关联、待排放置、已排编辑、教师／班级／教室个人课表、教室停用历史保留、Rules 不可用时段与问题重算、账号建立／停启和双标签 stale revision 冲突、退出后普通账号角色隔离。
+- 浏览器验收发现资料管理 Add／Edit 表单打开和保存后的焦点会落到远处 Close 或 `body`。页面现使用稳定资料 ID、首字段 ref 和延迟到 mutation 解锁后的焦点请求：打开表单聚焦首个输入；新增成功回到对应 Add；编辑、停启和冲突刷新回到同一条资料的最新操作按钮；目标消失时才回到该资料搜索框。课程 Configure、班次关联和账号冲突也按稳定 ID 恢复到可继续操作的位置。
+- 实测停用教室仍可在个人课表中以 `Inactive` 选择并看到历史课程；Rules 同时显示教室不可用问题。教师不可用时段新增后出现对应问题，删除后只移除该问题而不影响教室问题，证明关联写入和规则重算没有串线。
+- 两个管理员标签以同一账号 revision 竞争停用 scheduler：胜方提交成功，败方得到 `ACCOUNT_CHANGED` 并自动读取最新版；焦点落在同一 scheduler 的可用 Activate 按钮。随后普通 scheduler 登录看不到 Accounts 导航、管理员账号缓存或恢复表单，旧管理员标签也被会话检查清回登录页。
+- 页面整体 `clientWidth` 与 `scrollWidth` 均为1024，没有页面级横向溢出；资料、课程和排课的成功提示、冲突提示及键盘焦点均在最终构建复核。
+
+### 最终自动门槛与代码审计
+
+- 最终精确源码树的 `npm run test:release` 全部通过：database initialization、ESLint、Prisma／SQLite schema、自动 UX 契约、production build、完整 CRUD、双 standalone 跨进程并发及性能回归。构建确认当前共有34个 Route Handler。
+- 性能结果：Issues p95 中位 `19.8 ms`、Year workspace `13.4 ms`、30间教室 Candidate `159.3 ms`、六账号资料 workspace 整轮 `27.7 ms`／请求p95 `30.3 ms`、Rules workspace 整轮 `21.5 ms`／请求p95 `24.0 ms`、360条 warning重算 `73.5 ms`、一个写入加五个一致快照读取 `102.9 ms`。Prepared Statement 审计保持 Candidate `16／12600`、全量 warning刷新 `16／5288`。
+- 代码注释扫描覆盖66个 production／验证／schema 文件，共2384行以注释开头；逐文件检查确认没有无注释文件，也没有 `TODO／FIXME／HACK／@ts-ignore／@ts-nocheck` 或空 `catch {}`。注释门槛表示基础开发者能找到职责、边界和竞态原因，不表示用无意义注释覆盖每一行。
+- `git diff --check`、TypeScript、ESLint、production build 和最终发布回归均通过；没有暂存或提交任何文件，也没有覆盖工作区内原有的 UX／文档修改。
+
+### 尚未完成的外部发布证据
+
+1. `docs/UX_TASK_TEST_RESULTS.json` 的 P1–P5 仍为空，`npm run verify:ux-results` 会按设计失败；必须由五位未参与开发的真实排课老师在 `1024×768` 完成固定任务，不能以本次开发者浏览器验收代替。
+2. Railway 真实域名、单实例、持久卷、HTTPS、重启后持久性、双浏览器五秒同步，以及平台备份／恢复演练仍没有线上证据。完成这些项目之前，只能称本地发布候选，不能签署正式上线通过。
+3. 正式开发服务保持关闭；下一次启动必须显式确认数据库路径和环境，再使用受控流程启动，避免开发热重载再次无意迁移正式资料。
+
+## 2026-08-11｜学生班级编号改为年级内唯一
+
+### 问题与修正
+
+- 真实 UI 验收发现 Year 1 已有 `AAA_01` 后，Year 2／3 无法建立自己的 `AAA_01`。根因是旧 schema 把 `student_groups.code` 设为全校单列 UNIQUE；实际业务身份应为稳定 UUID，而编号只需要在同一年级内唯一。
+- Prisma 与 runtime SQLite 现统一为 `(year, code)` 组合唯一。同一年级再次建立 `AAA_01` 仍返回明确409，不同年级则各自建立独立记录、revision 和 UUID。
+- SQLite 无法直接删除表定义生成的 autoindex，因此 runtime `2026081105` 在短 `IMMEDIATE` 事务内原样重建 `student_groups`。迁移保留 ID、code、year、program、时间戳和 revision；`section_student_groups` 的既有外键值不改。事务提交前执行 `foreign_key_check`，任何关系异常都会整体回滚。
+- 待排区原先按显示 code 反查 programme；跨年同名后会混入错误年级。接口现同时返回 `studentGroupIds`，页面以稳定 ID 进行班级、programme 和下拉筛选，code 只用于显示和搜索。
+- 完整备份业务校验同步为“同一年级的 code 不得重复”；上传库即使删除 unique index并造出重复 `(year, code)`，也会在替换在线资料前稳定400。
+
+### 自动与受控迁移证据
+
+- database-init 覆盖旧单列 UNIQUE 表形：原教师／课程／班次／学生班级关联逐字段保留；升级后 Year 1／3 可建立与旧 Year 2 同 code 的记录，Year 2 第二条同名记录仍拒绝，二次初始化完全幂等。
+- 完整 production CRUD 覆盖 Year 1／2／3 三条 `AAA_2` 同时存在且 ID 各不相同；待排卡只返回真正关联的 Year 2 ID，不把同 code 的 Year 1／3 混入。恶意备份重复同一年级 code 以400拒绝且在线库、会话零变化。
+- TypeScript、ESLint、Prisma schema、UX、production build、CRUD、双 standalone 并发和374班次性能全部通过。性能脚本同时锁定13项 runtime 索引；新增迁移没有增加 warning／candidate SQL 数量。
+- 迁移前停止本地服务并建立 `data/timetabling-pre-2026081105-20260811-231936.sqlite`（`0600`）。在线库与副本原始 SHA-256 都为 `99ada6a010a2e1c8c4f6296e79d0ad43b1a30c90d9bb0c693b446872762078f7`；全表资料 dump 摘要都为 `8735cac1c51fb4d8773a063cadd131ea8f4e9923fc09f7d172d71021e2aa496d`。
+- 迁移后 raw SHA-256 因表／索引结构变化成为 `b15c332bcf0566ca6959954fbe9279bf899b0723a6dfa16b64ea7bbf4e9d8e8c`，但全表资料摘要仍精确为 `8735cac1…496d`；班级总数仍为7、同一年级重复数0、`integrity_check=ok`、外键错误0。随后以明确正式库路径重新启动 production standalone，`/api/health` 返回 `status=ok`。
+
+## 2026-08-11｜允许安全删除误建学生班级
+
+### 问题与修正
+
+- 资料页面原本只有 Edit；老师误建学生班级后无法自行移除。Student groups 表现已加入逐行 Delete，确认框会同时显示编号和年级，避免跨年同名时删除错误记录。
+- 删除请求携带画面当前 revision，并在 `IMMEDIATE` 事务内先比较最新版。另一位老师已修改时返回稳定 `MASTER_DATA_CHANGED` 409并刷新，旧页面不能删除没有重新审阅的新版资料。
+- 只有完全未使用的记录可以删除。`section_student_groups` 仍有任何课程班次关联时返回 `STUDENT_GROUP_IN_USE`；应急周期备份的 `sectionGroups` 仍保留该稳定 ID 时也返回同一保护码。两种情况都不会级联删除课程、班次、排课或备份资料。
+- 删除成功后页面关闭旧编辑表单、重载一致的资料工作区并把焦点还给 Add student group；数据库已提交但刷新失败，或响应结果未知时，会冻结旧工作区并要求刷新，避免重复不可逆操作。
+
+### 自动与真实页面证据
+
+- production CRUD 覆盖无效 revision 400、旧 revision 409、`BEFORE DELETE` trigger 强制未知故障500并逐表零变化、未使用班级200删除、二次删除404、班次关联409，以及 Start 后仅由应急周期备份保留的班级409；所有受保护场景比较完整业务快照不变。
+- production build、TypeScript、ESLint、`git diff --check` 和完整 CRUD 均通过。
+- 在独立临时 SQLite 的 production standalone 中真实建立 `MISTAKE_01 · Year 2`，确认后成功删除，页面显示成功提示且 Add student group 获焦；再建立 `IN_USE_01` 并关联 `DELETE_COURSE_01`，确认删除后明确提示先清除课程班次关联，班级仍保留，浏览器控制台零错误。
+- 上述自动和浏览器测试只使用临时数据库，没有连接或修改正式 SQLite。
+
+## 2026-08-12｜Course 安全删除与 section 数量生命周期
+
+### 业务语义与实现
+
+- Courses 表每行新增明确的 `Manage sections` 与 `Delete` 操作；section 面板把数量字段命名为 `Number of sections`，打开后直接聚焦。减少数量只删除最高编号尾部，确认框列出实际 label 范围，并说明 Teaching Members allocation 是保留的审计基线，之后重新导入可能重建自动班次。
+- section 尾部只要仍有排课、学生班级或人工教师就返回稳定 `COURSE_SECTION_IN_USE` 409。人工教师的精确定义为 `teacher_id IS NOT NULL AND (allocation_teacher_id IS NULL OR teacher_id <> allocation_teacher_id)`；空教师和仍等于 allocation 来源教师的自动分配可以安全随尾部移除。手工 resize 不改 `teaching_allocations`，所以来源数量与当前 sections 不一致时会显示 mismatch。
+- `DELETE /api/courses/:id` 必须携带老师看到的 Course revision，在 `BEGIN IMMEDIATE` 内重新比较。旧版返回 `COURSE_CHANGED` 409；已排课、学生班级或人工教师返回 `COURSE_IN_USE` 409；成功后由外键级联清除 Course 拥有的 sections 与 Teaching allocation baseline，但保留教师、学生班级、教室等主资料。
+- 应急周期备份是旧周期的独立完整快照，不阻止删除、也不随当前 Course 删除而改写；用户日后明确 Restore 时可以重新带回旧课程。本批严格没有改变既有 `sessionsPerWeek` 1／2 规则。
+- 删除和数量调整共用全局写锁、session generation、revision CAS 与 unknown-outcome 冻结边界。409 刷新成功后只使用最新版对象和数量显示提示；Course 已消失或删除成功时焦点回 Courses 搜索，stale 或 `COURSE_IN_USE` 时回同一稳定 Delete，避免原生确认框后落到 `body`。
+
+### 自动与真实页面证据
+
+- 最终隔离源码树的 `node --check`、ESLint、`tsc --noEmit --incremental false` 与 production `npm run build` 全部通过；构建继续生成34个 Route Handler。
+- 完整 production CRUD 在全新临时 SQLite 通过：DELETE `null`／损坏 JSON／错误 revision 400、64KiB 上限413、stale409、学生班级／人工教师／已排课三类保护、trigger500全回滚、真实写锁 BUSY503与 `Retry-After: 1`、空／自动教师成功删除、重复删除404，以及自动尾部 shrink 后 allocation baseline 原样和 mismatch。Cycle Start 后删除 live Course 的前后比较同时证明 backup 行与 `snapshot_json` 字节不变。
+- 完整双 standalone 回归通过。section resize 和 Course DELETE 都由第三连接先持有写锁，等待 A／B 两个服务各自真实到达 writer entry 后才同时放行；resize 严格一个200／一个409，delete 严格一个200／一个404，没有双赢或孤立 section。
+- 374班次隔离性能回归通过：Issues p95中位17.6ms、Year workspace 15.3ms、Candidate 143.6ms、六账号资料轮询整轮25.3ms／请求p95 26.0ms、Rules整轮19.8ms／请求p95 22.4ms、360条 warning刷新63.7ms、混合写读91.3ms，prepared-statement 数量保持不变。
+- 最终 production standalone 使用 `/private/tmp` 唯一数据库和 `31873` 端口完成真实应用内浏览器验收：2→3、3→2的确认取消／接受、Delete取消／成功、学生班级与人工教师保护、清除后删除、双标签 stale revision刷新、最新版提示和键盘焦点均符合契约；控制台 warning／error 为空。
+- 所有新增数据库、构建产物、账号和浏览器资料都位于 `/private/tmp`，没有连接或修改正式 `web/data` SQLite，也没有停止、重启或占用 `localhost:3000`；本批没有暂存或提交文件。
+
+## 2026-08-12｜繁忙总表课程卡保持可读宽度
+
+### 问题与修正
+
+- Year 1 实际排入90个课次后，同一时段最多约15张课程卡并排。旧布局把一天封顶在288px，再按通道百分比分割，真实浏览器中最窄卡片只有17.2px；课程编号、教师、班级和教室文字都会被裁到无法辨认。
+- 总表现按每条并行课程至少112px动态扩展当天宽度，扣除卡片间隙后实际最窄约110px。普通日期仍保持至少152px并可同屏查看多个工作日；极繁忙日期不再压缩卡片，而是使用总表自己的横向滚动与左右按钮浏览。
+- PRD、架构说明、UX任务协议和静态UX门槛已同步：三天同屏是普通密度合同，繁忙密度优先保证卡片固定字号和最小可读宽度。
+
+### 验证
+
+- `npm run verify:ux`、定向ESLint、`tsc --noEmit --incremental false`、`git diff --check` 和 production build 全部通过。
+- 受控重启 `localhost:3000` 后，在现有90张Year 1卡片上实测：90张卡片最小宽度109.99px、低于100px的卡片为0；总表内部 `clientWidth=687px`、`scrollWidth=6044px`，证明拥挤量由内部滚动承载而非页面级压缩。
+- 分别检查最左和最右端画面，课程编号、教师、学生班级、Room pending与问题数均可读；本次只改变布局与说明，没有改动任何排课资料。

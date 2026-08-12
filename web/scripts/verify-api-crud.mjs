@@ -695,6 +695,157 @@ async function verifyOwnPasswordLifecycleAndFailures() {
   report("自改密码 400／500／BUSY 503 原子回滚及成功后的全会话撤销");
 }
 
+async function verifyAccountStatusRevisionCasAndFailures() {
+  // 账号状态使用独立夹具，避免启停或撤销会话影响后续需要持续使用的管理员与
+  // password-CAS 账号。全部断言仍走 production standalone 的真实 route。
+  const username = "account-status-cas";
+  const password = "AccountStatusCas123!";
+  const created = (await requestApi("/api/auth/accounts", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { username, password },
+  })).body;
+  assert.deepEqual(created, {
+    id: created.id,
+    username,
+    isAdmin: false,
+    isActive: true,
+    revision: 1,
+  });
+
+  const accounts = (await requestApi("/api/auth/accounts")).body;
+  assert.deepEqual(accounts.find((account) => account.id === created.id), created);
+  const schedulerLogin = await requestApi("/api/auth/login", {
+    method: "POST",
+    authenticated: false,
+    json: { username, password },
+  });
+  const schedulerCookie = (schedulerLogin.response.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert(schedulerCookie.includes("="));
+  assert.equal(schedulerLogin.body.user.revision, 1);
+
+  function statusState() {
+    // 密码不参与状态 revision，但保留哈希在快照中可发现意外的跨字段更新。
+    return executeTestDatabase((db) => ({
+      account: db.prepare("SELECT password_hash, is_active, revision FROM app_users WHERE id = ?").get(created.id),
+      sessions: db.prepare("SELECT * FROM auth_sessions WHERE user_id = ? ORDER BY token_hash").all(created.id),
+    }));
+  }
+
+  // 同版本同值是成功 no-op，不提高 revision，也不撤销现有 scheduler 会话。
+  const stateBeforeNoOp = statusState();
+  // BEFORE UPDATE trigger 是比“最终值没变”更强的证据：错误实现若仍执行一条同值
+  // UPDATE，会直接得到500，而不能靠 SQLite changes 或事后快照让测试假绿。
+  executeTestDatabase((db) => {
+    const accountIdLiteral = db.prepare("SELECT quote(?) AS value").get(created.id).value;
+    db.exec(`CREATE TRIGGER zz_reject_account_status_noop_update
+      BEFORE UPDATE ON app_users WHEN OLD.id = ${accountIdLiteral}
+      BEGIN SELECT RAISE(ABORT, 'no-op must not execute UPDATE'); END;`);
+  });
+  let noOp;
+  try {
+    noOp = await requestApi("/api/auth/accounts", {
+      method: "PATCH",
+      json: { action: "status", userId: created.id, isActive: true, expectedRevision: 1 },
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_reject_account_status_noop_update"));
+  }
+  assert.deepEqual(noOp.body, { ok: true, revision: 1, changed: false });
+  assert.deepEqual(statusState(), stateBeforeNoOp);
+  assert.equal((await requestApi("/api/auth/status", { cookie: schedulerCookie })).body.user.revision, 1);
+
+  // Route 必须严格要求 positive safe integer，不能把缺少版本、数字字符串或浮点数
+  // 转成可写命令。每个400后逐字段比较账号与会话，证明验证发生在事务之前。
+  for (const invalidPayload of [
+    { action: "status", userId: created.id, isActive: false },
+    { action: "status", userId: created.id, isActive: false, expectedRevision: null },
+    { action: "status", userId: created.id, isActive: false, expectedRevision: "1" },
+    { action: "status", userId: created.id, isActive: false, expectedRevision: 0 },
+    { action: "status", userId: created.id, isActive: false, expectedRevision: 1.5 },
+    { action: "status", userId: created.id, isActive: false, expectedRevision: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    const rejected = await requestApi("/api/auth/accounts", {
+      method: "PATCH",
+      expectedStatus: 400,
+      json: invalidPayload,
+    });
+    assert.deepEqual(rejected.body, { error: "Account action is invalid." });
+    assert.deepEqual(statusState(), stateBeforeNoOp);
+  }
+
+  // DELETE trigger 在条件 UPDATE 已执行后强制失败。由于停用和会话撤销共属一个
+  // IMMEDIATE 事务，500 必须同时回滚 is_active、revision 和全部既有会话。
+  executeTestDatabase((db) => {
+    const accountIdLiteral = db.prepare("SELECT quote(?) AS value").get(created.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_account_status_session_revoke
+      BEFORE DELETE ON auth_sessions WHEN OLD.user_id = ${accountIdLiteral}
+      BEGIN SELECT RAISE(ABORT, 'SECRET account status trigger /private/tmp/status.sqlite'); END;`);
+  });
+  let failedStatus;
+  try {
+    failedStatus = await requestApi("/api/auth/accounts", {
+      method: "PATCH",
+      expectedStatus: 500,
+      json: { action: "status", userId: created.id, isActive: false, expectedRevision: 1 },
+    });
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_account_status_session_revoke"));
+  }
+  assert.deepEqual(failedStatus.body, { error: "The account could not be updated. Try again." });
+  assert(!/secret|trigger|sqlite|sql|\/private\/tmp/i.test(JSON.stringify(failedStatus.body)));
+  assert.deepEqual(statusState(), stateBeforeNoOp);
+
+  const disabled = await requestApi("/api/auth/accounts", {
+    method: "PATCH",
+    json: { action: "status", userId: created.id, isActive: false, expectedRevision: 1 },
+  });
+  assert.deepEqual(disabled.body, { ok: true, revision: 2, changed: true });
+  const disabledState = statusState();
+  assert.equal(disabledState.account.is_active, 0);
+  assert.equal(disabledState.account.revision, 2);
+  assert.deepEqual(disabledState.sessions, []);
+  assert.equal((await requestApi("/api/auth/status", { cookie: schedulerCookie })).body.user, null);
+
+  // stale-same 是最容易误写成 no-op 的 ABA 边界：服务器当前也为 Inactive，但旧
+  // revision 1 已错过一次真实提交，仍必须409且保持 revision 2。
+  for (const isActive of [false, true]) {
+    const conflict = await requestApi("/api/auth/accounts", {
+      method: "PATCH",
+      expectedStatus: 409,
+      json: { action: "status", userId: created.id, isActive, expectedRevision: 1 },
+    });
+    assert.deepEqual(conflict.body, {
+      code: "ACCOUNT_CHANGED",
+      error: "This account was changed by another administrator. Review the latest account list before trying again.",
+    });
+    assert.deepEqual(statusState(), disabledState);
+  }
+
+  const enabled = await requestApi("/api/auth/accounts", {
+    method: "PATCH",
+    json: { action: "status", userId: created.id, isActive: true, expectedRevision: 2 },
+  });
+  assert.deepEqual(enabled.body, { ok: true, revision: 3, changed: true });
+  const enabledNoOp = await requestApi("/api/auth/accounts", {
+    method: "PATCH",
+    json: { action: "status", userId: created.id, isActive: true, expectedRevision: 3 },
+  });
+  assert.deepEqual(enabledNoOp.body, { ok: true, revision: 3, changed: false });
+
+  // 密码重置有自己的 hash/session CAS，不改变公开状态版本；管理员仍可使用刚刷新
+  // 的 revision 3 做下一次启停，而不会收到与状态无关的冲突。
+  await requestApi("/api/auth/accounts", {
+    method: "PATCH",
+    json: { action: "resetPassword", userId: created.id, password: "AccountStatusReset456!" },
+  });
+  const finalAccount = (await requestApi("/api/auth/accounts")).body
+    .find((account) => account.id === created.id);
+  assert.equal(finalAccount.revision, 3);
+  assert.equal(finalAccount.isActive, true);
+  report("账号状态 revision CAS、no-op、输入边界、故障回滚、会话撤销及 stale-same 409");
+}
+
 async function verifyWorkbookBoundaries() {
   // 固定版本是两个已知 SheetJS 漏洞的主要修复保证，不能只依赖 npm audit
   // 对本地 file dependency 的有限识别能力。
@@ -1478,6 +1629,249 @@ async function verifyTeachingImportFailureBoundaries() {
   report("Teaching allocation 真实 500／BUSY 503 安全 JSON 与事务回滚");
 }
 
+async function verifyCourseDeletionAndAutomaticSectionResize() {
+  // 删除协议先用一门完全独立的手工课程覆盖严格输入、body 上限、stale CAS、未知
+  // trigger 回滚、成功级联和重复删除。所有断言只连接本轮 mkdtemp 数据库。
+  const deletableCourse = (await requestApi("/api/courses", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "COURSE_DELETE_SAFE", catalog: "Safe deletion regression", sectionCount: 2 },
+  })).body;
+  const beforeInvalidDelete = readBusinessSnapshot();
+  await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 400,
+    headers: { "Content-Type": "application/json" },
+    body: "null",
+  });
+  await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 400,
+    headers: { "Content-Type": "application/json" },
+    body: "{",
+  });
+  await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 400,
+    json: { revision: "1" },
+  });
+  await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 413,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision: 1, padding: "x".repeat(70 * 1_024) }),
+  });
+  assert.deepEqual(readBusinessSnapshot(), beforeInvalidDelete);
+
+  const grownDeletableCourse = await requestApi(`/api/courses/${deletableCourse.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 3, revision: deletableCourse.revision },
+  });
+  const beforeStaleDelete = readBusinessSnapshot();
+  const staleDelete = await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: deletableCourse.revision },
+  });
+  assert.equal(staleDelete.body.code, "COURSE_CHANGED");
+  assert.deepEqual(readBusinessSnapshot(), beforeStaleDelete);
+
+  executeTestDatabase((db) => {
+    const courseIdLiteral = db.prepare("SELECT quote(?) AS value").get(deletableCourse.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_course_delete BEFORE DELETE ON courses
+      WHEN OLD.id = ${courseIdLiteral}
+      BEGIN SELECT RAISE(ABORT, 'SECRET course delete trigger /private/tmp/live.sqlite'); END;`);
+  });
+  try {
+    const failedDelete = await requestApi(`/api/courses/${deletableCourse.id}`, {
+      method: "DELETE",
+      expectedStatus: 500,
+      json: { revision: grownDeletableCourse.body.revision },
+    });
+    assert.deepEqual(failedDelete.body, { error: "The course could not be deleted. Try again." });
+    assert(!/secret|trigger|sqlite|database|course_sections|\/private\/tmp|stack/i.test(JSON.stringify(failedDelete.body)));
+    assert.deepEqual(readBusinessSnapshot(), beforeStaleDelete);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_course_delete"));
+  }
+
+  // 独立 RESERVED writer 不影响认证 SELECT，但会让 Course DELETE 自己的
+  // BEGIN IMMEDIATE 在 production busy timeout 后受控失败；原课程和全部关系必须不变。
+  const snapshotBeforeDeleteBusy = readBusinessSnapshot();
+  const deleteLockDatabase = new Database(testDatabasePath);
+  let deleteBusyFailure;
+  try {
+    deleteLockDatabase.exec("BEGIN IMMEDIATE");
+    deleteBusyFailure = await requestApi(`/api/courses/${deletableCourse.id}`, {
+      method: "DELETE",
+      expectedStatus: 503,
+      json: { revision: grownDeletableCourse.body.revision },
+    });
+  } finally {
+    if (deleteLockDatabase.inTransaction) deleteLockDatabase.exec("ROLLBACK");
+    deleteLockDatabase.close();
+  }
+  assert.deepEqual(deleteBusyFailure.body, { error: "Another scheduler is updating course data. Try again in a moment." });
+  assert.equal(deleteBusyFailure.response.headers.get("retry-after"), "1");
+  assert.deepEqual(readBusinessSnapshot(), snapshotBeforeDeleteBusy);
+
+  assert.deepEqual((await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    json: { revision: grownDeletableCourse.body.revision },
+  })).body, { ok: true });
+  await requestApi(`/api/courses/${deletableCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 404,
+    json: { revision: grownDeletableCourse.body.revision },
+  });
+  assert.equal(executeTestDatabase((db) => db.prepare("SELECT COUNT(*) AS count FROM course_sections WHERE course_id = ?").get(deletableCourse.id).count), 0);
+
+  // Teaching Members 自动教师属于可再生成的来源资料。手工缩小数量时允许删除自动
+  // 尾班，但 allocation baseline 保持原样并形成明确 mismatch；随后整课删除原子清除
+  // course、剩余自动 section 和 baseline，教师主资料继续保留。
+  const autoRows = [{
+    Mod: "COURSE_AUTO_RESIZE",
+    Catalog: "Automatic section lifecycle",
+    Lecturer: "COURSE AUTO RESIZE TEACHER",
+    "Staff Type": "FT",
+    "# of grps teaching": 3,
+  }];
+  const autoWorkbook = workbookBuffer([["Teaching Members", teachingRowsWorksheet(autoRows)]]);
+  await uploadWorkbook(autoWorkbook, "course-auto-resize.xlsx", 200);
+  const autoCourse = (await requestApi("/api/courses")).body.find((course) => course.code === "COURSE_AUTO_RESIZE");
+  const autoTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.name === "COURSE AUTO RESIZE TEACHER");
+  assert(autoCourse && autoTeacher, "The automatic resize fixture was not created.");
+  const autoSectionsBefore = executeTestDatabase((db) => db.prepare(`SELECT id, sequence, teacher_id, allocation_teacher_id
+    FROM course_sections WHERE course_id = ? ORDER BY sequence`).all(autoCourse.id));
+  assert.equal(autoSectionsBefore.length, 3);
+  assert(autoSectionsBefore.every((section) => section.teacher_id === autoTeacher.id && section.allocation_teacher_id === autoTeacher.id));
+
+  const autoShrink = await requestApi(`/api/courses/${autoCourse.id}/sections`, {
+    method: "PATCH",
+    json: { sectionCount: 1, revision: autoCourse.revision },
+  });
+  assert.equal(autoShrink.body.revision, autoCourse.revision + 1);
+  assert.equal((await requestApi(`/api/courses/${autoCourse.id}/sections`)).body.length, 1);
+  const baselineAfterShrink = executeTestDatabase((db) => db.prepare("SELECT assigned_group_count FROM teaching_allocations WHERE course_id = ? AND teacher_id = ?").get(autoCourse.id, autoTeacher.id));
+  assert.deepEqual(baselineAfterShrink, { assigned_group_count: 3 });
+  const summaryAfterShrink = (await requestApi("/api/courses")).body.find((course) => course.id === autoCourse.id);
+  assert.equal(summaryAfterShrink.configuredSections, 1);
+  assert.equal(summaryAfterShrink.allocatedSections, 3);
+  assert.equal(summaryAfterShrink.allocationVarianceCount, 1);
+
+  await requestApi(`/api/courses/${autoCourse.id}`, {
+    method: "DELETE",
+    json: { revision: autoShrink.body.revision },
+  });
+  const autoOwnedRowsAfterDelete = executeTestDatabase((db) => ({
+    course: db.prepare("SELECT COUNT(*) AS count FROM courses WHERE id = ?").get(autoCourse.id).count,
+    allocations: db.prepare("SELECT COUNT(*) AS count FROM teaching_allocations WHERE course_id = ?").get(autoCourse.id).count,
+    sections: db.prepare("SELECT COUNT(*) AS count FROM course_sections WHERE course_id = ?").get(autoCourse.id).count,
+    teacher: db.prepare("SELECT COUNT(*) AS count FROM teachers WHERE id = ?").get(autoTeacher.id).count,
+  }));
+  assert.deepEqual(autoOwnedRowsAfterDelete, { course: 0, allocations: 0, sections: 0, teacher: 1 });
+
+  // 同一来源文件以后会按产品契约重新建立新 course ID 与自动班次；这不是删除失败，
+  // 而是用户明确再次导入来源资料的结果。清理重建夹具后继续其他回归。
+  await uploadWorkbook(autoWorkbook, "course-auto-recreate.xlsx", 200);
+  const recreatedAutoCourse = (await requestApi("/api/courses")).body.find((course) => course.code === "COURSE_AUTO_RESIZE");
+  assert(recreatedAutoCourse && recreatedAutoCourse.id !== autoCourse.id);
+  assert.equal(recreatedAutoCourse.configuredSections, 3);
+  await requestApi(`/api/courses/${recreatedAutoCourse.id}`, {
+    method: "DELETE",
+    json: { revision: recreatedAutoCourse.revision },
+  });
+
+  // 已排课、学生班级和人工教师按优先次序分别阻止整课删除；每个409都必须保持
+  // 完整业务快照。老师逐步显式清理后，同一课程才可安全删除。
+  const protectedTeacher = (await requestApi("/api/teachers", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { name: "COURSE DELETE MANUAL TEACHER", staffType: "PT" },
+  })).body;
+  const protectedGroup = (await requestApi("/api/student-groups", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "COURSE_DELETE_GROUP", year: 1, program: "DELETE" },
+  })).body;
+  const protectedCourse = (await requestApi("/api/courses", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "COURSE_DELETE_PROTECTED", catalog: null, sectionCount: 1 },
+  })).body;
+  const protectedSetup = await requestApi(`/api/courses/${protectedCourse.id}`, {
+    method: "PATCH",
+    json: {
+      revision: protectedCourse.revision,
+      durationHours: 2,
+      sessionsPerWeek: 1,
+      primaryYear: 1,
+      minimumRoomCapacity: null,
+      requiresLab: false,
+      requiresMultiProjector: false,
+      requiresSmartClassroom: false,
+      separateSectionsAcrossDays: false,
+      weekStart: null,
+      weekEnd: null,
+    },
+  });
+  const protectedSection = (await requestApi(`/api/courses/${protectedCourse.id}/sections`)).body[0];
+  let protectedAssignment = await requestApi(`/api/course-sections/${protectedSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: protectedTeacher.id, studentGroupIds: [protectedGroup.id], revision: protectedSection.revision },
+  });
+  const protectedLesson = (await requestApi("/api/schedule/lessons", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { sectionId: protectedSection.id, occurrence: 1, dayOfWeek: 5, startHour: 8, roomId: null },
+  })).body;
+
+  let protectedSnapshot = readBusinessSnapshot();
+  const scheduledDelete = await requestApi(`/api/courses/${protectedCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: protectedSetup.body.revision },
+  });
+  assert.equal(scheduledDelete.body.code, "COURSE_IN_USE");
+  assert.match(scheduledDelete.body.error, /scheduled/i);
+  assert.deepEqual(readBusinessSnapshot(), protectedSnapshot);
+  await requestApi(`/api/schedule/lessons/${protectedLesson.id}?revision=${protectedLesson.revision}`, { method: "DELETE" });
+
+  protectedSnapshot = readBusinessSnapshot();
+  const groupedDelete = await requestApi(`/api/courses/${protectedCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: protectedSetup.body.revision },
+  });
+  assert.equal(groupedDelete.body.code, "COURSE_IN_USE");
+  assert.match(groupedDelete.body.error, /student groups/i);
+  assert.deepEqual(readBusinessSnapshot(), protectedSnapshot);
+  protectedAssignment = await requestApi(`/api/course-sections/${protectedSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: protectedTeacher.id, studentGroupIds: [], revision: protectedAssignment.body.revision },
+  });
+
+  protectedSnapshot = readBusinessSnapshot();
+  const manualTeacherDelete = await requestApi(`/api/courses/${protectedCourse.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: protectedSetup.body.revision },
+  });
+  assert.equal(manualTeacherDelete.body.code, "COURSE_IN_USE");
+  assert.match(manualTeacherDelete.body.error, /manually maintained teacher/i);
+  assert.deepEqual(readBusinessSnapshot(), protectedSnapshot);
+  protectedAssignment = await requestApi(`/api/course-sections/${protectedSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: null, studentGroupIds: [], revision: protectedAssignment.body.revision },
+  });
+  assert.equal(protectedAssignment.body.changed, true);
+  await requestApi(`/api/courses/${protectedCourse.id}`, {
+    method: "DELETE",
+    json: { revision: protectedSetup.body.revision },
+  });
+  report("Course 删除 CAS／关系保护／自动子资料级联，以及 section 自动教师安全缩减");
+}
+
 async function verifyCrudAndRevisions() {
   // 教师新增会统一大写，重复姓名由唯一键转换成 409；两个稳定 ID 将用于
   // 后面的班次 revision 和排课共享分配测试。
@@ -1514,6 +1908,76 @@ async function verifyCrudAndRevisions() {
     expectedStatus: 409,
     json: { code: "AAA_2", year: 2, program: "AAA" },
   });
+  // 班级编号只在同一年级内唯一：三个年级都能拥有 AAA_2，且每一条都有独立
+  // 稳定 ID。后续筛选和班次关联必须使用这些 ID，不能再用 code 猜是哪一年级。
+  const sameCodeYearOne = (await requestApi("/api/student-groups", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "AAA_2", year: 1, program: "AAA" },
+  })).body;
+  const sameCodeYearThree = (await requestApi("/api/student-groups", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "AAA_2", year: 3, program: "AAA" },
+  })).body;
+  assert.notEqual(sameCodeYearOne.id, studentGroup.id);
+  assert.notEqual(sameCodeYearThree.id, studentGroup.id);
+  assert.notEqual(sameCodeYearOne.id, sameCodeYearThree.id);
+  const sameCodeGroups = (await requestApi("/api/student-groups")).body
+    .filter((group) => group.code === "AAA_2");
+  assert.deepEqual(sameCodeGroups.map((group) => group.year), [1, 2, 3]);
+
+  // 完全未被使用的误建班级允许管理员删除。删除同样消费 revision：旧页面即使
+  // 想删除的最终状态相同，也必须先刷新；未知数据库故障则固定500且零写入。
+  const deletableGroup = (await requestApi("/api/student-groups", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { code: "DELETE_ME", year: 3, program: "TEST" },
+  })).body;
+  const stateBeforeInvalidGroupDelete = readBusinessSnapshot();
+  await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+    method: "DELETE",
+    expectedStatus: 400,
+    json: { revision: "1" },
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeInvalidGroupDelete);
+  const updatedDeletableGroup = await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+    method: "PATCH",
+    json: { code: deletableGroup.code, year: deletableGroup.year, program: "TEST2", revision: deletableGroup.revision },
+  });
+  const stateBeforeStaleGroupDelete = readBusinessSnapshot();
+  const staleGroupDelete = await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: deletableGroup.revision },
+  });
+  assert.equal(staleGroupDelete.body.code, "MASTER_DATA_CHANGED");
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeStaleGroupDelete);
+  executeTestDatabase((db) => {
+    const groupIdLiteral = db.prepare("SELECT quote(?) AS value").get(deletableGroup.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_student_group_delete BEFORE DELETE ON student_groups WHEN OLD.id = ${groupIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced student-group delete failure'); END;`);
+  });
+  try {
+    const failedGroupDelete = await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+      method: "DELETE",
+      expectedStatus: 500,
+      json: { revision: updatedDeletableGroup.body.revision },
+    });
+    assert.deepEqual(failedGroupDelete.body, { error: "The student group could not be deleted. Try again." });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeStaleGroupDelete);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_student_group_delete"));
+  }
+  assert.deepEqual((await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+    method: "DELETE",
+    json: { revision: updatedDeletableGroup.body.revision },
+  })).body, { ok: true });
+  await requestApi(`/api/student-groups/${deletableGroup.id}`, {
+    method: "DELETE",
+    expectedStatus: 404,
+    json: { revision: updatedDeletableGroup.body.revision },
+  });
+  assert(!(await requestApi("/api/student-groups")).body.some((group) => group.id === deletableGroup.id));
   const room = (await requestApi("/api/rooms", {
     method: "POST",
     expectedStatus: 201,
@@ -1629,6 +2093,17 @@ async function verifyCrudAndRevisions() {
   assert.equal(firstAssignment.body.revision, 2);
   assert.equal(firstAssignment.body.changed, true);
 
+  // 当前班次仍引用的班级绝不能级联删除；409 必须保留关联和所有业务资料。
+  const stateBeforeProtectedGroupDelete = readBusinessSnapshot();
+  const protectedGroupDelete = await requestApi(`/api/student-groups/${studentGroup.id}`, {
+    method: "DELETE",
+    expectedStatus: 409,
+    json: { revision: studentGroup.revision },
+  });
+  assert.equal(protectedGroupDelete.body.code, "STUDENT_GROUP_IN_USE");
+  assert.match(protectedGroupDelete.body.error, /course section/i);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeProtectedGroupDelete);
+
   // 无效教师或学生班级必须在事务内被拒绝，且不能消耗当前 revision。
   await requestApi(`/api/course-sections/${section.id}`, {
     method: "PATCH",
@@ -1684,6 +2159,12 @@ async function verifyCrudAndRevisions() {
   assert.equal(sections[0].teacherId, teacherB.id);
   assert.deepEqual(sections[0].studentGroupIds, [studentGroup.id]);
   assert.equal(sections[0].revision, winningAssignment.body.revision);
+  const sameCodeTray = (await requestApi("/api/schedule/unscheduled?year=1")).body
+    .find((item) => item.sectionId === section.id && item.occurrence === 1);
+  assert(sameCodeTray, "The configured section did not enter the Year 1 unscheduled tray.");
+  assert.deepEqual(sameCodeTray.studentGroupIds, [studentGroup.id]);
+  assert(!sameCodeTray.studentGroupIds.includes(sameCodeYearOne.id));
+  assert(!sameCodeTray.studentGroupIds.includes(sameCodeYearThree.id));
 
   // 班次数量增加后会建立新尾部班次；未分配、未排课的尾部班次可以安全删除，
   // 低编号班次 ID、教师和学生班级必须保持不变。
@@ -1719,16 +2200,62 @@ async function verifyCrudAndRevisions() {
     expectedStatus: 409,
     json: { sectionCount: 2, revision: courseRevision },
   });
-  assert.match(protectedResize.body.error, /has a teacher/i);
+  assert.equal(protectedResize.body.code, "COURSE_SECTION_IN_USE");
+  assert.match(protectedResize.body.error, /manually maintained teacher/i);
   const sectionsAfterProtectedResize = (await requestApi(`/api/courses/${course.id}/sections`)).body;
   assert.equal(sectionsAfterProtectedResize.length, 3);
   assert.equal(sectionsAfterProtectedResize[2].id, tailSection.id);
   assert.equal(sectionsAfterProtectedResize[2].teacherId, teacherA.id);
   assert.equal(sectionsAfterProtectedResize[2].revision, protectedTail.body.revision);
-  await requestApi(`/api/course-sections/${tailSection.id}`, {
+
+  let tailAssignment = await requestApi(`/api/course-sections/${tailSection.id}`, {
     method: "PATCH",
     json: { teacherId: null, studentGroupIds: [], revision: protectedTail.body.revision },
   });
+  tailAssignment = await requestApi(`/api/course-sections/${tailSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: null, studentGroupIds: [sameCodeYearOne.id], revision: tailAssignment.body.revision },
+  });
+  const stateBeforeGroupedTailResize = readBusinessSnapshot();
+  const groupedTailResize = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { sectionCount: 2, revision: courseRevision },
+  });
+  assert.equal(groupedTailResize.body.code, "COURSE_SECTION_IN_USE");
+  assert.match(groupedTailResize.body.error, /student groups/i);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeGroupedTailResize);
+  tailAssignment = await requestApi(`/api/course-sections/${tailSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: null, studentGroupIds: [], revision: tailAssignment.body.revision },
+  });
+
+  // 尾班一旦进入总表，即使它来自本次手工增长也不能被数量修正级联移除。
+  // Return to tray 后仍须清除人工教师，最后一次 shrink 才能提交。
+  tailAssignment = await requestApi(`/api/course-sections/${tailSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: teacherA.id, studentGroupIds: [], revision: tailAssignment.body.revision },
+  });
+  const scheduledTailLesson = (await requestApi("/api/schedule/lessons", {
+    method: "POST",
+    expectedStatus: 201,
+    json: { sectionId: tailSection.id, occurrence: 1, dayOfWeek: 5, startHour: 8, roomId: null },
+  })).body;
+  const stateBeforeScheduledTailResize = readBusinessSnapshot();
+  const scheduledTailResize = await requestApi(`/api/courses/${course.id}/sections`, {
+    method: "PATCH",
+    expectedStatus: 409,
+    json: { sectionCount: 2, revision: courseRevision },
+  });
+  assert.equal(scheduledTailResize.body.code, "COURSE_SECTION_IN_USE");
+  assert.match(scheduledTailResize.body.error, /scheduled/i);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeScheduledTailResize);
+  await requestApi(`/api/schedule/lessons/${scheduledTailLesson.id}?revision=${scheduledTailLesson.revision}`, { method: "DELETE" });
+  tailAssignment = await requestApi(`/api/course-sections/${tailSection.id}`, {
+    method: "PATCH",
+    json: { teacherId: null, studentGroupIds: [], revision: tailAssignment.body.revision },
+  });
+  assert.equal(tailAssignment.body.changed, true);
   const shrunkCourse = await requestApi(`/api/courses/${course.id}/sections`, {
     method: "PATCH",
     json: { sectionCount: 2, revision: courseRevision },
@@ -2428,6 +2955,184 @@ async function verifyCrudAndRevisions() {
     sectionId: section.id,
     lessonId: lessonOne.id,
   };
+}
+
+async function verifyTeachingWeekRuleIsolation() {
+  // 这个 fixture 专门保护“课程日期相同，但教学周不相同”的规则语义。
+  // 所有资料都经 production CRUD API 建立；finally 只从本次临时数据库清理这些专用 ID。
+  const fixtureIds = { courses: [], teacher: null, group: null, rooms: [] };
+
+  const createConfiguredCourse = async ({ code, durationHours, weekStart, weekEnd }) => {
+    const course = (await requestApi("/api/courses", {
+      method: "POST",
+      expectedStatus: 201,
+      json: { code, catalog: "Teaching-week rule regression", sectionCount: 1 },
+    })).body;
+    fixtureIds.courses.push(course.id);
+    await requestApi(`/api/courses/${course.id}`, {
+      method: "PATCH",
+      json: {
+        revision: course.revision,
+        durationHours,
+        sessionsPerWeek: 1,
+        primaryYear: 1,
+        minimumRoomCapacity: 1,
+        requiresLab: false,
+        requiresMultiProjector: false,
+        requiresSmartClassroom: false,
+        separateSectionsAcrossDays: false,
+        weekStart,
+        weekEnd,
+      },
+    });
+    const section = (await requestApi(`/api/courses/${course.id}/sections`)).body[0];
+    const assignment = await requestApi(`/api/course-sections/${section.id}`, {
+      method: "PATCH",
+      json: {
+        teacherId: fixtureIds.teacher.id,
+        studentGroupIds: [fixtureIds.group.id],
+        revision: section.revision,
+      },
+    });
+    assert.equal(assignment.body.changed, true);
+    return { course, section };
+  };
+
+  const placeFixtureLesson = async (sectionId, startHour, roomId, { dayOfWeek = 1, expectedStatus = 201 } = {}) => (
+    await requestApi("/api/schedule/lessons", {
+      method: "POST",
+      expectedStatus,
+      json: { sectionId, occurrence: 1, dayOfWeek, startHour, roomId },
+    })
+  ).body;
+
+  try {
+    fixtureIds.teacher = (await requestApi("/api/teachers", {
+      method: "POST",
+      expectedStatus: 201,
+      json: { name: "auto teaching week teacher", staffType: "FT" },
+    })).body;
+    fixtureIds.group = (await requestApi("/api/student-groups", {
+      method: "POST",
+      expectedStatus: 201,
+      json: { code: "WEEK_RULE_1", year: 1, program: "WEEK RULES" },
+    })).body;
+    const sameBlockRoom = (await requestApi("/api/rooms", {
+      method: "POST",
+      expectedStatus: 201,
+      json: { code: "91-01-01", capacity: 50, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
+    })).body;
+    const otherBlockRoom = (await requestApi("/api/rooms", {
+      method: "POST",
+      expectedStatus: 201,
+      json: { code: "92-01-01", capacity: 50, hasLab: false, hasMultiProjector: false, isSmartClassroom: false },
+    })).body;
+    fixtureIds.rooms.push(sameBlockRoom.id, otherBlockRoom.id);
+
+    // W1–4 的 9:00–13:00 加 16:00–18:00，以及 W5–8 的 9:00–11:00、
+    // 13:00–15:00、16:00–18:00，各自在真实周内都保留午餐且不超过规则上限。
+    // 旧算法把两段互斥课程合起来，会错误得到连续六小时、十小时总量和无午餐。
+    const earlyAdjacent = await createConfiguredCourse({ code: "AUTO_WEEK_A1", durationHours: 2, weekStart: 1, weekEnd: 4 });
+    const earlyLate = await createConfiguredCourse({ code: "AUTO_WEEK_A2", durationHours: 2, weekStart: 1, weekEnd: 4 });
+    const lateLunch = await createConfiguredCourse({ code: "AUTO_WEEK_B1", durationHours: 2, weekStart: 5, weekEnd: 8 });
+    const lateLate = await createConfiguredCourse({ code: "AUTO_WEEK_B2", durationHours: 2, weekStart: 5, weekEnd: 8 });
+    await placeFixtureLesson(earlyAdjacent.section.id, 11, sameBlockRoom.id);
+    await placeFixtureLesson(earlyLate.section.id, 16, sameBlockRoom.id);
+    await placeFixtureLesson(lateLunch.section.id, 13, sameBlockRoom.id);
+    await placeFixtureLesson(lateLate.section.id, 16, sameBlockRoom.id);
+
+    const proposed = await createConfiguredCourse({ code: "AUTO_WEEK_ALL", durationHours: 2, weekStart: null, weekEnd: null });
+    const legalCandidates = (await requestApi(`/api/course-sections/${proposed.section.id}/candidates?occurrence=1`)).body;
+    const exactLegalCandidate = legalCandidates.slots.find((slot) => (
+      slot.dayOfWeek === 1 && slot.startHour === 9 && slot.roomId === sameBlockRoom.id
+    ));
+    assert(exactLegalCandidate, "W1–4 and W5–8 loads were incorrectly merged in candidate search.");
+
+    // null/null 是 W1–52；每一个实际周都合法，所以 production POST 与随后全表刷新
+    // 都必须保存完全相同的空 warning 清单。
+    const proposedLesson = await placeFixtureLesson(proposed.section.id, 9, sameBlockRoom.id);
+    assert.deepEqual(proposedLesson.warnings, []);
+    const persistedLegalLesson = (await requestApi("/api/schedule/lessons?year=1")).body
+      .find((lesson) => lesson.id === proposedLesson.id);
+    assert(persistedLegalLesson, "The all-weeks regression lesson was not returned by the timetable API.");
+    assert.deepEqual(persistedLegalLesson.warnings, []);
+
+    // W4–4 与 W1–4 在端点 W4 同时生效。13:00–16:00 补齐连续时段与午餐，
+    // 另一栋的 11:00–13:00 又与 proposed 背靠背；四类教师/班级规则都是真实违规。
+    const weekFourLoad = await createConfiguredCourse({ code: "AUTO_WEEK_W4_LOAD", durationHours: 3, weekStart: 4, weekEnd: 4 });
+    const weekFourTravel = await createConfiguredCourse({ code: "AUTO_WEEK_W4_TRAVEL", durationHours: 2, weekStart: 4, weekEnd: 4 });
+    await placeFixtureLesson(weekFourLoad.section.id, 13, sameBlockRoom.id);
+    await placeFixtureLesson(weekFourTravel.section.id, 11, otherBlockRoom.id);
+
+    const persistedViolation = (await requestApi("/api/schedule/lessons?year=1")).body
+      .find((lesson) => lesson.id === proposedLesson.id);
+    const expectedWarnings = [
+      "Teacher has no free lunch hour between 12:00 and 14:00",
+      "Teacher has more than 4 continuous hours",
+      "Teacher exceeds 7 teaching hours in one day",
+      "Teacher has back-to-back lessons in different blocks",
+      "WEEK_RULE_1 has no free lunch hour between 12:00 and 14:00",
+      "WEEK_RULE_1 has more than 4 continuous hours",
+      "WEEK_RULE_1 exceeds 6 class hours in one day",
+      "WEEK_RULE_1 has back-to-back lessons in different blocks",
+    ];
+    assert.deepEqual([...persistedViolation.warnings].sort(), [...expectedWarnings].sort());
+    for (const warning of expectedWarnings) {
+      assert.equal(persistedViolation.warnings.filter((item) => item === warning).length, 1,
+        `Teaching-week warning was not emitted exactly once: ${warning}`);
+    }
+
+    // Return to tray is the real DELETE path. The now-unscheduled section uses the same
+    // calculatePlacementWarnings function, so its formerly legal exact slot must disappear while W4 violates.
+    await requestApi(`/api/schedule/lessons/${proposedLesson.id}?revision=${persistedViolation.revision}`, { method: "DELETE" });
+    const violatingCandidates = (await requestApi(`/api/course-sections/${proposed.section.id}/candidates?occurrence=1`)).body;
+    assert(violatingCandidates.slots.length > 0, "The W4 fixture unexpectedly removed every candidate on all five days.");
+    assert(!violatingCandidates.slots.some((slot) => (
+      slot.dayOfWeek === 1 && slot.startHour === 9 && slot.roomId === sameBlockRoom.id
+    )), "Candidate search did not apply the same W4 warning rules as persisted lessons.");
+
+    // same_block 是成对规则，也必须明确保护周次边界：周二 W1–4 的 09:00 课程
+    // 与 W5–8 另一栋的 11:00 课程互斥，W4–4 的同一位置则在端点真实相邻。
+    const futureTravel = await createConfiguredCourse({ code: "AUTO_WEEK_TRAVEL_B", durationHours: 2, weekStart: 5, weekEnd: 8 });
+    await placeFixtureLesson(futureTravel.section.id, 11, otherBlockRoom.id, { dayOfWeek: 2 });
+    const proposedTravel = await createConfiguredCourse({ code: "AUTO_WEEK_TRAVEL_A", durationHours: 2, weekStart: 1, weekEnd: 4 });
+    const legalTravelCandidates = (await requestApi(`/api/course-sections/${proposedTravel.section.id}/candidates?occurrence=1`)).body;
+    assert(legalTravelCandidates.slots.some((slot) => (
+      slot.dayOfWeek === 2 && slot.startHour === 9 && slot.roomId === sameBlockRoom.id
+    )), "Mutually exclusive W1–4/W5–8 block changes were incorrectly treated as travel warnings.");
+    const proposedTravelLesson = await placeFixtureLesson(proposedTravel.section.id, 9, sameBlockRoom.id, { dayOfWeek: 2 });
+    assert.deepEqual(proposedTravelLesson.warnings, []);
+
+    const endpointTravel = await createConfiguredCourse({ code: "AUTO_WEEK_TRAVEL_W4", durationHours: 2, weekStart: 4, weekEnd: 4 });
+    await placeFixtureLesson(endpointTravel.section.id, 11, otherBlockRoom.id, { dayOfWeek: 2 });
+    const persistedTravelViolation = (await requestApi("/api/schedule/lessons?year=1")).body
+      .find((lesson) => lesson.id === proposedTravelLesson.id);
+    assert.deepEqual(persistedTravelViolation.warnings.sort(), [
+      "Teacher has back-to-back lessons in different blocks",
+      "WEEK_RULE_1 has back-to-back lessons in different blocks",
+    ].sort());
+    await requestApi(`/api/schedule/lessons/${proposedTravelLesson.id}?revision=${persistedTravelViolation.revision}`, { method: "DELETE" });
+    const violatingTravelCandidates = (await requestApi(`/api/course-sections/${proposedTravel.section.id}/candidates?occurrence=1`)).body;
+    assert(!violatingTravelCandidates.slots.some((slot) => (
+      slot.dayOfWeek === 2 && slot.startHour === 9 && slot.roomId === sameBlockRoom.id
+    )), "Candidate search omitted the real W4 persisted same-block warning.");
+
+    report("教学周 W1–4/W5–8 隔离、W4 包含端点及候选/持久 warning 一致性");
+  } finally {
+    // Courses own sections, links and lessons through ON DELETE CASCADE. Removing them first
+    // lets the dedicated teacher/group/rooms be deleted without touching any earlier CRUD fixture.
+    executeTestDatabase((db) => {
+      const cleanup = db.transaction(() => {
+        const deleteCourse = db.prepare("DELETE FROM courses WHERE id = ?");
+        for (const courseId of fixtureIds.courses) deleteCourse.run(courseId);
+        if (fixtureIds.teacher?.id) db.prepare("DELETE FROM teachers WHERE id = ?").run(fixtureIds.teacher.id);
+        if (fixtureIds.group?.id) db.prepare("DELETE FROM student_groups WHERE id = ?").run(fixtureIds.group.id);
+        const deleteRoom = db.prepare("DELETE FROM rooms WHERE id = ?");
+        for (const roomId of fixtureIds.rooms) deleteRoom.run(roomId);
+      });
+      cleanup.immediate();
+    });
+  }
 }
 
 async function verifyManagementSnapshots(ids) {
@@ -3199,6 +3904,54 @@ async function verifySystemBackupAcrossColumnOrders() {
     assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
   }
 
+  // 不同年级同 code 是合法资料，但同一年级的重复仍必须由完整恢复的业务校验拒绝。
+  // 上传库可以没有 production unique key，所以先重建一张无组合约束的同形表，再
+  // 插入相同 Year + code；若只依赖 live 索引，这个文件会到复制阶段才错误地返回500。
+  const duplicateStudentGroupPath = path.join(temporaryDirectory, "duplicate-student-group-year-code.sqlite");
+  await writeFile(duplicateStudentGroupPath, await readFile(reorderedBackupPath), { mode: 0o600 });
+  const duplicateStudentGroupDatabase = new Database(duplicateStudentGroupPath);
+  try {
+    duplicateStudentGroupDatabase.pragma("foreign_keys = OFF");
+    const removeStudentGroupKey = duplicateStudentGroupDatabase.transaction(() => {
+      duplicateStudentGroupDatabase.exec(`
+        CREATE TABLE student_groups_without_year_code_key (
+          id TEXT PRIMARY KEY,
+          code TEXT NOT NULL,
+          year INTEGER NOT NULL CHECK (year IN (1, 2, 3)),
+          program TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
+        );
+        INSERT INTO student_groups_without_year_code_key
+          (id, code, year, program, created_at, updated_at, revision)
+        SELECT id, code, year, program, created_at, updated_at, revision FROM student_groups;
+        DROP TABLE student_groups;
+        ALTER TABLE student_groups_without_year_code_key RENAME TO student_groups;
+      `);
+      const existing = duplicateStudentGroupDatabase.prepare(
+        "SELECT code, year, program FROM student_groups ORDER BY year, code LIMIT 1",
+      ).get();
+      assert(existing, "The duplicate student-group backup fixture needs one group.");
+      duplicateStudentGroupDatabase.prepare(
+        "INSERT INTO student_groups (id, code, year, program) VALUES (?, ?, ?, ?)",
+      ).run(randomUUID(), existing.code, existing.year, existing.program);
+    });
+    removeStudentGroupKey.immediate();
+    duplicateStudentGroupDatabase.pragma("foreign_keys = ON");
+    assert.deepEqual(duplicateStudentGroupDatabase.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(duplicateStudentGroupDatabase.pragma("foreign_key_check"), []);
+  } finally {
+    duplicateStudentGroupDatabase.close();
+  }
+  await requestApi("/api/system-backup", {
+    method: "POST",
+    body: fullRestoreForm(await readFile(duplicateStudentGroupPath), "duplicate-student-group-year-code.sqlite", expectedCurrentToken),
+    expectedStatus: 400,
+  });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterMarker);
+  assert.deepEqual(executeTestDatabase((db) => db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all()), sessionsBeforeRejectedRestore);
+
   // 上传库的表/列形状比较刻意不依赖索引，因此攻击者可以删除 window unique key 后
   // 保存重复自然键，同时仍通过 integrity 与 FK。两张表都必须由 business invariant
   // 在复制 live 数据前拒绝；不能等到 live INSERT 碰 unique 才变成误导性的500。
@@ -3591,6 +4344,42 @@ async function verifyAtomicCycleActions(ids) {
     { courses: started.body.backup.courses, sections: started.body.backup.sections, lessons: started.body.backup.lessons },
     { courses: expectedCyclePayload.courses.length, sections: expectedCyclePayload.sections.length, lessons: expectedCyclePayload.lessons.length },
   );
+
+  // Start 会保留基础资料，但应急快照只保存稳定 student-group ID。此时公开删除若
+  // 放行，未来 Restore 才会失败；因此必须在删除当下返回保护性409且全库零变化。
+  const retainedStudentGroup = (await requestApi("/api/student-groups", { cookie: schedulerCookie })).body
+    .find((group) => group.id === ids.studentGroupId);
+  assert(retainedStudentGroup, "The student group retained after Start was not available for delete protection.");
+  const stateBeforeBackupProtectedDelete = readBusinessSnapshot();
+  const backupProtectedDelete = await requestApi(`/api/student-groups/${ids.studentGroupId}`, {
+    method: "DELETE",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { revision: retainedStudentGroup.revision },
+  });
+  assert.equal(backupProtectedDelete.body.code, "STUDENT_GROUP_IN_USE");
+  assert.match(backupProtectedDelete.body.error, /emergency cycle backup/i);
+  assert.deepEqual(readBusinessSnapshot(), stateBeforeBackupProtectedDelete);
+
+  // Course 与 student group 的备份语义不同：课程及其子树完整包含在 cycle JSON 中，
+  // 当前周期删除不需要也不允许改写旧快照。用空的新周期建立并删除一门课程，逐字段
+  // 比较 backup row 与 snapshot_json 字节，证明 Restore 仍保留原来的完整历史周期。
+  const backupBeforeLiveCourseDelete = stateBeforeBackupProtectedDelete.scheduleBackups[0];
+  const liveCourseWithBackup = (await requestApi("/api/courses", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 201,
+    json: { code: "DELETE_WITH_CYCLE_BACKUP", catalog: "Backup remains immutable", sectionCount: 2 },
+  })).body;
+  await requestApi(`/api/courses/${liveCourseWithBackup.id}`, {
+    method: "DELETE",
+    cookie: schedulerCookie,
+    json: { revision: liveCourseWithBackup.revision },
+  });
+  const backupAfterLiveCourseDelete = readBusinessSnapshot().scheduleBackups[0];
+  assert.deepEqual(backupAfterLiveCourseDelete, backupBeforeLiveCourseDelete);
+  assert.equal(Buffer.from(backupAfterLiveCourseDelete.snapshot_json).equals(Buffer.from(backupBeforeLiveCourseDelete.snapshot_json)), true);
+  assert.equal((await requestApi("/api/cycle", { cookie: schedulerCookie })).body.currentToken, started.body.currentToken);
 
   const stateBeforeEmptyStart = readBusinessSnapshot();
   const emptyStart = await requestApi("/api/cycle", {
@@ -3995,13 +4784,16 @@ async function run() {
   await verifyAuthentication();
   await verifyPostSetupRestartWithoutToken(databasePath);
   await verifyOwnPasswordLifecycleAndFailures();
+  await verifyAccountStatusRevisionCasAndFailures();
   await verifyWorkbookBoundaries();
   await verifyTeachingGroupCountBoundaries();
   await verifyTeachingExplicitZeroAndNoOp();
   await verifyTeachingImportRevisionsAndSourceKeys();
   await verifyTeachingAllocationReimport();
   await verifyTeachingImportFailureBoundaries();
+  await verifyCourseDeletionAndAutomaticSectionResize();
   const relationshipIds = await verifyCrudAndRevisions();
+  await verifyTeachingWeekRuleIsolation();
   await verifyManagementSnapshots(relationshipIds);
   await verifyRulesWorkspaceContracts(relationshipIds);
   await verifyAtomicMasterDataWarnings(relationshipIds);

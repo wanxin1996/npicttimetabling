@@ -1,11 +1,14 @@
 import {
+  CourseChangedError,
+  CourseInUseError,
   CourseSetupBusyError,
   CourseSetupInputError,
   CourseSetupRevisionConflictError,
   CourseSetupStateConflictError,
+  deleteCourse,
   updateCourseSetup,
 } from "@/lib/database";
-import { ROOM_CAPACITY_MAXIMUM } from "@/lib/master-data-input";
+import { parsePositiveRevision, ROOM_CAPACITY_MAXIMUM } from "@/lib/master-data-input";
 import { safeDatabaseFailureResponse } from "@/lib/database-response";
 import { readJsonObject } from "@/lib/request-json";
 import { isOpaqueResourceId } from "@/lib/schedule-input";
@@ -67,5 +70,28 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     if (error instanceof CourseSetupBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
     // trigger、约束、磁盘等未知错误只写入服务器日志；浏览器始终收到固定安全文案。
     return safeDatabaseFailureResponse(error, "Course setup update failed", "The course setup could not be saved. Try again.");
+  }
+}
+
+export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
+  // 删除确认提交稳定课程 ID 与老师实际看到的 revision；损坏 JSON 和超大 body 继续
+  // 由共用的 64 KiB reader 拒绝，不能在数据库入口前分配任意大小的请求内容。
+  const { id } = await context.params;
+  if (!isOpaqueResourceId(id)) return Response.json({ error: "Course id is invalid." }, { status: 400 });
+  const parsed = await readJsonObject(request, "Course deletion must be a JSON object.");
+  if (!parsed.ok) return parsed.response;
+  const revision = parsePositiveRevision(parsed.value.revision, "Course");
+  if (!revision.ok) return Response.json({ error: revision.error }, { status: 400 });
+
+  try {
+    const deleted = deleteCourse(id, revision.value);
+    if (!deleted) return Response.json({ error: "Course not found." }, { status: 404 });
+    return Response.json({ ok: true });
+  } catch (error) {
+    if (error instanceof CourseSetupInputError) return Response.json({ error: error.message }, { status: 400 });
+    if (error instanceof CourseChangedError) return Response.json({ code: "COURSE_CHANGED", error: error.message }, { status: 409 });
+    if (error instanceof CourseInUseError) return Response.json({ code: error.code, error: error.message }, { status: 409 });
+    if (error instanceof CourseSetupBusyError) return Response.json({ error: error.message }, { status: 503, headers: { "Retry-After": "1" } });
+    return safeDatabaseFailureResponse(error, "Course deletion failed", "The course could not be deleted. Try again.");
   }
 }

@@ -15,7 +15,7 @@ import {
 
 // 所有功能页面共用同一个外层布局；View 只决定中间区域显示哪一种排课资料，避免为每张资料表重复维护导航和登录逻辑。
 type View = "Year timetables" | "Personal timetables" | "Rules & issues" | "Cycle" | "Accounts" | "Profile" | "Teachers" | "Student groups" | "Rooms" | "Courses";
-type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boolean };
+type AppUser = { id: string; username: string; isAdmin: boolean; isActive: boolean; revision: number };
 
 type Teacher = {
   id: string;
@@ -79,7 +79,7 @@ type DataManagementWorkspace = { teachers: Teacher[]; groups: StudentGroup[]; ro
 type CourseSectionsWorkspace = { currentCourse: Course; sections: CourseSection[]; allocationVariances: AllocationVariance[] };
 type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; courseCode: string; teacherId: string | null; teacherName: string | null; dayOfWeek: number; startHour: number; durationHours: number; roomId: string | null; roomCode: string | null; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number; revision: number; warnings: string[]; warningSeverity: "High" | "Warning" | "Advisory" | null };
 type TimetableLoadResult = { loaded: boolean; reopenedLesson: ScheduledLesson | null; unscheduledSections: UnscheduledSection[] };
-type UnscheduledSection = { id: string; sectionId: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
+type UnscheduledSection = { id: string; sectionId: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 type ScheduleIssue = { id: string; lessonId: string; sectionId: string; occurrence: number; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type YearTimetableWorkspace = { lessons: ScheduledLesson[]; unscheduledSections: UnscheduledSection[]; issues: ScheduleIssue[]; teachers: Teacher[]; rooms: Room[] };
@@ -98,11 +98,39 @@ class RulesWorkspaceRequestError extends Error {
   }
 }
 
+class ProtectedSessionExpiredError extends Error {
+  constructor() {
+    super("The protected browser session expired.");
+    this.name = "ProtectedSessionExpiredError";
+  }
+}
+
 function requireArrayPayload<T>(value: unknown, message: string): T[] {
   // 服务器聚合响应必须整批到达。只靠 TypeScript 的 `as` 不会检查真实 JSON；若代理
   // 意外返回 HTML、null 或缺少数组，这里会在任何 React state 写入前拒绝整批资料。
   if (!Array.isArray(value)) throw new Error(message);
   return value as T[];
+}
+
+function isAppUserPayload(value: unknown): value is AppUser {
+  // 账号资料会决定管理员专属界面和启停按钮；不能只用 TypeScript `as` 信任网络
+  // JSON。这里逐字段确认最小公开形状，额外字段仍可由后端以后向兼容地加入。
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.id === "string"
+    && candidate.id.length > 0
+    && typeof candidate.username === "string"
+    && candidate.username.length > 0
+    && typeof candidate.isAdmin === "boolean"
+    && typeof candidate.isActive === "boolean"
+    && Number.isSafeInteger(candidate.revision)
+    && Number(candidate.revision) >= 1;
+}
+
+function parseAccountsPayload(value: unknown): AppUser[] {
+  const accounts = requireArrayPayload<unknown>(value, "The accounts response was invalid.");
+  if (!accounts.every(isAppUserPayload)) throw new Error("The accounts response contained an invalid account.");
+  return accounts;
 }
 
 function parseYearTimetableWorkspace(payload: unknown): YearTimetableWorkspace {
@@ -380,11 +408,12 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<TimetableDropTarget | null>(null);
   const positionedLessons = useMemo(() => positionTimetableLessons(lessons), [lessons]);
-  // 先统计每天最多有多少门课同时上课，再给繁忙日期有限的额外宽度；每条并排课程预留约 44px，一天最多增长到 288px。
-  // 三个最宽日期连同时间轴约占 924px，在 1024px 电脑和个人课表内仍给滚动条、边距及像素舍入保留安全空间。
+  // 先统计每天最多有多少门课同时上课，再按每条并排课程至少 112px 扩展当天宽度。
+  // 总表可能同时展示十多班课程；若继续把一天封顶在 288px，每张卡最终只剩十几像素，课程编号也无法辨认。
+  // 因此普通日期仍可同时看到至少三个工作日，极繁忙日期则宁可让内部总表横向滚动，也不再牺牲卡片可读性。
   const laneCountsByDay = timetableDays.map((_, dayIndex) => Math.max(1, ...positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map((item) => item.laneCount)));
   const dayWidthWeights = laneCountsByDay.map((laneCount) => laneCount <= 2 ? 1 : Math.min(2.4, 1 + ((laneCount - 2) * 0.28)));
-  const dayMinimumWidths = laneCountsByDay.map((laneCount) => Math.min(288, Math.max(136, laneCount * 44)));
+  const dayMinimumWidths = laneCountsByDay.map((laneCount) => Math.max(152, laneCount * 112));
   const minimumGridWidth = 48 + dayMinimumWidths.reduce((total, width) => total + width, 0) + (timetableDays.length * 4);
   const timetableColumns = `48px ${dayMinimumWidths.map((width, index) => `minmax(${width}px, ${dayWidthWeights[index]}fr)`).join(" ")}`;
 
@@ -440,9 +469,9 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
 
   return (
     <div>
-      {/* 总表只承诺至少三个连续工作日同屏；繁忙日期可以更宽，其余日期通过明确的左右按钮查看，不再为了五天全塞入而无限缩小课程卡。 */}
+      {/* 普通密度下至少三个连续工作日同屏；极繁忙日期按卡片数量继续扩宽，其余内容通过明确的左右按钮查看。 */}
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-        <span>{onCellDrop ? "At least three days stay visible. Busy days use wider cards; use the arrows for the rest." : "At least three days stay visible; use the arrows to review the rest."}</span>
+        <span>{onCellDrop ? "Cards stay readable. Busy days expand horizontally; use the arrows for the rest." : "Cards stay readable; use the arrows to review the rest."}</span>
         <div className="flex gap-1">
           <button onClick={() => scrollTimetable(-1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable left">← Left</button>
           <button onClick={() => scrollTimetable(1)} className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-700 hover:border-blue-400 hover:text-blue-700" type="button" aria-label="Scroll timetable right">Right →</button>
@@ -517,16 +546,29 @@ export default function Home() {
   const [editingTeacher, setEditingTeacher] = useState<Teacher | null>(null);
   const [editingGroup, setEditingGroup] = useState<StudentGroup | null>(null);
   const [editingRoom, setEditingRoom] = useState<Room | null>(null);
-  // 教师、班级和教室的编辑／状态按钮按“资料页 + 稳定 ID + 动作”保存引用。
-  // 多人冲突关闭旧表单后，画面可精确回到老师刚才使用的入口，而不是把键盘焦点丢到页面开头。
+  // 教师、班级和教室的编辑／状态／删除按钮按“资料页 + 稳定 ID + 动作”保存引用。
+  // 保存或多人冲突刷新后，画面可精确回到老师刚才使用的入口，而不是把键盘焦点丢到页面开头。
   const masterRecordButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const masterDataSearchInputRef = useRef<HTMLInputElement>(null);
+  const dataManagementFormToggleButtonRef = useRef<HTMLButtonElement>(null);
+  const dataManagementFormFirstInputRef = useRef<HTMLInputElement>(null);
+  // 资料刷新会重建表格行，而 finally 才解除按钮的 disabled。一次性目标等两者都
+  // 完成后才恢复焦点；新增资料回到 Add，编辑／启停则按稳定 ID 回到原动作。
+  const pendingMasterRecordFocusRef = useRef<
+    | { kind: "form-toggle" }
+    | { kind: "record"; recordView: "Teachers" | "Student groups" | "Rooms"; recordId: string; action: "edit" | "status" | "delete" }
+    | null
+  >(null);
   const loadErrorRefreshButtonRef = useRef<HTMLButtonElement>(null);
   const [courses, setCourses] = useState<Course[]>([]);
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
   // 每门课程的 Configure 按钮按稳定课程 ID 保存引用。旧设置表单因 409 被关闭后，
   // 键盘焦点会回到同一门课的按钮，而不是掉到页面 body 让老师重新 Tab 很久。
   const courseConfigureButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const courseDeleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  // 删除成功后课程行已经不存在，焦点回到搜索；并发冲突刷新后则按稳定 ID 回到
+  // 最新 Delete 按钮。管理写锁释放前不消费目标，避免聚焦仍 disabled 的旧节点。
+  const pendingCourseDeleteFocusRef = useRef<{ kind: "delete"; courseId: string } | { kind: "search" } | null>(null);
   const courseSearchInputRef = useRef<HTMLInputElement>(null);
   const courseDurationInputRef = useRef<HTMLInputElement>(null);
   const savingCourseSetupIdRef = useRef<string | null>(null);
@@ -598,11 +640,19 @@ export default function Home() {
   // 会在八秒后隐藏，而且错误画面过去只显示固定文案，无法说明写入结果未知或已提交但重载失败。
   const [workspaceLoadErrorDetail, setWorkspaceLoadErrorDetail] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  // 这个 generation 只在身份边界改变时提高，不受普通课表轮询影响。受保护请求在
+  // await 前保存号码；登出／会话撤销后迟到的旧响应不得下载资料、复活缓存或改提示。
+  const authenticatedSessionGeneration = useRef(0);
+  const sessionExpiryNoticeActive = useRef(false);
   // ref 会在同一个事件循环内立即挡住重复 Enter／双击，state 则把按钮显示为进行中。
   // 首次 setup 若发出两次请求，第二个 409 不应盖掉第一笔已经成功的登录结果。
   const authenticationRequestInFlight = useRef(false);
   const [authenticationSubmitting, setAuthenticationSubmitting] = useState(false);
   const [accounts, setAccounts] = useState<AppUser[]>([]);
+  // 启停按钮以稳定账号 ID 保存引用。多人冲突或成功刷新会重建这一行，下一帧仍要
+  // 把键盘焦点送回同一账号的最新按钮，不能让使用者从页面 body 重新寻找入口。
+  const accountStatusButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const pendingAccountStatusFocusRef = useRef<string | null>(null);
   // 完整恢复会覆盖管理员打开页面后发生的任何业务修改，因此页面先保存服务端给出的
   // 当前资料指纹，提交时再由数据库在写锁内核对。这个值只作并发确认，不显示给用户。
   const [systemRestoreCurrentToken, setSystemRestoreCurrentToken] = useState<string | null>(null);
@@ -630,6 +680,7 @@ export default function Home() {
   function setNotice(message: string, tone: NoticeTone = "info") {
     // 保留既有 setNotice("文字") 调用的低风险写法，同时允许关键成功、警告和错误路径显式指定颜色。
     // 显示开关在调用当下打开，序号则保证相同文案也会重新触发计时与辅助技术播报。
+    if (sessionExpiryNoticeActive.current) return;
     setNoticeMessage(message);
     setNoticeTone(tone);
     setShowNoticeToast(true);
@@ -666,9 +717,11 @@ export default function Home() {
     return true;
   }
 
-  function finishManagementMutation(key: string) {
+  function finishManagementMutation(key: string, sessionRequestGeneration: number) {
     // finally 可能在页面状态已经变化后运行；只有仍持有同一把锁的请求可以释放它，
-    // 避免迟到的旧请求意外解锁一笔较新的操作。
+    // 避免迟到的旧请求意外解锁一笔较新的操作。generation 是必填参数，让之后新增
+    // mutation 若忘记绑定身份边界，会直接在 TypeScript 检查时报错，而不是留下竞态。
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
     if (managementMutationKeyRef.current !== key) return;
     managementMutationKeyRef.current = null;
     setManagementMutationKey(null);
@@ -678,6 +731,7 @@ export default function Home() {
     // 写请求已提交后若聚合重载失败，或网络中断令提交结果未知，当前 revision 和关联
     // 清单都不再可信。统一卸载可编辑工作区，只保留 Refresh 入口；绝不能让老师
     // 在旧画面继续保存第二笔资料，或因重复点击把已成功的第一笔误报成冲突。
+    if (sessionExpiryNoticeActive.current || authenticationRequestInFlight.current) return;
     setWorkspaceLoadErrorDetail(message);
     setAuthScreen("load-error");
     setNotice(message, tone);
@@ -692,6 +746,65 @@ export default function Home() {
       else sectionsCloseButtonRef.current?.focus();
     });
   }
+
+  useEffect(() => {
+    // refreshAccounts 会替换整行按钮，而 mutation 的 finally 才解除 disabled。等两项
+    // state 都提交后再消费一次性目标，成功与409冲突都会回到同一账号的最新动作。
+    if (managementMutationKey !== null) return;
+    const accountId = pendingAccountStatusFocusRef.current;
+    if (!accountId) return;
+    pendingAccountStatusFocusRef.current = null;
+    const animationFrame = window.requestAnimationFrame(() => accountStatusButtonRefs.current.get(accountId)?.focus());
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [accounts, managementMutationKey]);
+
+  useEffect(() => {
+    // 新增／编辑表单位于汇总卡和搜索框之后；如果焦点留在页首的 Add／Close 按钮，
+    // 键盘继续 Tab 会绕过整张表单。DOM 挂载后的下一帧直接进入第一个实际输入。
+    if (!showForm || (view === "Courses" && editingCourse)) return;
+    const animationFrame = window.requestAnimationFrame(() => dataManagementFormFirstInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [editingCourse, editingGroup, editingRoom, editingTeacher, showForm, view]);
+
+  useEffect(() => {
+    // React 会在聚合刷新时替换资料对象，管理锁也要到 finally 才解除；因此不能在
+    // fetch 回调里立即 focus 一个仍 disabled 或尚未挂载的按钮。
+    if (managementMutationKey !== null) return;
+    const target = pendingMasterRecordFocusRef.current;
+    if (!target) return;
+    pendingMasterRecordFocusRef.current = null;
+    const animationFrame = window.requestAnimationFrame(() => {
+      if (target.kind === "form-toggle") {
+        dataManagementFormToggleButtonRef.current?.focus();
+        return;
+      }
+      // 键格式与 masterRecordButtonKey 相同；在 Effect 内直接组合可保持依赖稳定，
+      // 避免每次 render 因本地函数身份改变而重复消费一次性焦点目标。
+      const originalButton = masterRecordButtonRefs.current.get(
+        `${target.recordView}:${target.recordId}:${target.action}`,
+      );
+      if (originalButton?.isConnected) originalButton.focus();
+      else masterDataSearchInputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [courses, groups, managementMutationKey, rooms, teachers]);
+
+  useEffect(() => {
+    if (managementMutationKey !== null) return;
+    const target = pendingCourseDeleteFocusRef.current;
+    if (!target) return;
+    pendingCourseDeleteFocusRef.current = null;
+    const animationFrame = window.requestAnimationFrame(() => {
+      if (target.kind === "search") {
+        courseSearchInputRef.current?.focus();
+        return;
+      }
+      const deleteButton = courseDeleteButtonRefs.current.get(target.courseId);
+      if (deleteButton?.isConnected) deleteButton.focus();
+      else courseSearchInputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [courses, managementMutationKey]);
 
   useEffect(() => {
     // 轮询回调每五秒才执行一次，不能依赖建立 interval 时捕获的旧 editingLesson。
@@ -801,13 +914,14 @@ export default function Home() {
   const filteredUnscheduledSections = useMemo(() => {
     // 待排搜索同时检查课程、教师、学生班级和专业；下拉菜单提供精确筛选，覆盖分配工作中最常见的查找方式。
     const normalizedQuery = unscheduledQuery.trim().toLowerCase();
-    const selectedGroupCode = groups.find((group) => group.id === unscheduledGroupId)?.code;
     return unscheduledSections.filter((section) => {
-      const sectionGroups = groups.filter((group) => section.studentGroups.includes(group.code));
-      const searchableText = [section.label, section.teacherName ?? "", section.staffType ?? "", ...section.studentGroups, ...sectionGroups.map((group) => group.program)].join(" ").toLowerCase();
+      // 同一个 AAA_01 可以分别属于 Year 1、2、3，筛选必须使用稳定 ID；若按 code
+      // 反查，会把另一个年级的同名班级及其 programme 错误混入当前待排卡片。
+      const sectionGroups = groups.filter((group) => section.studentGroupIds.includes(group.id));
+      const searchableText = [section.label, section.teacherName ?? "", section.staffType ?? "", ...section.studentGroups, ...sectionGroups.flatMap((group) => [group.program, `Year ${group.year}`])].join(" ").toLowerCase();
       return (!normalizedQuery || searchableText.includes(normalizedQuery))
         && (unscheduledStaffType === "All" || section.staffType === unscheduledStaffType)
-        && (!selectedGroupCode || section.studentGroups.includes(selectedGroupCode))
+        && (!unscheduledGroupId || section.studentGroupIds.includes(unscheduledGroupId))
         && (!unscheduledProgram || sectionGroups.some((group) => group.program === unscheduledProgram));
     });
   }, [groups, unscheduledGroupId, unscheduledProgram, unscheduledQuery, unscheduledSections, unscheduledStaffType]);
@@ -820,7 +934,14 @@ export default function Home() {
   // Inspector 只要仍有一张编辑表单，就要求老师先明确 Close／Save／Return，再离开
   // 年级或打开另一张课；这既保护已标记 stale 的草稿，也避免普通未保存选择被拖动
   // 或导航静默清除。真正保存期间还会冻结所有相关入口直到请求完成。
-  const workspaceNavigationLocked = editingLesson !== null || lessonMutation !== null || placingSessionKey !== null || savingCourseSetupId !== null || managementMutationKey !== null;
+  const workspaceNavigationLocked = editingLesson !== null
+    || placingSection !== null
+    || candidateSection !== null
+    || candidatesLoading
+    || lessonMutation !== null
+    || placingSessionKey !== null
+    || savingCourseSetupId !== null
+    || managementMutationKey !== null;
 
   function setActiveView(nextView: View) {
     // 恢复指纹只对管理员实际审阅的 Accounts 页面有效。任何导航离开都会同步
@@ -833,11 +954,19 @@ export default function Home() {
     // React 在登录画面出现时不会卸载这个组件。退出、会话过期或完整恢复后必须显式
     // 清除管理员账号清单、恢复指纹和上一个账号读取的业务资料；否则下一位普通排课
     // 账号登录后会先看到旧 Accounts 页面或旧课表，直到后台刷新才被替换。
+    authenticatedSessionGeneration.current += 1;
     visibleWorkspaceRefreshNumber.current += 1;
     activeManualTimetableRefreshNumber.current = null;
     setWorkspaceLoadErrorDetail(null);
     setCurrentUser(null);
     setAccounts([]);
+    accountStatusButtonRefs.current.clear();
+    pendingAccountStatusFocusRef.current = null;
+    masterRecordButtonRefs.current.clear();
+    pendingMasterRecordFocusRef.current = null;
+    courseConfigureButtonRefs.current.clear();
+    courseDeleteButtonRefs.current.clear();
+    pendingCourseDeleteFocusRef.current = null;
     setSystemRestoreCurrentToken(null);
     setTeachers([]);
     setGroups([]);
@@ -856,25 +985,74 @@ export default function Home() {
     setEditingLesson(null);
     setLessonDraftIsStale(false);
     setPlacingSection(null);
+    // 身份边界切换时同步释放上一账号的所有即时锁。旧请求的 finally 还会核对
+    // 原 session generation 和操作 identity，因此不会误清新账号后来建立的同名锁。
+    placingSessionKeyRef.current = null;
+    setPlacingSessionKey(null);
+    lessonMutationIdRef.current = null;
+    setLessonMutation(null);
+    managementMutationKeyRef.current = null;
+    setManagementMutationKey(null);
+    savingCourseSetupIdRef.current = null;
+    setSavingCourseSetupId(null);
+    savingSectionIdRef.current = null;
+    setSavingSectionId(null);
     clearCandidateSlotWorkspace();
     setPersonalOwnerId("");
     setPersonalLessons([]);
+    setLastSyncedAt(null);
     setUnavailableWindows([]);
     setScheduleIssues([]);
     setRuleSettings([]);
     setCurrentCycle(null);
+    setDownloadingBackup(false);
+    setRestoringBackup(false);
+    setImporting(false);
     setShowForm(false);
     setShowTimetableInspector(false);
     setShowUnscheduledDrawer(true);
     setView("Year timetables");
   }, [clearCandidateSlotWorkspace]);
 
+  const expireSessionAndReturnToLogin = useCallback((message: string) => {
+    // 会话失效属于身份边界变化，不是普通资料读取失败。先废弃所有请求 generation
+    // 并清空上一账号缓存，再显示登录页；直接更新 notice state 可让这个 callback
+    // 保持稳定，供全页面状态轮询使用而不会每次 render 重建 interval。
+    sessionExpiryNoticeActive.current = true;
+    clearSessionBoundWorkspace();
+    setAuthScreen("login");
+    setNoticeMessage(message);
+    setNoticeTone("error");
+    setShowNoticeToast(true);
+    setNoticeRequestNumber((current) => current + 1);
+  }, [clearSessionBoundWorkspace]);
+
+  function protectedResponseEndedSession(response: Response, message: string, requestGeneration?: number) {
+    // 受保护接口已经明确返回401时，不必等下一次五秒状态轮询。调用方必须在解析
+    // 业务正文或写任何 workspace state 前检查本 helper，并立即结束当前流程。
+    if (requestGeneration !== undefined && !sessionRequestIsCurrent(requestGeneration)) return true;
+    if (response.status !== 401) return false;
+    expireSessionAndReturnToLogin(message);
+    return true;
+  }
+
+  function sessionRequestIsCurrent(requestGeneration: number) {
+    // 收到 Response 只证明 fetch 的第一阶段结束；解析正文、冲突重载和 catch 都可能
+    // 在老师登出并重新登录后才继续。每个异步 continuation 都用同一号码复核，确保
+    // 上一账号的迟到请求不能冻结、改提示或写入新账号刚加载的 workspace。
+    return requestGeneration === authenticatedSessionGeneration.current;
+  }
+
   function openView(nextView: View) {
     // 切换资料页面时清除上一页专用的编辑对象、筛选和课程详情，防止旧状态被错误带到新的表格。
-    if (editingLessonRef.current || lessonMutationIdRef.current || placingSessionKeyRef.current || savingCourseSetupIdRef.current || managementMutationKeyRef.current) {
+    if (editingLessonRef.current || placingSection || candidateSection || candidatesLoading
+      || lessonMutationIdRef.current || placingSessionKeyRef.current
+      || savingCourseSetupIdRef.current || managementMutationKeyRef.current) {
       setNotice(editingLessonRef.current
         ? "Close or save the open Inspector lesson before leaving this workspace."
-        : "A save is still in progress. Wait for it to finish before leaving this workspace.", "warning");
+        : placingSection || candidateSection || candidatesLoading
+          ? "Close the open placement or candidate panel before leaving this workspace."
+          : "A save is still in progress. Wait for it to finish before leaving this workspace.", "warning");
       return;
     }
     // 同步导航也要废弃此前已发出的 Rules／Cycle／Accounts／Personal 读取；否则它们
@@ -907,8 +1085,12 @@ export default function Home() {
     // 可选 signal 只由首次排课链传入，使 POST 成功后的工作区刷新也受同一个30秒总时限保护。
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const workspaceResponse = await fetch(`/api/schedule/workspace?year=${year}`, { signal });
+      if (protectedResponseEndedSession(workspaceResponse, "Your session expired. Sign in again before opening a timetable.", sessionRequestGeneration)) {
+        return { loaded: false, reopenedLesson: null, unscheduledSections: [] };
+      }
       if (!workspaceResponse.ok) {
         // 已有更新的显式请求取代本次请求时，旧失败也不能覆盖新请求的提示。
         if (requestNumber === visibleWorkspaceRefreshNumber.current) setNotice("The year timetable could not be loaded.", "error");
@@ -919,6 +1101,7 @@ export default function Home() {
       // 保留清楚的聚合响应类型，再立即执行运行时数组验证；`as` 只帮助 TypeScript，
       // 下一行才负责拒绝 200 HTML、null 或缺字段 JSON，且发生在任何 state 写入之前。
       const workspace = await workspaceResponse.json() as YearTimetableWorkspace;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return { loaded: false, reopenedLesson: null, unscheduledSections: [] };
       parseYearTimetableWorkspace(workspace);
       const nextLessons = workspace.lessons;
       const nextUnscheduledSections = workspace.unscheduledSections;
@@ -950,6 +1133,7 @@ export default function Home() {
       return { loaded: true, reopenedLesson, unscheduledSections: nextUnscheduledSections };
     } catch {
       // 断网或服务器重启时 fetch 会直接抛错；保持当前画面并允许老师稍后重试。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return { loaded: false, reopenedLesson: null, unscheduledSections: [] };
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
         setNotice("The year timetable could not be loaded. Check the connection and try again.", "error");
       }
@@ -964,10 +1148,18 @@ export default function Home() {
 
   function openLessonEditor(lesson: ScheduledLesson) {
     // 所有课程卡统一从这里打开 Inspector，确保上一门课的“远端已改变”标记
-    // 不会错误带到新课程，也让 ref 在下一次轮询前就拥有最新对象。
+    // 不会错误带到新课程，也让 ref 在下一次轮询前就拥有最新对象。课程卡会在
+    // 编辑期间被停用；若不先安排新焦点，浏览器会把焦点丢到 body，键盘老师
+    // 既不知道 Inspector 已打开，也要重新 Tab 很久才能进入表单。
+    const inspectorWasAlreadyOpen = showTimetableInspector;
+    if (!inspectorWasAlreadyOpen) pendingInspectorFocusRef.current = "lesson-day";
     editingLessonRef.current = lesson;
     setLessonDraftIsStale(false);
     setEditingLesson(lesson);
+    setShowTimetableInspector(true);
+    if (inspectorWasAlreadyOpen) {
+      window.requestAnimationFrame(() => lessonEditorDaySelectRef.current?.focus());
+    }
   }
 
   function closeLessonEditor() {
@@ -1003,10 +1195,11 @@ export default function Home() {
     });
   }
 
-  async function reloadChangedLesson(lessonSnapshot: ScheduledLesson, conflictMessage: string, reopenLesson: boolean) {
+  async function reloadChangedLesson(lessonSnapshot: ScheduledLesson, conflictMessage: string, reopenLesson: boolean, sessionRequestGeneration: number) {
     // PATCH、拖动和 Return to tray 共用同一刷新流程。只有聚合 workspace 的五份年级
     // 资料全部读取成功才说“最新版本已载入”；网络失败时不能给出错误保证。
     const timetableResult = await openTimetable(timetableYear, undefined, reopenLesson ? lessonSnapshot : undefined);
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
     if (!timetableResult.loaded) {
       window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
       setNotice(`${conflictMessage} The latest timetable could not be reloaded. Refresh the page before continuing.`, "error");
@@ -1063,11 +1256,13 @@ export default function Home() {
     // 复用主动刷新流程，让它提高 generation 并暂时挡住后台轮询。否则 Rules 页上一批
     // 已经在途的五秒请求可能晚于本次点击返回，再把旧问题资料写回新打开的年级页面。
     const requestNumber = visibleWorkspaceRefreshNumber.current + 1;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const timetableResult = await openTimetable(issue.primaryYear, undefined, {
       id: issue.lessonId,
       sectionId: issue.sectionId,
       occurrence: issue.occurrence,
     });
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
     // openTimetable 会同步领取上面的号码；等待期间若导航或写入又提高 generation，
     // 这次旧点击不得再写提示、打开 Inspector 或覆盖后来操作的焦点。
     if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
@@ -1084,7 +1279,6 @@ export default function Home() {
     clearCandidateSlotWorkspace();
     // 从问题清单进入编辑时，先收起左侧待排抽屉，给右侧 Inspector 和五天总表留下足够空间。
     setShowUnscheduledDrawer(false);
-    setShowTimetableInspector(true);
     setActiveView("Year timetables");
     setShowForm(false);
     setNotice(`${issue.sectionLabel} opened from the issue list.`, "info");
@@ -1093,12 +1287,14 @@ export default function Home() {
     requestAnimationFrame(() => document.getElementById("lesson-editor")?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" }));
   }
 
-  async function fetchRulesWorkspace(): Promise<RulesWorkspace> {
+  const fetchRulesWorkspace = useCallback(async (sessionRequestGeneration?: number): Promise<RulesWorkspace> => {
     // 服务端在一个 SQLite DEFERRED 快照内读取窗口、问题、规则开关和教师。浏览器只
     // 发一个 GET，避免写入刚好夹在多个旧接口之间，拼出数据库从未同时存在的 Rules 页面。
     const response = await fetch("/api/rules/workspace", { cache: "no-store" });
+    if (sessionRequestGeneration !== undefined && sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
     if (!response.ok) throw new RulesWorkspaceRequestError(response.status);
     const payload: unknown = await response.json();
+    if (sessionRequestGeneration !== undefined && sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
     if (typeof payload !== "object" || payload === null) throw new Error("The rules workspace response was invalid.");
     const candidate = payload as Record<string, unknown>;
     if (!Array.isArray(candidate.unavailableWindows)
@@ -1113,7 +1309,7 @@ export default function Home() {
       ruleSettings: candidate.ruleSettings as RuleSetting[],
       teachers: candidate.teachers as Teacher[],
     };
-  }
+  }, []);
 
   function applyRulesWorkspace(workspace: RulesWorkspace) {
     // React 会把同一异步 continuation 内的 state 写入合并为一次提交。四份数组只能从
@@ -1127,14 +1323,15 @@ export default function Home() {
     setLastSyncedAt(new Date());
   }
 
-  async function refreshRulesWorkspace(mutationKey: string): Promise<RulesWorkspace | null> {
+  async function refreshRulesWorkspace(mutationKey: string, sessionRequestGeneration: number): Promise<RulesWorkspace | null> {
     // beginManagementMutation 已使写入前的轮询失效；写入得到明确结果后再领取一个更高
     // generation。除了号码仍最新，还必须确认原 mutation key 仍持锁，防止迟到的旧写入
     // 刷新在登出、冻结或未来另一笔操作之后应用 state 并给出虚假的成功提示。
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
     try {
-      const workspace = await fetchRulesWorkspace();
+      const workspace = await fetchRulesWorkspace(sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return null;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current
         || managementMutationKeyRef.current !== mutationKey) return null;
       applyRulesWorkspace(workspace);
@@ -1146,18 +1343,20 @@ export default function Home() {
     }
   }
 
-  async function reloadRulesWorkspaceAfterConflict(mutationKey: string, message: string, failureMessage: string) {
+  async function reloadRulesWorkspaceAfterConflict(mutationKey: string, message: string, failureMessage: string, sessionRequestGeneration: number) {
     // 409 表示服务端已经明确拒绝本次旧基线写入，结果并非未知；仍须在持锁期间取得
     // 一个完整新快照，才能再次开放按钮。若新快照也读不到，旧窗口／规则状态已知过期，
     // 必须冻结整页，不能只显示 toast 后让老师继续从旧值发出第二笔 CAS。
     try {
-      const workspace = await refreshRulesWorkspace(mutationKey);
+      const workspace = await refreshRulesWorkspace(mutationKey, sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (!workspace) throw new Error("The conflict refresh was superseded.");
       setNotice(message, "warning");
       return true;
     } catch (error) {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
-        handleRulesMutationUnauthorized();
+        handleRulesMutationUnauthorized(sessionRequestGeneration);
         return false;
       }
       freezeManagementWorkspace(failureMessage, "error");
@@ -1165,12 +1364,12 @@ export default function Home() {
     }
   }
 
-  function handleRulesMutationUnauthorized() {
+  function handleRulesMutationUnauthorized(sessionRequestGeneration: number) {
     // 401 明确表示本次写入未通过会话保护；先清掉上一账号的全部业务资料，再切回登录页。
     // finally 稍后只负责释放当前 mutation key，不能让过期会话继续停留在可编辑 Rules 画面。
-    clearSessionBoundWorkspace();
-    setAuthScreen("login");
-    setNotice("Your session expired. Please sign in again before changing rules.", "error");
+    if (sessionRequestIsCurrent(sessionRequestGeneration)) {
+      expireSessionAndReturnToLogin("Your session expired. Please sign in again before changing rules.");
+    }
   }
 
   async function openRules() {
@@ -1183,8 +1382,10 @@ export default function Home() {
     }
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
-      const workspace = await fetchRulesWorkspace();
+      const workspace = await fetchRulesWorkspace(sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
       applyRulesWorkspace(workspace);
       setActiveView("Rules & issues");
@@ -1192,11 +1393,10 @@ export default function Home() {
       return true;
     } catch (error) {
       // 断网时保留老师当前页面和资料，不留下未处理的 Promise，也不误显示空白规则页。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
         if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
-          clearSessionBoundWorkspace();
-          setAuthScreen("login");
-          setNotice("Your session expired. Please sign in again.", "error");
+          expireSessionAndReturnToLogin("Your session expired. Please sign in again.");
           return false;
         }
         setNotice("Rules and timetable issues could not be loaded. Check the connection and try again.", "error");
@@ -1217,8 +1417,10 @@ export default function Home() {
     }
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch("/api/cycle");
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before opening cycle recovery.", sessionRequestGeneration)) return false;
       if (!response.ok) {
         if (requestNumber === visibleWorkspaceRefreshNumber.current) {
           setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
@@ -1226,6 +1428,7 @@ export default function Home() {
         return false;
       }
       const nextCycle = await response.json() as CycleStatus;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
       setCurrentCycle(nextCycle);
       setActiveView("Cycle");
@@ -1233,6 +1436,7 @@ export default function Home() {
       return true;
     } catch {
       // 新周期属于高风险页面；读取失败时继续停留原页面，绝不能显示过期或不完整的清空状态。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
         setNotice("Cycle status could not be loaded. Check the connection and try again.", "error");
       }
@@ -1250,11 +1454,13 @@ export default function Home() {
       // 个人课表属于历史排课查询，因此停用教师仍必须可见；首次打开时则优先选择 Active 教师。
       ? [...teachers].sort((left, right) => Number(right.status === "Active") - Number(left.status === "Active"))
       : kind === "Room"
-        ? rooms.filter((room) => room.status === "Active")
+        // 教室停用也只阻止未来分配，不会删除历史 lesson。与教师采用相同顺序，
+        // 让老师仍能查询停用教室的既有占用，而默认优先选择 Active 教室。
+        ? [...rooms].sort((left, right) => Number(right.status === "Active") - Number(left.status === "Active"))
         : groups;
     const ownerId = requestedOwnerId || availableOwners[0]?.id || "";
     if (!ownerId) {
-      const missingOwner = kind === "Teacher" ? "teacher" : kind === "Room" ? "active room" : "student group";
+      const missingOwner = kind === "Teacher" ? "teacher" : kind === "Room" ? "room" : "student group";
       setNotice(`Add at least one ${missingOwner} before opening a personal timetable.`, "warning");
       return;
     }
@@ -1264,8 +1470,10 @@ export default function Home() {
     }
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch(`/api/schedule/personal?kind=${kind}&ownerId=${encodeURIComponent(ownerId)}`);
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before opening a personal timetable.", sessionRequestGeneration)) return;
       if (!response.ok) {
         if (requestNumber === visibleWorkspaceRefreshNumber.current) {
           setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
@@ -1276,6 +1484,7 @@ export default function Home() {
         await response.json(),
         "The personal timetable response was invalid.",
       );
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
       // 只有新课表完整到达后才更新选择器和页面，失败时保留老师仍可阅读的上一版画面。
       setPersonalKind(kind);
@@ -1284,6 +1493,7 @@ export default function Home() {
       setActiveView("Personal timetables");
       setShowForm(false);
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
         setNotice("The personal timetable could not be loaded. Check the connection and try again.", "error");
       }
@@ -1312,6 +1522,7 @@ export default function Home() {
       placementTimedOut = true;
       requestController.abort();
     }, 30_000);
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch("/api/schedule/lessons", {
         method: "POST",
@@ -1319,17 +1530,22 @@ export default function Home() {
         body: JSON.stringify(input),
         signal: requestController.signal,
       });
-      const body = await response.json() as ScheduledLesson & { code?: string; error?: string };
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before placing a lesson.", sessionRequestGeneration)) return null;
+      const body = await response.json() as ScheduledLesson & { changed?: boolean; code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return null;
 
       if (response.status === 409 && body.code === "LESSON_ALREADY_SCHEDULED") {
         // 另一账号已先完成同一课次时，必须重新读取总表和待排清单；
         // 否则旧卡片仍留在待排区，老师很容易继续重复操作或误判保存位置。
         const timetableResult = await openTimetable(timetableYear, requestController.signal);
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return null;
         window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
         const conflictMessage = body.error ?? "This weekly session has already been placed by another scheduler.";
-        setNotice(timetableResult.loaded
-          ? `${conflictMessage} The latest timetable has been reloaded; review its saved position before continuing.`
-          : `${conflictMessage} The latest timetable could not be reloaded. Refresh the page before continuing.`, timetableResult.loaded ? "warning" : "error");
+        if (!timetableResult.loaded) {
+          freezeManagementWorkspace(`${conflictMessage} The latest timetable could not be reloaded, so the previous workspace is no longer safe to edit. Refresh before continuing.`);
+          return null;
+        }
+        setNotice(`${conflictMessage} The latest timetable has been reloaded; review its saved position before continuing.`, "warning");
         return null;
       }
       if (!response.ok) {
@@ -1339,19 +1555,27 @@ export default function Home() {
       // 成功后的完整刷新仍属于同一次保存：锁必须保持到旧待排卡消失，
       // 否则慢速网络下老师可能再次拖动仍显示在页面上的同一课次。
       const timetableResult = await openTimetable(timetableYear, requestController.signal);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return null;
       window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
-      return { lesson: body, timetableReloaded: timetableResult.loaded };
+      if (!timetableResult.loaded) {
+        freezeManagementWorkspace(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before making another change.`);
+        return null;
+      }
+      return { lesson: body, timetableReloaded: true };
     } catch {
       // 网络异常时服务器是否收到请求并不确定，不能鼓励老师立刻重复点击；
       // 明确要求先刷新，借由唯一键确认该课次究竟是否已经保存。
-      setNotice(placementTimedOut
-        ? "The placement request timed out. Refresh the timetable before trying this session again."
-        : "The placement result could not be confirmed. Refresh the timetable before trying this session again.", "error");
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return null;
+      freezeManagementWorkspace(placementTimedOut
+        ? "The placement request timed out and its result is unknown. Refresh before trying this session again."
+        : "The placement result could not be confirmed. Refresh before trying this session again.", "error");
       return null;
     } finally {
       window.clearTimeout(requestTimeout);
-      placingSessionKeyRef.current = null;
-      setPlacingSessionKey(null);
+      if (sessionRequestIsCurrent(sessionRequestGeneration) && placingSessionKeyRef.current === sessionKey) {
+        placingSessionKeyRef.current = null;
+        setPlacingSessionKey(null);
+      }
     }
   }
 
@@ -1372,6 +1596,7 @@ export default function Home() {
       }
       lessonMutationIdRef.current = lesson.id;
       setLessonMutation({ id: lesson.id, action: "move" });
+      const sessionRequestGeneration = authenticatedSessionGeneration.current;
       try {
         // 移动课程只改变星期和时间，但 PATCH 接口会整体保存班次资料；因此必须把拖动开始时
         // 的教师、教室和学生班级原样带回，避免移动误清关联或绕过并发 revision。
@@ -1387,15 +1612,17 @@ export default function Home() {
             revision: lesson.revision,
           }),
         });
+        if (protectedResponseEndedSession(response, "Your session expired. Sign in again before moving a lesson.", sessionRequestGeneration)) return;
         const body = await response.json() as ScheduledLesson & { code?: string; error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (response.status === 409 && body.code === "SCHEDULED_LESSON_CHANGED") {
-          await reloadChangedLesson(lesson, body.error ?? "This lesson was changed by another scheduler.", false);
+          await reloadChangedLesson(lesson, body.error ?? "This lesson was changed by another scheduler.", false, sessionRequestGeneration);
           return;
         }
         if (response.status === 404) {
           // 课程已经被另一位老师退回待排区时，按“尝试重开”流程刷新；找不到
           // lesson 后统一流程会打开最新待排清单并给出准确去向，而不是留下空 Inspector。
-          await reloadChangedLesson(lesson, body.error ?? "This lesson is no longer scheduled.", true);
+          await reloadChangedLesson(lesson, body.error ?? "This lesson is no longer scheduled.", true, sessionRequestGeneration);
           return;
         }
         if (!response.ok) {
@@ -1404,8 +1631,9 @@ export default function Home() {
         }
         setEditingLesson(null);
         const timetableResult = await openTimetable(timetableYear);
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (!timetableResult.loaded) {
-          setNotice(`${body.sectionLabel} was moved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
+          freezeManagementWorkspace(`${body.sectionLabel} was moved, but the latest timetable could not be loaded. Refresh before continuing.`);
           return;
         }
         revealSavedLesson(body.id);
@@ -1414,20 +1642,24 @@ export default function Home() {
           body.warnings.length ? "warning" : "success",
         );
       } catch {
-        setNotice("The move result could not be confirmed. Refresh the timetable before moving this lesson again.", "error");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        freezeManagementWorkspace("The move result could not be confirmed. Refresh before moving this lesson again.", "error");
       } finally {
-        lessonMutationIdRef.current = null;
-        setLessonMutation(null);
+        if (sessionRequestIsCurrent(sessionRequestGeneration) && lessonMutationIdRef.current === lesson.id) {
+          lessonMutationIdRef.current = null;
+          setLessonMutation(null);
+        }
       }
       return;
     }
     const sectionId = event.dataTransfer.getData("text/plain");
     const occurrence = Number(event.dataTransfer.getData("application/x-unscheduled-occurrence"));
     if (!sectionId || ![1, 2].includes(occurrence)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const placement = await requestLessonPlacement({ sectionId, occurrence, dayOfWeek, startHour, roomId: null });
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
     if (!placement) return;
     const body = placement.lesson;
-    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
     revealSavedLesson(body.id);
     setNotice(
       body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully. Assign its room next.`,
@@ -1446,9 +1678,12 @@ export default function Home() {
     setEditingLesson(null);
     setCandidateSlots([]);
     setCandidatesLoading(true);
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch(`/api/course-sections/${encodeURIComponent(sectionId)}/candidates?occurrence=${occurrence}`);
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before checking candidate slots.", sessionRequestGeneration)) return;
       const body = await response.json() as { error?: string; slots?: CandidateSlot[] };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!candidateSlotRequestIsCurrent(requestNumber, sectionId, occurrence)) return;
       if (!response.ok) {
         // 教师缺失或停用等资料问题不应伪装成“没有空位”；返回原排课表单后，老师仍可手工放课并接受警告。
@@ -1463,6 +1698,7 @@ export default function Home() {
         body.slots.length ? "success" : "warning",
       );
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!candidateSlotRequestIsCurrent(requestNumber, sectionId, occurrence)) return;
       // 网络中断也要恢复面板和 loading 状态，不能把 Inspector 永久留在 Checking 状态。
       clearCandidateSlotWorkspace();
@@ -1479,10 +1715,11 @@ export default function Home() {
     const { sectionId, occurrence } = candidateSection;
     const currentIdentity = candidateSectionIdentityRef.current;
     if (currentIdentity?.sectionId !== sectionId || currentIdentity.occurrence !== occurrence || candidatesLoading) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const placement = await requestLessonPlacement({ sectionId, occurrence, dayOfWeek: slot.dayOfWeek, startHour: slot.startHour, roomId: slot.roomId });
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
     if (!placement) return;
     const body = placement.lesson;
-    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
     revealSavedLesson(body.id);
     setNotice(
       body.warnings.length ? `${body.sectionLabel} changed while placing and now has warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed in ${slot.roomCode} with no warnings.`,
@@ -1495,6 +1732,7 @@ export default function Home() {
     event.preventDefault();
     if (!placingSection) return;
     const data = new FormData(event.currentTarget);
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const placement = await requestLessonPlacement({
       sectionId: placingSection.sectionId,
       occurrence: placingSection.occurrence,
@@ -1502,9 +1740,9 @@ export default function Home() {
       startHour: Number(data.get("startHour")),
       roomId: String(data.get("roomId") ?? "") || null,
     });
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
     if (!placement) return;
     const body = placement.lesson;
-    if (!placement.timetableReloaded) return setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
     revealSavedLesson(body.id);
     setNotice(
       body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} placed successfully.`,
@@ -1528,6 +1766,7 @@ export default function Home() {
     const data = new FormData(event.currentTarget);
     // getAll 会保留每个复选框的值；没有勾选时传空数组，服务器就会把该班次明确设为“学生班级待分配”。
     const studentGroupIds = data.getAll("studentGroupIds").map(String);
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch(`/api/schedule/lessons/${encodeURIComponent(lessonAtSubmit.id)}`, {
         method: "PATCH",
@@ -1541,15 +1780,17 @@ export default function Home() {
           revision: lessonAtSubmit.revision,
         }),
       });
-      const body = await response.json() as ScheduledLesson & { code?: string; error?: string };
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before saving a lesson.", sessionRequestGeneration)) return;
+      const body = await response.json() as ScheduledLesson & { changed?: boolean; code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (response.status === 409 && body.code === "SCHEDULED_LESSON_CHANGED") {
-        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson was changed by another scheduler.", true);
+        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson was changed by another scheduler.", true, sessionRequestGeneration);
         return;
       }
       if (response.status === 404) {
         // 404 通常表示另一位老师已经 Return to tray。传入 true 不是强行重开，
         // 而是让刷新流程确认课程确实缺失后展示最新待排区和正确焦点。
-        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson is no longer scheduled.", true);
+        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson is no longer scheduled.", true, sessionRequestGeneration);
         return;
       }
       if (!response.ok) {
@@ -1563,21 +1804,36 @@ export default function Home() {
       setEditingLesson(null);
       setLessonDraftIsStale(false);
       const timetableResult = await openTimetable(timetableYear);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
       if (!timetableResult.loaded) {
-        setNotice(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${body.sectionLabel} was saved, but the latest timetable could not be loaded. Refresh before continuing.`);
         return;
       }
       revealSavedLesson(body.id);
-      setNotice(
-        body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} updated successfully.`,
-        body.warnings.length ? "warning" : "success",
-      );
+      if (body.changed === false) {
+        // API 已证明这次请求没有执行 UPDATE 或 warning 刷新。界面也应诚实说明
+        // “资料本来就相同”，不能把 no-op 说成一次实际更新。
+        setNotice(
+          body.warnings.length
+            ? `${body.sectionLabel} already matched these choices. Existing warnings: ${body.warnings.join(", ")}.`
+            : `${body.sectionLabel} already matched these choices. No changes were needed.`,
+          body.warnings.length ? "warning" : "info",
+        );
+      } else {
+        setNotice(
+          body.warnings.length ? `${body.sectionLabel} saved with warnings: ${body.warnings.join(", ")}.` : `${body.sectionLabel} updated successfully.`,
+          body.warnings.length ? "warning" : "success",
+        );
+      }
     } catch {
-      setNotice("The lesson update result could not be confirmed. Refresh the timetable before trying again.", "error");
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      freezeManagementWorkspace("The lesson update result could not be confirmed. Refresh before trying again.", "error");
     } finally {
-      lessonMutationIdRef.current = null;
-      setLessonMutation(null);
+      if (sessionRequestIsCurrent(sessionRequestGeneration) && lessonMutationIdRef.current === lessonAtSubmit.id) {
+        lessonMutationIdRef.current = null;
+        setLessonMutation(null);
+      }
     }
   }
 
@@ -1591,11 +1847,14 @@ export default function Home() {
     const lessonAtSubmit = editingLesson;
     lessonMutationIdRef.current = lessonAtSubmit.id;
     setLessonMutation({ id: lessonAtSubmit.id, action: "return" });
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch(`/api/schedule/lessons/${encodeURIComponent(lessonAtSubmit.id)}?revision=${lessonAtSubmit.revision}`, { method: "DELETE" });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before returning a lesson.", sessionRequestGeneration)) return;
       const body = await response.json() as { code?: string; error?: string; ok?: boolean };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (response.status === 409 && body.code === "SCHEDULED_LESSON_CHANGED") {
-        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson was changed by another scheduler.", true);
+        await reloadChangedLesson(lessonAtSubmit, body.error ?? "This lesson was changed by another scheduler.", true, sessionRequestGeneration);
         return;
       }
       if (!response.ok) {
@@ -1610,9 +1869,10 @@ export default function Home() {
       // section + occurrence。服务端会在一个快照里读取总表与待排区；前端再按旧 ID／
       // 逻辑课次寻找替代记录，不能无条件宣称课程仍在待排区。
       const timetableResult = await openTimetable(timetableYear, undefined, lessonAtSubmit);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!timetableResult.loaded) {
         window.requestAnimationFrame(() => inspectorCloseButtonRef.current?.focus());
-        setNotice(`${lessonAtSubmit.sectionLabel} was returned, but the latest timetable could not be loaded. Refresh before continuing.`, "warning");
+        freezeManagementWorkspace(`${lessonAtSubmit.sectionLabel} was returned, but the latest timetable could not be loaded. Refresh before continuing.`);
         return;
       }
 
@@ -1641,10 +1901,13 @@ export default function Home() {
         setNotice(`${lessonAtSubmit.sectionLabel} was returned, but it is no longer in Year ${timetableYear}; another scheduler may have changed its year or cycle. The current year has been reloaded.`, "warning");
       }
     } catch {
-      setNotice("The return-to-tray result could not be confirmed. Refresh the timetable before trying again.", "error");
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      freezeManagementWorkspace("The return-to-tray result could not be confirmed. Refresh before trying again.", "error");
     } finally {
-      lessonMutationIdRef.current = null;
-      setLessonMutation(null);
+      if (sessionRequestIsCurrent(sessionRequestGeneration) && lessonMutationIdRef.current === lessonAtSubmit.id) {
+        lessonMutationIdRef.current = null;
+        setLessonMutation(null);
+      }
     }
   }
 
@@ -1656,15 +1919,18 @@ export default function Home() {
     const data = new FormData(form);
     const mutationKey = `rule-window-add:${kind}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch("/api/unavailability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ownerId: String(data.get("ownerId") ?? ""), dayOfWeek: Number(data.get("dayOfWeek")), startHour: Number(data.get("startHour")), endHour: Number(data.get("endHour")) }) });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 401) {
-          handleRulesMutationUnauthorized();
+          handleRulesMutationUnauthorized(sessionRequestGeneration);
           return;
         }
         const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (response.status === 409 && body.code === "UNAVAILABLE_WINDOW_EXISTS") {
           await reloadRulesWorkspaceAfterConflict(
             mutationKey,
@@ -1672,6 +1938,7 @@ export default function Home() {
               ? `${body.error} The latest rules workspace has been loaded.`
               : "That unavailable time was already saved, possibly by another scheduler. The latest rules workspace has been loaded.",
             "That unavailable time already exists, but the latest rules workspace could not be loaded. Refresh before making another change.",
+            sessionRequestGeneration,
           );
           return;
         }
@@ -1679,22 +1946,24 @@ export default function Home() {
         return;
       }
       committed = true;
-      const workspace = await refreshRulesWorkspace(mutationKey);
+      const workspace = await refreshRulesWorkspace(mutationKey, sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!workspace) throw new Error("The saved rules refresh was superseded.");
       form.reset();
       setNotice(`${kind} unavailable time saved.`, "success");
     } catch (error) {
       // 写入响应成功后，会话仍可能恰好在 aggregate 重载前过期。401 是明确的认证
       // 状态，不应误报成资料未知；清空上一账号资料并回登录页，下一次登录会完整重载。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
-        handleRulesMutationUnauthorized();
+        handleRulesMutationUnauthorized(sessionRequestGeneration);
         return;
       }
       freezeManagementWorkspace(committed
         ? `${kind} unavailable time was saved, but its latest result could not be loaded. Refresh before continuing.`
         : "The unavailable-time request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -1702,23 +1971,27 @@ export default function Home() {
     // 删除不可用时段会立即影响之后的排课检查；已有课程的 warning 会在重新打开或编辑时根据最新规则刷新。
     const mutationKey = `rule-window-remove:${window.id}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       // 数据库 ID 的公开契约允许不透明字符串；URLSearchParams 会安全编码 &、#、? 等
       // 字符，避免直接插值把一个 ID 拆成额外查询参数或截断真正的删除目标。
       const search = new URLSearchParams({ id: window.id, kind: window.kind });
       const response = await fetch(`/api/unavailability?${search.toString()}`, { method: "DELETE" });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 401) {
-          handleRulesMutationUnauthorized();
+          handleRulesMutationUnauthorized(sessionRequestGeneration);
           return;
         }
         const body = await response.json().catch(() => ({})) as { error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (response.status === 404) {
           await reloadRulesWorkspaceAfterConflict(
             mutationKey,
             `${window.ownerLabel} unavailable time was already removed by another scheduler. The latest rules workspace has been loaded.`,
             `${window.ownerLabel} unavailable time was removed by another scheduler, but the latest rules workspace could not be loaded. Refresh before making another change.`,
+            sessionRequestGeneration,
           );
           return;
         }
@@ -1726,19 +1999,21 @@ export default function Home() {
         return;
       }
       committed = true;
-      const workspace = await refreshRulesWorkspace(mutationKey);
+      const workspace = await refreshRulesWorkspace(mutationKey, sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!workspace) throw new Error("The removed rules refresh was superseded.");
       setNotice(`${window.ownerLabel} unavailable time removed.`, "success");
     } catch (error) {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
-        handleRulesMutationUnauthorized();
+        handleRulesMutationUnauthorized(sessionRequestGeneration);
         return;
       }
       freezeManagementWorkspace(committed
         ? "The unavailable time was removed, but the latest rules page could not be loaded. Refresh before continuing."
         : "The remove request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -1746,6 +2021,7 @@ export default function Home() {
     // 每次只保存一个规则开关，随后重新载入本页；服务端会用新政策重新计算全部问题，让开关影响立即可见。
     const mutationKey = `rule-setting:${rule.key}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch("/api/rule-settings", {
@@ -1755,12 +2031,14 @@ export default function Home() {
         // 已先切换时返回 typed 409，而不是让迟到请求静默覆盖对方的新选择。
         body: JSON.stringify({ key: rule.key, expectedEnabled: rule.enabled, enabled: !rule.enabled }),
       });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 401) {
-          handleRulesMutationUnauthorized();
+          handleRulesMutationUnauthorized(sessionRequestGeneration);
           return;
         }
         const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (response.status === 409 && body.code === "RULE_SETTING_CHANGED") {
           await reloadRulesWorkspaceAfterConflict(
             mutationKey,
@@ -1768,6 +2046,7 @@ export default function Home() {
               ? `${body.error} The latest rules workspace has been loaded; review the current setting before trying again.`
               : `${rule.label} was changed by another scheduler. The latest rules workspace has been loaded; review it before trying again.`,
             `${rule.label} was changed by another scheduler, but the latest rules workspace could not be loaded. Refresh before making another change.`,
+            sessionRequestGeneration,
           );
           return;
         }
@@ -1775,19 +2054,21 @@ export default function Home() {
         return;
       }
       committed = true;
-      const workspace = await refreshRulesWorkspace(mutationKey);
+      const workspace = await refreshRulesWorkspace(mutationKey, sessionRequestGeneration);
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!workspace) throw new Error("The changed rules refresh was superseded.");
       setNotice(`${rule.label} ${rule.enabled ? "disabled" : "enabled"}.`, "success");
     } catch (error) {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
-        handleRulesMutationUnauthorized();
+        handleRulesMutationUnauthorized(sessionRequestGeneration);
         return;
       }
       freezeManagementWorkspace(committed
         ? `${rule.label} was changed, but the latest rules page could not be loaded. Refresh before continuing.`
         : "The rule-setting request was interrupted, so its result is unknown. Refresh the rules page before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -1802,26 +2083,39 @@ export default function Home() {
     }
   }
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (sessionRequestGeneration: number) => {
     // 服务端在一个 SQLite DEFERRED 快照内读取四张清单。浏览器只发一个请求，
     // 因此 Teaching Members 导入不能夹在教师和课程响应之间制造“不可能版本”。
-    const response = await fetch("/api/data-management/workspace", { cache: "no-store" });
-    if (!response.ok) throw new Error("Could not load the master-data workspace.");
-    const workspace = await response.json() as DataManagementWorkspace;
-    if (!Array.isArray(workspace.teachers) || !Array.isArray(workspace.groups)
-      || !Array.isArray(workspace.rooms) || !Array.isArray(workspace.courses)) {
-      throw new Error("The master-data workspace response was incomplete.");
+    try {
+      const response = await fetch("/api/data-management/workspace", { cache: "no-store" });
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      if (response.status === 401) {
+        expireSessionAndReturnToLogin("Your session expired. Sign in again before loading master data.");
+        throw new ProtectedSessionExpiredError();
+      }
+      if (!response.ok) throw new Error("Could not load the master-data workspace.");
+      const workspace = await response.json() as DataManagementWorkspace;
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      if (!Array.isArray(workspace.teachers) || !Array.isArray(workspace.groups)
+        || !Array.isArray(workspace.rooms) || !Array.isArray(workspace.courses)) {
+        throw new Error("The master-data workspace response was incomplete.");
+      }
+      return workspace;
+    } catch (error) {
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      throw error;
     }
-    return workspace;
-  }, []);
+  }, [expireSessionAndReturnToLogin]);
 
   const loadData = useCallback(async () => {
     // 每次显式资料刷新领取全局 generation；导航、登出或较新的读取都会提高它。
     // 慢响应即使最后成功，也只能返回 null，绝不能把旧清单或旧 revision 倒灌到新页面。
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
-      const workspace = await fetchData();
+      const workspace = await fetchData(sessionRequestGeneration);
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
       if (requestNumber !== visibleWorkspaceRefreshNumber.current) return null;
       setWorkspaceLoadErrorDetail(null);
       setTeachers(workspace.teachers);
@@ -1847,6 +2141,56 @@ export default function Home() {
     }
   }, [fetchData]);
 
+  const loadAuthenticatedWorkspaces = useCallback(async () => {
+    // 登录成功后默认显示年级总表，因此“基础资料已载入”还不够。四张资料清单与
+    // 当前年级五份工作区都完整到达后才允许把 authScreen 切成 ready；否则首次
+    // Year 请求碰到短暂500或损坏 JSON 时，真实有资料的数据库会被伪装成一张
+    // 可编辑的空总表。两批请求仍各自使用服务端一致快照，浏览器不会应用半份资料。
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
+    if (!await loadData()) return false;
+    if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+
+    const requestNumber = ++visibleWorkspaceRefreshNumber.current;
+    activeManualTimetableRefreshNumber.current = requestNumber;
+    try {
+      const response = await fetch("/api/schedule/workspace?year=1", { cache: "no-store" });
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      if (response.status === 401) {
+        expireSessionAndReturnToLogin("Your session expired. Sign in again before loading the timetable workspace.");
+        throw new ProtectedSessionExpiredError();
+      }
+      if (!response.ok) throw new Error("The initial year workspace could not be loaded.");
+      const workspace = parseYearTimetableWorkspace(await response.json());
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      if (requestNumber !== visibleWorkspaceRefreshNumber.current) return false;
+
+      setWorkspaceLoadErrorDetail(null);
+      setTimetableYear(1);
+      setLessons(workspace.lessons);
+      setUnscheduledSections(workspace.unscheduledSections);
+      setScheduleIssues(workspace.issues);
+      // 年级工作区里的教师和教室与 lessons 来自同一 SQLite 快照；使用这一份
+      // 作为默认排课页的下拉资料，避免课程卡与选择器跨提交版本。
+      setTeachers(workspace.teachers);
+      setRooms(workspace.rooms);
+      setView("Year timetables");
+      setShowForm(false);
+      editingLessonRef.current = null;
+      setEditingLesson(null);
+      setLessonDraftIsStale(false);
+      setPlacingSection(null);
+      clearCandidateSlotWorkspace();
+      return true;
+    } catch (error) {
+      if (sessionRequestGeneration !== authenticatedSessionGeneration.current) throw new ProtectedSessionExpiredError();
+      throw error;
+    } finally {
+      if (activeManualTimetableRefreshNumber.current === requestNumber) {
+        activeManualTimetableRefreshNumber.current = null;
+      }
+    }
+  }, [clearCandidateSlotWorkspace, expireSessionAndReturnToLogin, loadData]);
+
   useEffect(() => {
     // 页面启动时先检查登录状态，再请求受保护的业务资料；未登录浏览器不会先下载教师或课程数据。
     void (async () => {
@@ -1858,21 +2202,23 @@ export default function Home() {
         if (status.setupRequired) {
           setWorkspaceLoadErrorDetail(null);
           setAuthScreen("setup");
+          setNotice("Create the first administrator account to open the scheduling workspace.", "info");
           return;
         }
         if (!status.user) {
           setWorkspaceLoadErrorDetail(null);
           setAuthScreen("login");
+          setNotice("Sign in with your scheduler account to load timetable data.", "info");
           return;
         }
 
-        // 必须先完整取得四张基础清单，之后才开放可编辑工作区。若这里先设 ready，
-        // 首次读取失败会把真正有资料的数据库伪装成四张可编辑空表。
-        if (!await loadData()) throw new Error("The initial master-data workspace refresh was superseded.");
+        // 默认首页是 Year 1；基础资料和这一张总表必须同时准备完成后才开放编辑。
+        if (!await loadAuthenticatedWorkspaces()) throw new Error("The initial authenticated workspace refresh was superseded.");
         setCurrentUser(status.user);
         setAuthScreen("ready");
         setNotice("Local data is saved and ready for scheduling setup.", "success");
-      } catch {
+      } catch (error) {
+        if (error instanceof ProtectedSessionExpiredError) return;
         setCurrentUser(null);
         setAuthScreen("load-error");
         setNotice("The secure session or scheduling data could not be loaded. Refresh before making changes.", "error");
@@ -1880,7 +2226,46 @@ export default function Home() {
         setIsLoading(false);
       }
     })();
-  }, [loadData]);
+  }, [loadAuthenticatedWorkspaces]);
+
+  const authenticatedUserId = currentUser?.id ?? null;
+
+  useEffect(() => {
+    // Year／Personal／Rules 会读取业务资料，但 Teachers、Courses、Accounts、Cycle 和
+    // Profile 也必须及时发现管理员停用或完整恢复撤销了当前会话。独立状态轮询覆盖
+    // 所有 ready 页面；临时500/断网只保留当前画面，只有明确 user=null 或身份改变
+    // 才清空上一账号缓存并返回登录页。
+    if (authScreen !== "ready" || !authenticatedUserId) return;
+    let active = true;
+    let requestInFlight = false;
+
+    async function verifyCurrentSession() {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const response = await fetch("/api/auth/status", { cache: "no-store" });
+        if (!active || !response.ok) return;
+        const payload = await response.json() as unknown;
+        if (!active || typeof payload !== "object" || payload === null || !("user" in payload)) return;
+        const nextUser = (payload as { user: unknown }).user;
+        if (nextUser === null || (isAppUserPayload(nextUser) && nextUser.id !== authenticatedUserId)) {
+          expireSessionAndReturnToLogin("Your session ended or changed in another browser. Sign in again to continue.");
+        }
+      } catch {
+        // 状态端点短暂不可用并不能证明会话已撤销；保留当前完整资料，下一个 tick
+        // 再核实。受保护写接口仍会由服务端拒绝，不能因网络抖动误登出老师。
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
+    void verifyCurrentSession();
+    const interval = window.setInterval(() => void verifyCurrentSession(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [authScreen, authenticatedUserId, expireSessionAndReturnToLogin]);
 
   useEffect(() => {
     // 老师查看实时资料时，每五秒刷新当前功能所需数据；其他账号的修改会自动出现，不需要手工刷新整页。
@@ -1916,18 +2301,15 @@ export default function Home() {
         // 未处理的 Promise rejection 或把半套 payload 写进页面。
         if (active && requestNumber === visibleWorkspaceRefreshNumber.current
           && error instanceof RulesWorkspaceRequestError && error.status === 401) {
-          clearSessionBoundWorkspace();
-          setAuthScreen("login");
-          setNotice("Your session expired. Please sign in again.", "error");
+          expireSessionAndReturnToLogin("Your session expired. Please sign in again.");
         }
         return;
       }
       try {
         if (!active || responses.length === 0) return;
         if (responses.some((response) => response.status === 401)) {
-          clearSessionBoundWorkspace();
-          setAuthScreen("login");
-          return setNotice("Your session expired. Please sign in again.", "error");
+          expireSessionAndReturnToLogin("Your session expired. Please sign in again.");
+          return;
         }
         if (responses.some((response) => !response.ok)) return;
         const payloads: unknown[] = await Promise.all(responses.map((response) => response.json()));
@@ -1981,12 +2363,16 @@ export default function Home() {
     void refreshVisibleWorkspace();
     const interval = window.setInterval(() => void refreshVisibleWorkspace(), 5000);
     return () => { active = false; window.clearInterval(interval); };
-  }, [authScreen, clearSessionBoundWorkspace, personalKind, personalOwnerId, timetableYear, view]);
+  }, [authScreen, expireSessionAndReturnToLogin, fetchRulesWorkspace, personalKind, personalOwnerId, timetableYear, view]);
 
   async function submitAuthentication(event: FormEvent<HTMLFormElement>) {
     // 首次管理员建立和日常登录共用账号密码；部署令牌只发送给 setup 接口，普通登录请求绝不携带它。
     event.preventDefault();
     if (authenticationRequestInFlight.current) return;
+    // 老师已开始新的显式认证尝试后，登录／设置结果可以正常更新提示；上一会话的
+    // 所有请求仍持有旧 authenticatedSessionGeneration，迟到时会在响应边界被丢弃。
+    authenticatedSessionGeneration.current += 1;
+    sessionExpiryNoticeActive.current = false;
     authenticationRequestInFlight.current = true;
     setAuthenticationSubmitting(true);
     const data = new FormData(event.currentTarget);
@@ -2032,13 +2418,14 @@ export default function Home() {
         }
       }
       try {
-        // 登录接口成功只代表会话已建立；基础资料全部读取成功后才开放编辑页面，
-        // 否则断网会让真实数据库看起来像一套可修改的空资料。
-        if (!await loadData()) throw new Error("The signed-in master-data workspace refresh was superseded.");
+        // 登录接口成功只代表会话已建立；基础资料和默认 Year 1 工作区全部读取
+        // 成功后才开放编辑页面，否则断网会把真实资料伪装成可修改的空总表。
+        if (!await loadAuthenticatedWorkspaces()) throw new Error("The signed-in workspace refresh was superseded.");
         setCurrentUser(authenticatedUser);
         setAuthScreen("ready");
         setNotice(`Signed in as ${authenticatedUser.username}.`, "success");
-      } catch {
+      } catch (error) {
+        if (error instanceof ProtectedSessionExpiredError) return;
         // 会话已经建立时不能再说“登录失败”；错误画面保留刷新入口，但绝不渲染空资料表。
         setCurrentUser(null);
         setAuthScreen("load-error");
@@ -2054,11 +2441,12 @@ export default function Home() {
         const status = await statusResponse.json() as { user?: AppUser | null };
         if (!status.user || typeof status.user.username !== "string") throw new Error("No confirmed session is available.");
         try {
-          if (!await loadData()) throw new Error("The recovered-session master-data workspace refresh was superseded.");
+          if (!await loadAuthenticatedWorkspaces()) throw new Error("The recovered-session workspace refresh was superseded.");
           setCurrentUser(status.user);
           setAuthScreen("ready");
           setNotice(`Signed in as ${status.user.username}. The original response was interrupted, but the session was confirmed.`, "warning");
-        } catch {
+        } catch (error) {
+          if (error instanceof ProtectedSessionExpiredError) return;
           setCurrentUser(null);
           setAuthScreen("load-error");
           setNotice("A session was established, but scheduling data could not be loaded. Refresh before making changes.", "warning");
@@ -2076,9 +2464,12 @@ export default function Home() {
 
   async function logout() {
     // 登出不仅清除浏览器 Cookie，也在服务端删除会话记录，复制旧 Cookie 也不能继续访问资料。
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch("/api/auth/logout", { method: "POST" });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         setNotice(body.error ?? "Sign out could not be completed. Try again.", "error");
         return;
@@ -2088,6 +2479,7 @@ export default function Home() {
       setNotice("Signed out.", "success");
     } catch {
       // 服务端没有确认撤销会话前保留当前画面，避免看似退出、刷新后又自动登录。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setNotice("Sign out could not reach the server. Check the connection and try again.", "error");
     }
   }
@@ -2101,31 +2493,45 @@ export default function Home() {
     }
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     setSystemRestoreCurrentToken(null);
     try {
       const statusResponse = await fetch("/api/system-backup/status", { cache: "no-store" });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (!statusResponse.ok) {
+        if (statusResponse.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before opening Accounts.");
+          return false;
+        }
         if (requestNumber === visibleWorkspaceRefreshNumber.current) {
           const body = await statusResponse.json().catch(() => ({})) as { error?: string };
+          if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
           setNotice(body.error ?? "The current system data could not be reviewed for restore.", "error");
         }
         return false;
       }
       const status = await statusResponse.json() as { currentToken?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (typeof status.currentToken !== "string" || !/^[0-9a-f]{64}$/.test(status.currentToken)) {
         throw new Error("The restore status response was invalid.");
       }
 
       const accountsResponse = await fetch("/api/auth/accounts", { cache: "no-store" });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (!accountsResponse.ok) {
+        if (accountsResponse.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before opening Accounts.");
+          return false;
+        }
         if (requestNumber === visibleWorkspaceRefreshNumber.current) {
           const body = await accountsResponse.json().catch(() => ({})) as { error?: string };
+          if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
           setNotice(body.error ?? "Only the administrator can manage accounts.", "error");
         }
         return false;
       }
-      const nextAccounts = await accountsResponse.json() as AppUser[];
-      if (!Array.isArray(nextAccounts)) throw new Error("The accounts response was invalid.");
+      const nextAccounts = parseAccountsPayload(await accountsResponse.json());
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return false;
 
       setAccounts(nextAccounts);
@@ -2136,6 +2542,7 @@ export default function Home() {
     } catch {
       // 两份资料只有全部读取和解析成功后才应用；断网时保留原页面，也绝不启用
       // 缺少状态确认的破坏性恢复表单。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (requestNumber === visibleWorkspaceRefreshNumber.current) {
         setSystemRestoreCurrentToken(null);
         setNotice("Accounts and restore status could not be loaded. Check the connection and try again.", "error");
@@ -2148,15 +2555,26 @@ export default function Home() {
     }
   }
 
-  async function refreshAccountsAfterMutation() {
+  async function refreshAccountsAfterMutation(requestNumber: number, sessionRequestGeneration: number) {
     // 账号写入已确认后只刷新清单，不再次执行页面导航，也不在 helper 内写提示；
-    // 调用方才能准确区分“写入失败”和“已写入但清单刷新失败”。
-    const response = await fetch("/api/auth/accounts");
+    // 调用方才能准确区分“写入失败”和“已写入但清单刷新失败”。请求还要绑定
+    // beginManagementMutation 后的 generation；会话轮询一旦清空页面，迟到的200
+    // 账号清单也只能丢弃，不能在登录页复活上一位管理员的缓存。
+    const response = await fetch("/api/auth/accounts", { cache: "no-store" });
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)) throw new ProtectedSessionExpiredError();
+    if (response.status === 401) throw new ProtectedSessionExpiredError();
     if (!response.ok) throw new Error("Accounts could not be refreshed.");
-    setAccounts(await response.json() as AppUser[]);
+    const nextAccounts = parseAccountsPayload(await response.json());
+    if (!sessionRequestIsCurrent(sessionRequestGeneration)
+      || requestNumber !== visibleWorkspaceRefreshNumber.current) throw new ProtectedSessionExpiredError();
+    setAccounts(nextAccounts);
     // 账号本身属于完整恢复会覆盖的系统状态；任何账号写入后，旧恢复指纹即使仍在
     // React state 中也不能继续使用。管理员需重新进入本页审阅并取得新指纹。
     setSystemRestoreCurrentToken(null);
+  }
+
+  function restoreAccountStatusFocus(userId: string) {
+    pendingAccountStatusFocusRef.current = userId;
   }
 
   async function createAccount(event: FormEvent<HTMLFormElement>) {
@@ -2168,28 +2586,43 @@ export default function Home() {
     const username = String(data.get("username") ?? "");
     const mutationKey = "account-create";
     if (!beginManagementMutation(mutationKey)) return;
+    const requestNumber = visibleWorkspaceRefreshNumber.current;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch("/api/auth/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password: String(data.get("password") ?? "") }) });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
       const body = await response.json().catch(() => ({})) as { error?: string; username?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
       if (!response.ok) {
+        if (response.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before creating an account.");
+          return;
+        }
         setNotice(body.error ?? "Account could not be created.", "error");
         return;
       }
       committed = true;
       form.reset();
       try {
-        await refreshAccountsAfterMutation();
+        await refreshAccountsAfterMutation(requestNumber, sessionRequestGeneration);
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(`${body.username ?? username} account created.`, "success");
-      } catch {
-        setNotice(`${body.username ?? username} account was created, but the latest account list could not be loaded. Refresh before making another change.`, "warning");
+      } catch (error) {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+        if (error instanceof ProtectedSessionExpiredError) {
+          expireSessionAndReturnToLogin("Your session expired after the account request. Sign in again to verify the latest account list.");
+          return;
+        }
+        freezeManagementWorkspace(`${body.username ?? username} account was created, but the latest account list could not be loaded. Refresh before making another change.`);
       }
     } catch {
-      setNotice(committed
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+      freezeManagementWorkspace(committed
         ? "The account was created, but its latest details could not be loaded. Refresh before continuing."
-        : "The create-account request was interrupted, so its result is unknown. Refresh the account list before retrying.", "warning");
+        : "The create-account request was interrupted, so its result is unknown. Refresh the page before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2199,16 +2632,17 @@ export default function Home() {
     const data = new FormData(event.currentTarget);
     const mutationKey = "password-change";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch("/api/auth/password", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currentPassword: String(data.get("currentPassword") ?? ""), newPassword: String(data.get("newPassword") ?? "") }) });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         // 401 表示会话已在请求到达前失效；PASSWORD_CHANGED 则表示旧密码校验后
         // 管理员重置／停用先提交。两者都不能继续展示上一账号缓存的课表和 Accounts 资料。
         if (response.status === 401 || (response.status === 409 && body.code === "PASSWORD_CHANGED")) {
-          clearSessionBoundWorkspace();
-          setAuthScreen("login");
-          setNotice(body.error ?? "Your account access changed. Sign in again before changing your password.", "error");
+          expireSessionAndReturnToLogin(body.error ?? "Your account access changed. Sign in again before changing your password.");
           return;
         }
         setNotice(body.error ?? "Password could not be changed.", "error");
@@ -2220,11 +2654,12 @@ export default function Home() {
     } catch {
       // 响应中断时密码可能已经提交且所有会话可能已经撤销。回到登录页比继续显示
       // 受保护资料更安全；老师可先尝试新密码，再决定是否需要重试。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       clearSessionBoundWorkspace();
       setAuthScreen("login");
       setNotice("The password-change result is unknown because the response was interrupted. Try signing in with the new password before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2232,27 +2667,63 @@ export default function Home() {
     // 停用账号会保留记录和审计关联，但阻止之后登录；保存后立即刷新清单，让管理员确认最新状态。
     const mutationKey = `account-status:${account.id}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const requestNumber = visibleWorkspaceRefreshNumber.current;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
-      const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive }) });
+      const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", userId: account.id, isActive: !account.isActive, expectedRevision: account.revision }) });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
       if (!response.ok) {
-        const body = await response.json().catch(() => ({})) as { error?: string };
+        const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+        if (response.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before changing an account.");
+          return;
+        }
+        if (response.status === 409 && body.code === "ACCOUNT_CHANGED") {
+          // 另一管理员已先提交时，旧按钮必须失效并立刻换成服务器最新版；否则用户
+          // 可能根据过期的 Active 标签再次操作，造成一连串可避免的冲突。
+          try {
+            await refreshAccountsAfterMutation(requestNumber, sessionRequestGeneration);
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+            // ACCOUNT_CHANGED 已是稳定 typed code；页面用一条完整文案说明“谁改变、
+            // 已经重载、下一步是什么”，避免把服务端提示和客户端后缀重复朗读两次。
+            setNotice(`${account.username} was changed by another administrator. The latest account list is now loaded; review it before trying again.`, "warning");
+            restoreAccountStatusFocus(account.id);
+          } catch (error) {
+            if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+            if (error instanceof ProtectedSessionExpiredError) {
+              expireSessionAndReturnToLogin("Your session expired while refreshing the changed account. Sign in again.");
+              return;
+            }
+            freezeManagementWorkspace(`${account.username} was changed by another administrator, but the latest account list could not be loaded. Refresh before making another change.`);
+          }
+          return;
+        }
         setNotice(body.error ?? "Account status could not be changed.", "error");
         return;
       }
       committed = true;
       try {
-        await refreshAccountsAfterMutation();
+        await refreshAccountsAfterMutation(requestNumber, sessionRequestGeneration);
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(`${account.username} ${account.isActive ? "deactivated" : "activated"}.`, "success");
-      } catch {
-        setNotice(`${account.username} was ${account.isActive ? "deactivated" : "activated"}, but the latest account list could not be loaded. Refresh before making another change.`, "warning");
+        restoreAccountStatusFocus(account.id);
+      } catch (error) {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+        if (error instanceof ProtectedSessionExpiredError) {
+          expireSessionAndReturnToLogin("Your session expired after the account request. Sign in again to verify the latest account list.");
+          return;
+        }
+        freezeManagementWorkspace(`${account.username} was ${account.isActive ? "deactivated" : "activated"}, but the latest account list could not be loaded. Refresh before making another change.`);
       }
     } catch {
-      setNotice(committed
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+      freezeManagementWorkspace(committed
         ? `${account.username} status changed, but the latest account list could not be loaded. Refresh before continuing.`
-        : "The account-status request was interrupted, so its result is unknown. Refresh the account list before retrying.", "warning");
+        : "The account-status request was interrupted, so its result is unknown. Refresh the page before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2264,19 +2735,43 @@ export default function Home() {
     const data = new FormData(form);
     const mutationKey = "account-password-reset";
     if (!beginManagementMutation(mutationKey)) return;
+    const requestNumber = visibleWorkspaceRefreshNumber.current;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
+    let committed = false;
     try {
       const response = await fetch("/api/auth/accounts", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "resetPassword", userId: String(data.get("userId") ?? ""), password: String(data.get("password") ?? "") }) });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
       const body = await response.json().catch(() => ({})) as { error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
       if (!response.ok) {
+        if (response.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before resetting a password.");
+          return;
+        }
         setNotice(body.error ?? "Password could not be reset.", "error");
         return;
       }
-      form.reset();
-      setNotice("Password reset. Existing sessions for that account were signed out.", "success");
+      committed = true;
+      try {
+        await refreshAccountsAfterMutation(requestNumber, sessionRequestGeneration);
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        form.reset();
+        setNotice("Password reset. Existing sessions for that account were signed out.", "success");
+      } catch (error) {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+        if (error instanceof ProtectedSessionExpiredError) {
+          expireSessionAndReturnToLogin("Your session expired after the password-reset request. Sign in again to verify the account.");
+          return;
+        }
+        freezeManagementWorkspace("The password was reset, but the latest account list could not be loaded. Refresh before making another change.");
+      }
     } catch {
-      setNotice("The password-reset response was interrupted, so its result is unknown. Ask the scheduler to try the new password before resetting it again.", "warning");
+      if (!sessionRequestIsCurrent(sessionRequestGeneration) || requestNumber !== visibleWorkspaceRefreshNumber.current) return;
+      freezeManagementWorkspace(committed
+        ? "The password was reset, but its latest account details could not be loaded. Refresh before continuing."
+        : "The password-reset response was interrupted, so its result is unknown. Refresh before resetting it again.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2284,17 +2779,22 @@ export default function Home() {
     // 由当前页面请求备份文件，权限或完整性失败时可显示易读提示，而不是跳转到只含 JSON 错误的新页面。
     setDownloadingBackup(true);
     setNotice("Creating and checking the full system backup...", "info");
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch("/api/system-backup", { cache: "no-store" });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before downloading a backup.", sessionRequestGeneration)) return;
       if (!response.ok) {
         const body = await response.json();
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         return setNotice(body.error ?? "The full system backup could not be downloaded.", "error");
       }
 
       // 服务端提供安全的日期文件名；浏览器建立临时下载地址并触发下载，点击发出后立即撤销地址，避免长期占用内存。
       const disposition = response.headers.get("Content-Disposition") ?? "";
       const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "timetabling-backup.sqlite";
-      const objectUrl = URL.createObjectURL(await response.blob());
+      const backupBlob = await response.blob();
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      const objectUrl = URL.createObjectURL(backupBlob);
       const downloadLink = document.createElement("a");
       downloadLink.href = objectUrl;
       downloadLink.download = filename;
@@ -2305,10 +2805,11 @@ export default function Home() {
       setNotice(`Full system backup downloaded as ${filename}.`, "success");
     } catch {
       // 本地服务断开或网络请求中断时保持页面可继续操作，并明确说明不能把这次请求当作成功备份。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setNotice("The full system backup could not be downloaded. Check the connection and try again.", "error");
     } finally {
       // 无论成功、接口拒绝还是网络异常，最终都重新启用下载按钮，避免一次失败后按钮永久锁住。
-      setDownloadingBackup(false);
+      if (sessionRequestIsCurrent(sessionRequestGeneration)) setDownloadingBackup(false);
     }
   }
 
@@ -2324,6 +2825,7 @@ export default function Home() {
     }
     const mutationKey = "system-restore";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const formData = new FormData(form);
     // beginManagementMutation 会立即让 React state 中的旧指纹失效；这里使用事件开始时
     // 捕获的稳定值完成本次已确认请求，后续点击则必须重新打开 Accounts。
@@ -2332,7 +2834,9 @@ export default function Home() {
     setNotice("Validating the backup and saving the current system state...", "info");
     try {
       const response = await fetch("/api/system-backup", { method: "POST", body: formData });
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { error?: string; code?: string; safetyBackupFilename?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 409 && body.code === "SYSTEM_STATE_CHANGED") {
           // 另一账号在管理员审阅后又提交了资料。清掉文件和确认项，强制重新查看
@@ -2366,13 +2870,14 @@ export default function Home() {
     } catch {
       // 网络中断不能推断恢复成功或失败。立即关闭可编辑工作区并清除确认，要求重新
       // 登录检查实际资料后再决定下一步，不能保留旧画面并鼓励盲目重试。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       form.reset();
       clearSessionBoundWorkspace();
       setAuthScreen("login");
       setNotice("The restore response was interrupted. Sign in again and verify the current system before retrying.", "warning");
     } finally {
-      setRestoringBackup(false);
-      finishManagementMutation(mutationKey);
+      if (sessionRequestIsCurrent(sessionRequestGeneration)) setRestoringBackup(false);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2385,13 +2890,16 @@ export default function Home() {
     if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.", "warning");
     const mutationKey = "cycle-start";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     // 把老师打开页面时看到的周期指纹交给服务器；若另一账号已经修改课程，
     // 服务器会要求刷新复核，而不是把老师没有确认过的新资料直接清空。
     try {
       const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", confirmation: String(data.get("confirmation") ?? ""), currentToken: currentCycle?.currentToken ?? "" }) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before starting a new cycle.", sessionRequestGeneration)) return;
       if (!response.ok) {
         const body = await response.json().catch(() => ({})) as { error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(body.error ?? "A new cycle could not be started.", "error");
         return;
       }
@@ -2399,6 +2907,7 @@ export default function Home() {
       // 提示也只能说“已提交但未能刷新”，不能诱导老师重复清空。
       committed = true;
       const body = await response.json() as CycleStatus;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setCurrentCycle(body);
       setLessons([]);
       setUnscheduledSections([]);
@@ -2407,14 +2916,17 @@ export default function Home() {
       form.reset();
       try {
         if (!await loadData()) throw new Error("The new-cycle master-data workspace refresh was superseded.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.", "success");
-      } catch {
+      } catch (error) {
+        if (error instanceof ProtectedSessionExpiredError || !sessionRequestIsCurrent(sessionRequestGeneration)) return;
         // 清空已经提交后，旧课程清单不再可信。切到不可编辑错误画面，防止老师在
         // 重新载入前继续操作已从数据库删除的记录。
         setAuthScreen("load-error");
         setNotice("The new cycle was started, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (committed) setCurrentCycle(null);
       // 连接中断时无法判断清空事务是否已经提交；保留可编辑旧画面会比要求刷新更
       // 危险，因此无论是否已读到2xx都先冻结工作区。
@@ -2423,7 +2935,7 @@ export default function Home() {
         ? "The new cycle was started, but its latest status could not be loaded. Refresh before continuing."
         : "The new-cycle response was interrupted, so the result is unknown. Refresh the cycle status before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2436,41 +2948,48 @@ export default function Home() {
     if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.", "warning");
     const mutationKey = "cycle-restore";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     // 同时提交页面显示的备份 ID 与当前周期指纹，防止多人操作时恢复了另一份新备份，
     // 或覆盖另一位老师在本页面打开后刚保存的课程工作。
     try {
       const response = await fetch("/api/cycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restore", confirmation: String(data.get("confirmation") ?? ""), backupId: currentCycle?.backup?.id ?? "", currentToken: currentCycle?.currentToken ?? "" }) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before restoring a cycle.", sessionRequestGeneration)) return;
       if (!response.ok) {
         const body = await response.json().catch(() => ({})) as { error?: string };
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(body.error ?? "The emergency backup could not be restored.", "error");
         return;
       }
       committed = true;
       const body = await response.json() as CycleStatus;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setCurrentCycle(body);
       form.reset();
       try {
         if (!await loadData()) throw new Error("The restored-cycle master-data workspace refresh was superseded.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice("The last emergency cycle backup was restored.", "success");
-      } catch {
+      } catch (error) {
+        if (error instanceof ProtectedSessionExpiredError || !sessionRequestIsCurrent(sessionRequestGeneration)) return;
         // 恢复会替换整套课程资料；刷新失败时隐藏旧可编辑清单，直到完整页面重载。
         setAuthScreen("load-error");
         setNotice("The emergency cycle backup was restored, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (committed) setCurrentCycle(null);
       setAuthScreen("load-error");
       setNotice(committed
         ? "The emergency cycle backup was restored, but its latest status could not be loaded. Refresh before continuing."
         : "The restore response was interrupted, so the result is unknown. Refresh the cycle status before retrying.", "warning");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
   type MasterRecordView = "Teachers" | "Student groups" | "Rooms";
-  type MasterRecordAction = "edit" | "status";
+  type MasterRecordAction = "edit" | "status" | "delete";
 
   function masterRecordButtonKey(recordView: MasterRecordView, recordId: string, action: MasterRecordAction) {
     // 同一个数据库 ID 可能在不同资料种类中重复，所以引用键同时包含页面和动作，
@@ -2493,6 +3012,7 @@ export default function Home() {
     action: MasterRecordAction;
     label: string;
     serverMessage?: string;
+    sessionRequestGeneration: number;
   }) {
     // 冲突一经确认就先卸载旧表单并清除筛选，让刷新后的目标记录一定有机会重新出现在表格中。
     // 管理资料全局锁会保持到此函数结束，所以等待 GET 时也不能打开另一张表单或发出第二笔写入。
@@ -2500,26 +3020,101 @@ export default function Home() {
     setQuery("");
     try {
       const latest = await loadData();
+      if (!sessionRequestIsCurrent(input.sessionRequestGeneration)) return;
       if (!latest) throw new Error("The conflict refresh was superseded before it could establish a new editing baseline.");
       const targetStillExists = input.recordView === "Teachers"
         ? latest.teachers.some((teacher) => teacher.id === input.recordId)
         : input.recordView === "Student groups"
           ? latest.groups.some((group) => group.id === input.recordId)
           : latest.rooms.some((room) => room.id === input.recordId);
+      pendingMasterRecordFocusRef.current = {
+        kind: "record",
+        recordView: input.recordView,
+        recordId: input.recordId,
+        action: input.action,
+      };
       setNotice(targetStillExists
         ? `${input.serverMessage ?? `${input.label} was changed by another scheduler.`} The latest record has been loaded; review it before trying again.`
         : `${input.serverMessage ?? `${input.label} changed in another session.`} The latest list has been loaded, but that record is no longer available.`, "warning");
-      window.requestAnimationFrame(() => {
-        const originalButton = masterRecordButtonRefs.current.get(masterRecordButtonKey(input.recordView, input.recordId, input.action));
-        // 删除记录的功能目前并未开放；这个后备焦点仍保护未来扩展或损坏资料情形，避免焦点落到 body。
-        if (targetStillExists && originalButton?.isConnected) originalButton.focus();
-        else masterDataSearchInputRef.current?.focus();
-      });
     } catch {
       // 冲突后旧列表已知不可信；如果最新版也读不到，继续显示任何可编辑资料都会鼓励用户依据旧 revision 操作。
       // 切换到 load-error 会完全卸载工作区，并由专用 Effect 聚焦“Refresh and try again”。
+      if (!sessionRequestIsCurrent(input.sessionRequestGeneration)) return;
       setAuthScreen("load-error");
       setNotice(`${input.label} was changed by another scheduler, but the latest master-data lists could not be loaded. Refresh before making changes.`, "error");
+    }
+  }
+
+  async function removeStudentGroup(group: StudentGroup) {
+    // 删除是不可撤销的基础资料动作，先说明精确年级和编号。服务端只允许删除完全
+    // 未使用的记录；任何班次或应急周期引用都会返回保护性409，不会级联清资料。
+    const confirmed = window.confirm(
+      `Delete ${group.code} from Year ${group.year}?\n\nThis only succeeds when no course section or emergency cycle backup uses the group.`,
+    );
+    if (!confirmed) return;
+    const mutationKey = `student-group-delete:${group.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
+    let committed = false;
+    try {
+      const response = await fetch(`/api/student-groups/${encodeURIComponent(group.id)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: group.revision }),
+      });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before deleting a student group.", sessionRequestGeneration)) return;
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      if (!response.ok) {
+        if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
+          await reloadMasterRecordAfterConflict({
+            recordView: "Student groups",
+            recordId: group.id,
+            action: "delete",
+            label: `${group.code} · Year ${group.year}`,
+            serverMessage: body.error,
+            sessionRequestGeneration,
+          });
+          return;
+        }
+        if (response.status === 409 && body.code === "STUDENT_GROUP_IN_USE") {
+          setNotice(body.error ?? "Clear this student group's section assignments before deleting it.", "warning");
+          return;
+        }
+        if (response.status === 404) {
+          // 404 已明确证明记录不存在；即使是另一位老师先删除，也不能在后续刷新
+          // 失败时把它误报成“删除结果未知”并鼓励重复尝试。
+          committed = true;
+          closeMasterRecordForm();
+          setQuery("");
+          pendingMasterRecordFocusRef.current = { kind: "form-toggle" };
+          if (!await loadData()) throw new Error("The already-deleted student-group refresh was superseded.");
+          if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+          setNotice(`${group.code} · Year ${group.year} was already removed by another scheduler.`, "warning");
+          return;
+        }
+        setNotice(body.error ?? "The student group could not be deleted.", "error");
+        return;
+      }
+      committed = true;
+      closeMasterRecordForm();
+      setQuery("");
+      pendingMasterRecordFocusRef.current = { kind: "form-toggle" };
+      try {
+        if (!await loadData()) throw new Error("The student-group refresh was superseded after deletion committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        setNotice(`${group.code} · Year ${group.year} was deleted.`, "success");
+      } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        freezeManagementWorkspace(`${group.code} · Year ${group.year} was deleted, but the latest lists could not be loaded. Refresh before continuing.`);
+      }
+    } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      freezeManagementWorkspace(committed
+        ? "The student group was deleted, but the latest data could not be loaded. Refresh before continuing."
+        : "The delete response was interrupted, so the result is unknown. Refresh the student-group list before retrying.");
+    } finally {
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2528,31 +3123,38 @@ export default function Home() {
     const isActive = teacher.status !== "Active";
     const mutationKey = `teacher-status:${teacher.id}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch(`/api/teachers/${encodeURIComponent(teacher.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: teacher.revision }) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before changing a teacher.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
-          await reloadMasterRecordAfterConflict({ recordView: "Teachers", recordId: teacher.id, action: "status", label: teacher.name, serverMessage: body.error });
+          await reloadMasterRecordAfterConflict({ recordView: "Teachers", recordId: teacher.id, action: "status", label: teacher.name, serverMessage: body.error, sessionRequestGeneration });
           return;
         }
         setNotice(body.error ?? "Teacher status could not be updated.", "error");
         return;
       }
       committed = true;
+      pendingMasterRecordFocusRef.current = { kind: "record", recordView: "Teachers", recordId: teacher.id, action: "status" };
       try {
         if (!await loadData()) throw new Error("The teacher refresh was superseded after the status change committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(`${teacher.name} is now ${isActive ? "active" : "inactive"}.`, "success");
       } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace(`${teacher.name} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`);
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? "Teacher status changed, but the latest data could not be loaded. Refresh before continuing."
         : "The teacher-status response was interrupted, so the result is unknown. Refresh the teacher list before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2561,31 +3163,38 @@ export default function Home() {
     const isActive = room.status !== "Active";
     const mutationKey = `room-status:${room.id}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch(`/api/rooms/${encodeURIComponent(room.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive, revision: room.revision }) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before changing a room.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 409 && body.code === "MASTER_DATA_CHANGED") {
-          await reloadMasterRecordAfterConflict({ recordView: "Rooms", recordId: room.id, action: "status", label: room.code, serverMessage: body.error });
+          await reloadMasterRecordAfterConflict({ recordView: "Rooms", recordId: room.id, action: "status", label: room.code, serverMessage: body.error, sessionRequestGeneration });
           return;
         }
         setNotice(body.error ?? "Room status could not be updated.", "error");
         return;
       }
       committed = true;
+      pendingMasterRecordFocusRef.current = { kind: "record", recordView: "Rooms", recordId: room.id, action: "status" };
       try {
         if (!await loadData()) throw new Error("The room refresh was superseded after the status change committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(`${room.code} is now ${isActive ? "active" : "inactive"}.`, "success");
       } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace(`${room.code} is now ${isActive ? "active" : "inactive"}, but the latest master-data lists could not be loaded. Refresh before continuing.`);
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? "Room status changed, but the latest data could not be loaded. Refresh before continuing."
         : "The room-status response was interrupted, so the result is unknown. Refresh the room list before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2634,11 +3243,14 @@ export default function Home() {
     const viewAtSubmit = view;
     const mutationKey = `master-record:${viewAtSubmit}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     // 浏览器先统一大小写和数字格式再发送；数据库约束与服务端验证仍是最终防线，不能只依赖表单。
     try {
       const response = await fetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before saving master data.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 409 && body.code === "MASTER_DATA_CHANGED" && editedRecord) {
           await reloadMasterRecordAfterConflict({
@@ -2647,6 +3259,7 @@ export default function Home() {
             action: "edit",
             label: editedRecord.label,
             serverMessage: body.error,
+            sessionRequestGeneration,
           });
           return;
         }
@@ -2654,6 +3267,9 @@ export default function Home() {
         return;
       }
       committed = true;
+      pendingMasterRecordFocusRef.current = editedRecord
+        ? { kind: "record", recordView: editedRecord.view, recordId: editedRecord.id, action: "edit" }
+        : { kind: "form-toggle" };
       form.reset();
       setShowForm(false);
       setEditingTeacher(null);
@@ -2661,16 +3277,19 @@ export default function Home() {
       setEditingRoom(null);
       try {
         if (!await loadData()) throw new Error("The record refresh was superseded after the save committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setNotice(`${viewAtSubmit.slice(0, -1)} saved to the local database.`, "success");
       } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace("The record was saved, but the latest master-data lists could not be loaded. Refresh before continuing.");
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? "The record was saved, but the latest data could not be loaded. Refresh before continuing."
         : "The save response was interrupted, so the result is unknown. Refresh this list before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2684,12 +3303,15 @@ export default function Home() {
     if (!(file instanceof File) || file.size === 0) return setNotice("Choose a Teaching Members .xlsx file first.", "warning");
     const mutationKey = "teaching-members-import";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     setImporting(true);
     let committed = false;
     // 工作表名称、表头、每行内容和全部分配由服务端校验，并在一个事务中更新，失败时不会留下半份导入资料。
     try {
       const response = await fetch("/api/imports/teaching-members", { method: "POST", body: formData });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before importing teaching allocations.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { error?: string; courses?: number; teachers?: number; sections?: number; zeroAllocationRows?: number; ignoredZeroRows?: number };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         setNotice(body.error ?? "Teaching allocation import failed.", "error");
         return;
@@ -2698,6 +3320,7 @@ export default function Home() {
       form.reset();
       try {
         if (!await loadData()) throw new Error("The import refresh was superseded after the transaction committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         // 新接口使用 zeroAllocationRows；部署滚动更新期间旧服务器仍可能只返回
         // ignoredZeroRows，所以仅把旧名称当兼容后备，展示语义始终是“已处理的明确零分配”。
         const zeroAllocationRows = body.zeroAllocationRows ?? body.ignoredZeroRows;
@@ -2706,15 +3329,17 @@ export default function Home() {
           : "Teaching allocation import completed.";
         setNotice(summary, "success");
       } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace("Teaching allocation import completed, but the latest master-data lists could not be loaded. Refresh before continuing.");
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? "Teaching allocation import completed, but its latest result could not be loaded. Refresh before continuing."
         : "The import response was interrupted, so the result is unknown. Refresh the course and teacher lists before retrying.");
     } finally {
-      setImporting(false);
-      finishManagementMutation(mutationKey);
+      if (sessionRequestIsCurrent(sessionRequestGeneration)) setImporting(false);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2727,45 +3352,168 @@ export default function Home() {
     const submittedCode = String(data.get("code") ?? "").trim().toUpperCase();
     const mutationKey = "manual-course-create";
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch("/api/courses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: submittedCode, catalog: String(data.get("catalog") ?? ""), sectionCount: Number(data.get("sectionCount")) }) });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before creating a course.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { error?: string; code?: string; configuredSections?: number };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         setNotice(body.error ?? "Manual course could not be created.", "error");
         return;
       }
       committed = true;
+      pendingMasterRecordFocusRef.current = { kind: "form-toggle" };
       form.reset();
       setShowForm(false);
       try {
         if (!await loadData()) throw new Error("The course refresh was superseded after manual creation committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         const createdSummary = typeof body.configuredSections === "number"
           ? `${body.code ?? submittedCode} and ${body.configuredSections} unassigned sections created.`
           : `${body.code ?? submittedCode} and its unassigned sections were created.`;
         setNotice(createdSummary, "success");
       } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace(`${body.code ?? submittedCode} was created, but the latest course list could not be loaded. Refresh before continuing.`);
       }
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? `${submittedCode || "The course"} was created, but its latest details could not be loaded. Refresh before continuing.`
         : "The create-course response was interrupted, so the result is unknown. Refresh the course list before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
+    }
+  }
+
+  function closeCourseWorkspaces(courseId: string) {
+    // 删除或确认课程已不存在时，只有目标课程的 Configure／Sections 工作区需要卸载；
+    // 其他课程不可能在全局写锁期间被打开，因此无需清除不相关的用户上下文。
+    if (editingCourse?.id === courseId) {
+      setEditingCourse(null);
+      setShowForm(false);
+    }
+    if (selectedCourse?.id === courseId) {
+      setSelectedCourse(null);
+      setSections([]);
+      setAllocationVariances([]);
+    }
+  }
+
+  async function removeCourse(course: Course) {
+    // 课程拥有自动生成的班次和 Teaching Members baseline；确认框明确说明删除范围，
+    // 服务端仍会保护所有已排课、学生班级和人工教师，不依赖浏览器自行判断关系。
+    const allocationNote = course.allocatedSections > 0
+      ? `\n• Its Teaching Members allocation baseline (${course.allocatedSections} expected section${course.allocatedSections === 1 ? "" : "s"}) will also be removed.`
+      : "";
+    const confirmed = window.confirm(
+      `Delete ${course.code}?\n\nThis will remove:\n• The course and ${course.configuredSections} unscheduled section${course.configuredSections === 1 ? "" : "s"}.${allocationNote}\n\nScheduled lessons, student-group assignments and manually maintained teachers must be cleared first. Re-importing Teaching Members or restoring an emergency cycle backup can create the course again.`,
+    );
+    if (!confirmed) return;
+
+    const mutationKey = `course-delete:${course.id}`;
+    if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
+    let committed = false;
+    try {
+      const response = await fetch(`/api/courses/${encodeURIComponent(course.id)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: course.revision }),
+      });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before deleting a course.", sessionRequestGeneration)) return;
+      // 收到 2xx 已经证明服务端提交；即使响应 JSON 随后损坏，也不能把已删除课程
+      // 误报成未知结果。404 同样明确证明目标已不存在。
+      committed = response.ok || response.status === 404;
+      const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+
+      if (!response.ok) {
+        if (response.status === 409 && body.code === "COURSE_CHANGED") {
+          closeCourseWorkspaces(course.id);
+          setQuery("");
+          try {
+            const latest = await loadData();
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+            if (!latest) throw new Error("The course-delete conflict refresh was superseded.");
+            const targetStillExists = latest.courses.some((item) => item.id === course.id);
+            pendingCourseDeleteFocusRef.current = targetStillExists
+              ? { kind: "delete", courseId: course.id }
+              : { kind: "search" };
+            setNotice(targetStillExists
+              ? `${body.error ?? `${course.code} was changed by another scheduler.`} The latest course list has now been loaded; review it before trying again.`
+              : `${course.code} changed in another session and is no longer in the latest course list.`, "warning");
+          } catch {
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+            freezeManagementWorkspace(`${course.code} changed in another session, but the latest course list could not be loaded. Refresh before making changes.`, "error");
+          }
+          return;
+        }
+        if (response.status === 409 && body.code === "COURSE_IN_USE") {
+          // `confirm()` drops keyboard focus. Once the global write lock is released,
+          // return it to the same stable action so keyboard users do not land on body.
+          pendingCourseDeleteFocusRef.current = { kind: "delete", courseId: course.id };
+          setNotice(body.error ?? "Clear this course's scheduled lessons and manual assignments before deleting it.", "warning");
+          return;
+        }
+        if (response.status === 404) {
+          closeCourseWorkspaces(course.id);
+          setQuery("");
+          pendingCourseDeleteFocusRef.current = { kind: "search" };
+          if (!await loadData()) throw new Error("The already-deleted course refresh was superseded.");
+          if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+          setNotice(`${course.code} was already removed by another scheduler.`, "warning");
+          return;
+        }
+        setNotice(body.error ?? "The course could not be deleted.", "error");
+        return;
+      }
+
+      closeCourseWorkspaces(course.id);
+      setQuery("");
+      pendingCourseDeleteFocusRef.current = { kind: "search" };
+      try {
+        if (!await loadData()) throw new Error("The course-list refresh was superseded after deletion committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        setNotice(`${course.code} and its ${course.configuredSections} owned section${course.configuredSections === 1 ? "" : "s"}${course.allocatedSections > 0 ? " and Teaching Members allocation baseline" : ""} were deleted.`, "success");
+      } catch {
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        freezeManagementWorkspace(`${course.code} was deleted, but the latest course list could not be loaded. Refresh before continuing.`);
+      }
+    } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+      freezeManagementWorkspace(committed
+        ? `${course.code} is no longer present, but the latest course list could not be loaded. Refresh before continuing.`
+        : "The course-delete response was interrupted, so the result is unknown. Refresh the course list before retrying.");
+    } finally {
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
   async function changeSectionCount(event: FormEvent<HTMLFormElement>) {
-    // 减少班次数量时只删除编号最高的班次；即使尚未排课也是有意义的课程资料，因此提交前要求明确确认。
+    // 减少数量只处理最高编号尾部；确认文案同时说明自动教师与 Excel baseline 的区别，
+    // 避免老师误以为手工修正 section 数量也会悄悄改写来源工作簿。
     event.preventDefault();
     if (!selectedCourse) return;
     const courseAtSubmit = selectedCourse;
     const data = new FormData(event.currentTarget);
     const sectionCount = Number(data.get("sectionCount"));
-    if (sectionCount < sections.length && !window.confirm(`Remove ${sections.length - sectionCount} highest-numbered unscheduled section(s) from ${courseAtSubmit.code}?`)) return;
+    if (sectionCount < sections.length) {
+      const firstRemoved = sectionCount + 1;
+      const lastRemoved = sections.length;
+      const removalRange = firstRemoved === lastRemoved
+        ? `${courseAtSubmit.code}_${String(firstRemoved).padStart(2, "0")}`
+        : `${courseAtSubmit.code}_${String(firstRemoved).padStart(2, "0")}–${courseAtSubmit.code}_${String(lastRemoved).padStart(2, "0")}`;
+      const baselineNote = courseAtSubmit.allocatedSections > 0
+        ? "\n\nTeaching Members allocation stays unchanged, so an allocation mismatch may appear and re-importing the unchanged file can recreate these sections."
+        : "";
+      if (!window.confirm(`Remove ${removalRange}?\n\nOnly unscheduled highest-numbered sections can be removed. Student groups and manually maintained teachers must be cleared first; automatic allocation teachers can be removed with their sections.${baselineNote}`)) return;
+    }
     const mutationKey = `section-count:${courseAtSubmit.id}`;
     if (!beginManagementMutation(mutationKey)) return;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch(`/api/courses/${encodeURIComponent(courseAtSubmit.id)}/sections`, {
@@ -2775,7 +3523,9 @@ export default function Home() {
         // 老师先调整班次数量后，服务器会拒绝这个旧基准，避免依据旧总数误删新版班次。
         body: JSON.stringify({ sectionCount, revision: courseAtSubmit.revision }),
       });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before changing section count.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 404) {
           // 新周期会原子删除全部课程；从旧画面提交到404时，不只是当前课程过期，
@@ -2788,18 +3538,27 @@ export default function Home() {
             // loadData 返回本次 GET 的实际对象；不能紧接着从 React courses state 读取，
             // 因为它仍可能是提交前的旧 render。openSections 也必须收到这个最新版 course。
             const latest = await loadData();
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
             if (!latest) throw new Error("The section-count conflict refresh was superseded.");
             const latestCourse = latest.courses.find((course) => course.id === courseAtSubmit.id);
             if (!latestCourse || !await openSections(latestCourse, false)) throw new Error("Latest course details could not be loaded.");
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
             setNotice(`${body.error ?? `${courseAtSubmit.code} was changed by another scheduler.`} The latest course and sections have been loaded; review the count before trying again.`, "warning");
             window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
           } catch {
             // 旧课程对象已经明确过期；只要最新版课程或班次读取不完整，就必须卸载整个可编辑工作区。
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
             freezeManagementWorkspace(`${courseAtSubmit.code} changed in another session, but its latest course details could not be loaded. Refresh before making changes.`, "error");
           }
           return;
         }
+        if (response.status === 409 && body.code === "COURSE_SECTION_IN_USE") {
+          setNotice(body.error ?? "Clear the protected tail-section work before reducing the section count.", "warning");
+          window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
+          return;
+        }
         setNotice(body.error ?? "Section count could not be changed.", "error");
+        window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
         return;
       }
       committed = true;
@@ -2807,23 +3566,27 @@ export default function Home() {
         // PATCH 成功也可能提高 course revision；从同一轮刷新结果取得新对象，再用它
         // 重开班次面板，避免 selectedCourse 留着旧 revision 导致下一次调整产生假冲突。
         const latest = await loadData();
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (!latest) throw new Error("The section-count refresh was superseded after the change committed.");
         const latestCourse = latest.courses.find((course) => course.id === courseAtSubmit.id);
         if (!latestCourse || !await openSections(latestCourse, false)) throw new Error("Sections could not be refreshed.");
-        setNotice(`${latestCourse.code} now has ${sectionCount} sections.`, "success");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        setNotice(`${latestCourse.code} now has ${latestCourse.configuredSections} section${latestCourse.configuredSections === 1 ? "" : "s"}.${latestCourse.allocationVarianceCount > 0 ? " Teaching Members allocation differs from the current sections; review the mismatch below." : ""}`, "success");
         window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
       } catch {
         // 保存已经提交后，旧对象不能继续作为可编辑基准；隐藏工作区直到完整重载。
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         freezeManagementWorkspace(`${courseAtSubmit.code} section count was changed, but the latest course details could not be loaded. Refresh before changing it again.`);
       }
     } catch {
       // 连接中断时无法知道 PATCH 是否到达提交边界。冻结旧 revision，避免老师在
       // 结果未知时继续缩减班次或重复保存一笔其实已经提交的变更。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? `${courseAtSubmit.code} section count was changed, but its latest details could not be loaded. Refresh before continuing.`
         : "The section-count response was interrupted, so the result is unknown. Refresh the course sections before retrying.");
     } finally {
-      finishManagementMutation(mutationKey);
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -2844,6 +3607,7 @@ export default function Home() {
     // 已发出的 Sections／workspace 读取，防止保存完成后旧响应覆盖新的 course revision。
     visibleWorkspaceRefreshNumber.current += 1;
     activeManualTimetableRefreshNumber.current = null;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     const data = new FormData(event.currentTarget);
     let committed = false;
     try {
@@ -2867,8 +3631,10 @@ export default function Home() {
           weekEnd: data.get("weekEnd") ? Number(data.get("weekEnd")) : null,
         }),
       });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before saving course setup.", sessionRequestGeneration)) return;
       committed = response.ok;
       const body = await response.json().catch(() => ({})) as { code?: string; error?: string };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 404) {
           // Course Setup 的目标消失通常表示另一进程已开始新周期；旧 courses state
@@ -2883,8 +3649,10 @@ export default function Home() {
           // 会看到赢家版本，不会在不知道变化的情况下直接重试覆盖。
           try {
             if (!await loadData()) throw new Error("The course-setup conflict refresh was superseded.");
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
             setNotice("This course setup was changed by another scheduler. The latest setup has been loaded; reopen Configure to review it.", "warning");
           } catch {
+            if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
             setShowForm(false);
             setEditingCourse(null);
             freezeManagementWorkspace("This course setup was changed by another scheduler, but the latest setup could not be loaded. Refresh before editing it again.", "error");
@@ -2899,9 +3667,11 @@ export default function Home() {
       }
       try {
         if (!await loadData()) throw new Error("The course-setup refresh was superseded after the save committed.");
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       } catch {
         // PATCH 已经明确返回成功时不能再说“保存失败”。关闭持有旧 revision 的表单，
         // 并准确说明只有刷新清单失败，避免老师重复提交已经保存的配置。
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         setShowForm(false);
         setEditingCourse(null);
         freezeManagementWorkspace(`${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`);
@@ -2912,6 +3682,7 @@ export default function Home() {
       restoreCourseConfigureFocus(courseAtSubmit.id, true);
       setNotice(`${courseAtSubmit.code} setup saved. Its generated sections will use these requirements.`, "success");
     } catch {
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (committed) {
         setShowForm(false);
         setEditingCourse(null);
@@ -2920,18 +3691,22 @@ export default function Home() {
         ? `${courseAtSubmit.code} setup was saved, but the latest course list could not be loaded. Refresh before continuing.`
         : "The course-setup response was interrupted, so the result is unknown. Refresh the course list before retrying.");
     } finally {
-      savingCourseSetupIdRef.current = null;
-      setSavingCourseSetupId(null);
+      if (sessionRequestIsCurrent(sessionRequestGeneration) && savingCourseSetupIdRef.current === courseAtSubmit.id) {
+        savingCourseSetupIdRef.current = null;
+        setSavingCourseSetupId(null);
+      }
     }
   }
 
-  async function openSections(course: Course, showFailureNotice = true) {
+  async function openSections(course: Course, showFailureNotice = true, focusSectionCount = false) {
     // currentCourse、班次和 allocation variance 由同一个服务端快照返回；每次点击
     // 也领取 generation，较慢的上一门课程不能在后来点击或导航后重新打开自己。
     const requestNumber = ++visibleWorkspaceRefreshNumber.current;
     activeManualTimetableRefreshNumber.current = requestNumber;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     try {
       const response = await fetch(`/api/courses/${encodeURIComponent(course.id)}/workspace`, { cache: "no-store" });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before opening course sections.", sessionRequestGeneration)) return false;
       if (response.status === 404) {
         // 只有新周期或另一账号移除课程后才会从既有清单点击到404；此时整张旧课程表
         // 都已知不可信，不能只关掉详情并继续允许 Configure／Sections。
@@ -2942,6 +3717,7 @@ export default function Home() {
       }
       if (!response.ok) throw new Error("Course sections workspace request failed.");
       const workspace = await response.json() as CourseSectionsWorkspace;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (!workspace.currentCourse || !Array.isArray(workspace.sections) || !Array.isArray(workspace.allocationVariances)) {
         throw new Error("Course sections workspace response was incomplete.");
       }
@@ -2957,9 +3733,11 @@ export default function Home() {
       });
       setShowForm(false);
       setEditingCourse(null);
+      if (focusSectionCount) window.requestAnimationFrame(() => sectionCountInputRef.current?.focus());
       return true;
     } catch {
       // 已被更新 generation 取代的请求保持安静；只有仍属当前画面的失败可以写提示。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return false;
       if (showFailureNotice && requestNumber === visibleWorkspaceRefreshNumber.current) {
         setNotice("Course sections could not be loaded. Check the connection and try again.", "error");
       }
@@ -2985,6 +3763,7 @@ export default function Home() {
     setSavingSectionId(section.id);
     const data = new FormData(event.currentTarget);
     const courseAtStart = selectedCourse;
+    const sessionRequestGeneration = authenticatedSessionGeneration.current;
     let committed = false;
     try {
       const response = await fetch(`/api/course-sections/${encodeURIComponent(section.id)}`, {
@@ -2996,7 +3775,9 @@ export default function Home() {
           revision: section.revision,
         }),
       });
+      if (protectedResponseEndedSession(response, "Your session expired. Sign in again before saving a section assignment.", sessionRequestGeneration)) return;
       const body = await response.json().catch(() => ({})) as { error?: string; allocationVariances?: AllocationVariance[] };
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!response.ok) {
         if (response.status === 404) {
           // 另一进程开始新周期后，旧 section ID 会稳定404。不能只提示并让同一面板
@@ -3007,6 +3788,7 @@ export default function Home() {
         // 409 表示另一位老师已经先保存；强制重新读取并用 revision 作为 form key，
         // 让非受控下拉框和复选框也立刻显示最新资料，而不是继续保留旧选择。
         const latestLoaded = response.status === 409 && courseAtStart ? await openSections(courseAtStart, false) : true;
+        if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
         if (response.status === 409 && !latestLoaded) {
           freezeManagementWorkspace(`${body.error ?? "Section changed in another session."} The latest section details could not be loaded; refresh before editing again.`, "error");
           return;
@@ -3019,6 +3801,7 @@ export default function Home() {
       }
       committed = true;
       const latestLoaded = courseAtStart ? await openSections(courseAtStart, false) : true;
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (!latestLoaded) {
         freezeManagementWorkspace(`${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before editing it again.`);
         return;
@@ -3033,13 +3816,16 @@ export default function Home() {
     } catch {
       // 请求中断时不能断言数据库没有写入；旧班次和旧 course revision 都不可再编辑，
       // 必须先通过唯一 Refresh 入口取得新的原子 workspace 后才能决定是否重试。
+      if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       freezeManagementWorkspace(committed
         ? `${section.label} assignment was saved, but the latest section details could not be loaded. Refresh before continuing.`
         : "The section-save response was interrupted, so the result is unknown. Refresh the section before retrying.");
     } finally {
-      savingSectionIdRef.current = null;
-      setSavingSectionId(null);
-      finishManagementMutation(mutationKey);
+      if (sessionRequestIsCurrent(sessionRequestGeneration) && savingSectionIdRef.current === section.id) {
+        savingSectionIdRef.current = null;
+        setSavingSectionId(null);
+      }
+      finishManagementMutation(mutationKey, sessionRequestGeneration);
     }
   }
 
@@ -3144,7 +3930,17 @@ export default function Home() {
               </button>
             </form>
           )}
-          <p className="mt-4 text-xs text-amber-700">{notice}</p>
+          {/* 登录／首次设置还没有主工作台的顶部 toast，因此这里本身必须提供正确
+              颜色与 live-region 语义；错误不能永远显示成 amber，也不能让读屏器
+              在 setup token 或密码失败后完全听不到反馈。 */}
+          <p
+            role={noticeTone === "error" ? "alert" : "status"}
+            aria-live={noticeTone === "error" ? "assertive" : "polite"}
+            aria-atomic="true"
+            className={`mt-4 text-xs ${noticeTone === "error" ? "text-red-700" : noticeTone === "success" ? "text-emerald-700" : noticeTone === "warning" ? "text-amber-700" : "text-blue-700"}`}
+          >
+            {notice}
+          </p>
         </div>
       </main>
     );
@@ -3227,6 +4023,7 @@ export default function Home() {
             </div>
             {isDataManagementView && (
               <button
+                ref={dataManagementFormToggleButtonRef}
                 onClick={toggleForm}
                 disabled={savingCourseSetupId !== null || managementMutationKey !== null}
                 className="rounded-xl bg-[#153d75] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#0f315f] disabled:cursor-wait disabled:opacity-60"
@@ -3263,6 +4060,7 @@ export default function Home() {
                     {personalKind === "Teacher" && teachers.filter((teacher) => teacher.status === "Inactive").map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.name} ({teacher.staffType}, Inactive)</option>)}
                     {personalKind === "StudentGroup" && groups.map((group) => <option key={group.id} value={group.id}>{group.code} · Year {group.year}</option>)}
                     {personalKind === "Room" && rooms.filter((room) => room.status === "Active").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats</option>)}
+                    {personalKind === "Room" && rooms.filter((room) => room.status === "Inactive").map((room) => <option key={room.id} value={room.id}>{room.code} · {room.capacity} seats · Inactive</option>)}
                   </select>
                 </label>
               </div>
@@ -3386,14 +4184,17 @@ export default function Home() {
                       </div>
                     </div>
                   ))}
-                  {/* Excel 导入只知道课程和教师分配，无法自动猜测课时与所属年级。
-                      当待排区为空时，直接解释缺少的资料并提供课程设置入口，避免老师误以为导入失败。 */}
+                  {/* 待排区为空有三种不同含义：尚无课程、课程仍缺设置，或所有已配置
+                      课次都已经排入总表。必须结合当前 lessons 区分；否则最后一种正常
+                      状态会被错误提示为“仍缺 duration／year”，误导老师重复修改课程。 */}
                   {filteredUnscheduledSections.length === 0 && (
                     unscheduledSections.length === 0 ? (
                       <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-xs leading-5 text-blue-900">
                         <p className="font-black">No sessions are ready for Year {timetableYear} yet.</p>
                         {courses.length === 0 ? (
                           <p className="mt-1">No courses have been added yet. Import the Teaching Members workbook or add a course before scheduling.</p>
+                        ) : lessons.length > 0 ? (
+                          <p className="mt-1">All currently configured Year {timetableYear} sessions are scheduled. Use Return to tray on a lesson if it needs to be placed again.</p>
                         ) : (
                           <p className="mt-1">Courses are available, but they still need a duration and primary year before their sections can enter this tray.</p>
                         )}
@@ -3402,7 +4203,7 @@ export default function Home() {
                           className="mt-2 rounded-lg bg-[#153d75] px-3 py-1.5 font-bold text-white"
                           type="button"
                         >
-                          {courses.length === 0 ? "Import or add courses" : "Configure courses"}
+                          {courses.length === 0 ? "Import or add courses" : lessons.length > 0 ? "Review courses" : "Configure courses"}
                         </button>
                       </div>
                     ) : (
@@ -3426,7 +4227,7 @@ export default function Home() {
                     {/* 左右工具面板保持互斥：老师一次只处理一种辅助任务，中央总表不会同时被两个面板遮挡或挤压。 */}
                     <button
                       ref={unscheduledToggleButtonRef}
-                      disabled={editingLesson !== null || lessonMutation !== null || placingSessionKey !== null}
+                      disabled={workspaceNavigationLocked}
                       onClick={() => {
                         const willOpen = !showUnscheduledDrawer;
                         setShowUnscheduledDrawer(willOpen);
@@ -3441,7 +4242,7 @@ export default function Home() {
                     </button>
                     <button
                       ref={inspectorToggleButtonRef}
-                      disabled={editingLesson !== null || lessonMutation !== null || placingSessionKey !== null}
+                      disabled={workspaceNavigationLocked}
                       onClick={() => {
                         const willOpen = !showTimetableInspector;
                         setShowTimetableInspector(willOpen);
@@ -3460,7 +4261,7 @@ export default function Home() {
                       {[1, 2, 3].map((year) => (
                         <button
                           key={year}
-                          disabled={editingLesson !== null || lessonMutation !== null || placingSessionKey !== null}
+                          disabled={workspaceNavigationLocked}
                           onClick={() => void openTimetable(year)}
                           className={`rounded-lg px-2.5 py-1.5 text-sm font-semibold disabled:cursor-wait disabled:opacity-50 ${year === timetableYear ? "bg-white shadow-sm" : "text-slate-500"}`}
                           type="button"
@@ -3488,8 +4289,8 @@ export default function Home() {
                         <button
                           title={`${lesson.sectionLabel} · ${lessonTime} · ${lesson.teacherName ?? "Teacher pending"} · ${lessonGroups} · ${lesson.roomCode ?? "Room pending"}`}
                           aria-label={completeLessonLabel}
-                          disabled={editingLesson !== null || lessonMutation !== null || placingSessionKey !== null}
-                          draggable={editingLesson === null && lessonMutation === null && placingSessionKey === null}
+                          disabled={workspaceNavigationLocked}
+                          draggable={!workspaceNavigationLocked}
                           onDragStart={(event) => {
                             draggingScheduledLessonRef.current = lesson;
                             event.dataTransfer.setData("application/x-scheduled-lesson", lesson.id);
@@ -3506,7 +4307,7 @@ export default function Home() {
                             setPlacingSection(null);
                             clearCandidateSlotWorkspace();
                           }}
-                          className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${editingLesson !== null || lessonMutation !== null || placingSessionKey !== null ? "cursor-wait opacity-60" : ""} ${issueClasses.card}`}
+                          className={`h-full w-full cursor-pointer overflow-hidden rounded p-1 text-left leading-tight shadow-sm hover:ring-2 focus-visible:outline-none focus-visible:ring-2 ${workspaceNavigationLocked ? "cursor-wait opacity-60" : ""} ${issueClasses.card}`}
                           type="button"
                         >
                           <span className="block truncate text-[11px] font-black">{lesson.sectionLabel}</span>
@@ -3883,7 +4684,17 @@ export default function Home() {
                       <div className="flex items-center gap-2">
                         <Pill tone={account.isActive ? "green" : "slate"}>{account.isActive ? "Active" : "Inactive"}</Pill>
                         {!account.isAdmin && (
-                          <button disabled={managementMutationKey !== null} onClick={() => void changeAccountStatus(account)} className="text-xs font-bold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button">
+                          <button
+                            ref={(button) => {
+                              if (button) accountStatusButtonRefs.current.set(account.id, button);
+                              else accountStatusButtonRefs.current.delete(account.id);
+                            }}
+                            aria-label={`${account.isActive ? "Deactivate" : "Activate"} ${account.username}`}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => void changeAccountStatus(account)}
+                            className="text-xs font-bold text-blue-700 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
                             {account.isActive ? "Deactivate" : "Activate"}
                           </button>
                         )}
@@ -4011,7 +4822,7 @@ export default function Home() {
                   <p className="mb-1 text-sm font-bold text-blue-950">Import Teaching Members</p>
                   <p className="mb-3 text-xs leading-5 text-blue-800">Reads <strong>Mod</strong>, <strong>Lecturer</strong>, <strong>Staff Type</strong> and <strong># of grps teaching</strong>. Positive rows create pre-assigned sections. A row with 0 explicitly clears that lecturer&apos;s existing allocation for the course; it is processed, not ignored.</p>
                   <div className="flex flex-col gap-3">
-                    <input name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" />
+                    <input ref={dataManagementFormFirstInputRef} name="file" required accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" type="file" className="block text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-800" />
                     <button disabled={managementMutationKey !== null} className="w-fit rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-70" type="submit">
                       {importing ? "Importing..." : "Import allocation"}
                     </button>
@@ -4098,14 +4909,14 @@ export default function Home() {
                 <fieldset disabled={managementMutationKey !== null} className="min-w-0 disabled:cursor-wait disabled:opacity-60">
                 {view === "Teachers" && (
                   <div className="grid gap-3 sm:grid-cols-[1fr_140px_auto]">
-                    <input name="name" required maxLength={TEACHER_NAME_MAX_LENGTH} defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input ref={dataManagementFormFirstInputRef} name="name" required maxLength={TEACHER_NAME_MAX_LENGTH} defaultValue={editingTeacher?.name} placeholder="Teacher name" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="staffType" defaultValue={editingTeacher?.staffType ?? "FT"} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="FT">Full-time (FT)</option><option value="PT">Part-time (PT)</option></select>
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Teachers" ? "Saving..." : editingTeacher ? "Save changes" : "Save teacher"}</button>
                   </div>
                 )}
                 {view === "Student groups" && (
                   <div className="grid gap-3 sm:grid-cols-[1fr_120px_130px_auto]">
-                    <input name="code" required maxLength={STUDENT_GROUP_CODE_MAX_LENGTH} defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input ref={dataManagementFormFirstInputRef} name="code" required maxLength={STUDENT_GROUP_CODE_MAX_LENGTH} defaultValue={editingGroup?.code} placeholder="e.g. AAA_01" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <select name="year" defaultValue={editingGroup?.year ?? 1} className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm"><option value="1">Year 1</option><option value="2">Year 2</option><option value="3">Year 3</option></select>
                     <input name="program" required maxLength={STUDENT_GROUP_PROGRAM_MAX_LENGTH} defaultValue={editingGroup?.program} placeholder="Programme" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <button disabled={managementMutationKey !== null} className="rounded-xl bg-[#153d75] px-4 py-2 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === "master-record:Student groups" ? "Saving..." : editingGroup ? "Save changes" : "Save group"}</button>
@@ -4114,7 +4925,7 @@ export default function Home() {
                 {view === "Rooms" && (
                   /* 教室新增和编辑共用表单；编辑时回填原容量和设施，避免只改地址却意外清除设备标记。 */
                   <div className="grid gap-3 lg:grid-cols-[1fr_110px_auto_auto_auto_auto]">
-                    <input name="room" required maxLength={ROOM_CODE_MAX_LENGTH} defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <input ref={dataManagementFormFirstInputRef} name="room" required maxLength={ROOM_CODE_MAX_LENGTH} defaultValue={editingRoom?.code} placeholder="e.g. 31-05-10" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <input name="capacity" required min="1" max={ROOM_CAPACITY_MAXIMUM} defaultValue={editingRoom?.capacity} type="number" placeholder="Capacity" className="rounded-xl border border-blue-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500" />
                     <label className="flex items-center gap-2 text-sm"><input name="lab" defaultChecked={editingRoom?.features.includes("Lab")} type="checkbox" /> Lab</label>
                     <label className="flex items-center gap-2 text-sm"><input name="projector" defaultChecked={editingRoom?.features.includes("Multi projector")} type="checkbox" /> Projector</label>
@@ -4180,19 +4991,35 @@ export default function Home() {
                     <tr className="border-t border-slate-100" key={group.id}>
                       <td className="px-5 py-4 font-semibold text-slate-800">{group.code}</td><td className="px-5 py-4"><Pill tone="blue">Year {group.year}</Pill></td><td className="px-5 py-4 text-slate-600">{group.program}</td><td className="px-5 py-4 text-slate-500">Checks conflicts and daily limits</td>
                       <td className="px-5 py-4 text-right">
-                        <button
-                          ref={(button) => {
-                            const key = masterRecordButtonKey("Student groups", group.id, "edit");
-                            if (button) masterRecordButtonRefs.current.set(key, button);
-                            else masterRecordButtonRefs.current.delete(key);
-                          }}
-                          disabled={managementMutationKey !== null}
-                          onClick={() => { setEditingGroup(group); setShowForm(true); }}
-                          className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50"
-                          type="button"
-                        >
-                          Edit
-                        </button>
+                        <div className="flex justify-end gap-3">
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Student groups", group.id, "edit");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => { setEditingGroup(group); setShowForm(true); }}
+                            className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            ref={(button) => {
+                              const key = masterRecordButtonKey("Student groups", group.id, "delete");
+                              if (button) masterRecordButtonRefs.current.set(key, button);
+                              else masterRecordButtonRefs.current.delete(key);
+                            }}
+                            aria-label={`Delete ${group.code} from Year ${group.year}`}
+                            disabled={managementMutationKey !== null}
+                            onClick={() => void removeStudentGroup(group)}
+                            className="font-semibold text-red-700 hover:text-red-900 disabled:cursor-wait disabled:opacity-50"
+                            type="button"
+                          >
+                            {managementMutationKey === `student-group-delete:${group.id}` ? "Deleting..." : "Delete"}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}</tbody>
@@ -4252,7 +5079,7 @@ export default function Home() {
                         <td className="px-5 py-4 text-slate-500">{course.durationHours ? `${course.durationHours}h · ${course.sessionsPerWeek}×/week · ${course.primaryYear ? `Y${course.primaryYear}` : "year pending"} · ${course.weekStart !== null && course.weekEnd !== null ? `W${course.weekStart}–${course.weekEnd}` : "all weeks"}` : "Not configured"}</td>
                         <td className="px-5 py-4 text-right">
                           <div className="flex justify-end gap-3">
-                            <button disabled={savingCourseSetupId !== null || managementMutationKey !== null} onClick={() => void openSections(course)} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button">Sections</button>
+                            <button disabled={savingCourseSetupId !== null || managementMutationKey !== null} onClick={() => void openSections(course, true, true)} className="font-semibold text-emerald-700 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-50" type="button" aria-label={`Manage ${course.code} sections`}>Manage sections</button>
                             {/* callback ref 会在筛选隐藏课程时删除旧节点；409 后不会把焦点送到已脱离 DOM 的按钮。 */}
                             <button
                               ref={(button) => {
@@ -4267,6 +5094,19 @@ export default function Home() {
                             >
                               Configure
                             </button>
+                            <button
+                              ref={(button) => {
+                                if (button) courseDeleteButtonRefs.current.set(course.id, button);
+                                else courseDeleteButtonRefs.current.delete(course.id);
+                              }}
+                              disabled={savingCourseSetupId !== null || managementMutationKey !== null}
+                              onClick={() => void removeCourse(course)}
+                              className="font-semibold text-red-700 hover:text-red-900 disabled:cursor-wait disabled:opacity-50"
+                              type="button"
+                              aria-label={`Delete ${course.code}`}
+                            >
+                              {managementMutationKey === `course-delete:${course.id}` ? "Deleting..." : "Delete"}
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -4280,14 +5120,14 @@ export default function Home() {
               /* 班次分配与课程统一设置分开，因为不同班次可有不同教师和学生班级。 */
               <div className="border-t border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-                  <div><p className="font-bold text-slate-950">{selectedCourse.code} sections</p><p className="text-xs text-slate-500">Assign a teacher and one or more student groups to each section.</p></div>
+                  <div><p className="font-bold text-slate-950">Manage {selectedCourse.code} sections</p><p className="text-xs text-slate-500">Change the number of sections, then assign a teacher and one or more student groups to each section.</p></div>
                   <button ref={sectionsCloseButtonRef} disabled={managementMutationKey !== null} onClick={() => { setSelectedCourse(null); setSections([]); setAllocationVariances([]); }} className="text-sm font-semibold text-blue-700 disabled:cursor-wait disabled:opacity-50" type="button" aria-label={`Close ${selectedCourse.code} sections`}>Close</button>
                 </div>
                 {/* 修正班次数量时保留低编号班次；仍含排课或班级关联的班次，服务端会拒绝删除。 */}
                 <form key={`${selectedCourse.id}:${selectedCourse.revision}:${sections.length}`} onSubmit={changeSectionCount} className="mb-3 flex flex-wrap items-end gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
-                  <label className="text-xs font-semibold text-amber-950">Total sections<input ref={sectionCountInputRef} name="sectionCount" required min="1" max="999" defaultValue={sections.length} disabled={managementMutationKey !== null} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
-                  <button disabled={managementMutationKey !== null} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900 disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === `section-count:${selectedCourse.id}` ? "Updating..." : "Update count"}</button>
-                  <p className="text-xs text-amber-800">Reducing removes only the highest numbers after their timetable and student groups are cleared.</p>
+                  <label className="text-xs font-semibold text-amber-950">Number of sections<input ref={sectionCountInputRef} name="sectionCount" required min="1" max="999" defaultValue={sections.length} disabled={managementMutationKey !== null} type="number" className="mt-1 block w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm disabled:cursor-wait disabled:bg-slate-100" /></label>
+                  <button disabled={managementMutationKey !== null} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm font-bold text-amber-900 disabled:cursor-wait disabled:opacity-60" type="submit">{managementMutationKey === `section-count:${selectedCourse.id}` ? "Saving..." : "Save section count"}</button>
+                  <p className="text-xs text-amber-800">Reducing removes only the highest unscheduled numbers. Clear student groups and manual teachers first; imported allocation remains as an auditable baseline.</p>
                 </form>
                 {allocationVariances.length > 0 && (
                   <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-3">

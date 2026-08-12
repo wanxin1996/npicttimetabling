@@ -374,6 +374,7 @@ function verifyRuntimeIndexes() {
     ["auth_sessions_user_id_idx", ["user_id"]],
     ["auth_sessions_expires_at_idx", ["expires_at"]],
     ["rooms_is_active_code_idx", ["is_active", "code"]],
+    ["student_groups_year_program_idx", ["year", "program"]],
     ["courses_primary_year_idx", ["primary_year"]],
     ["teaching_allocations_teacher_id_idx", ["teacher_id"]],
     ["course_sections_teacher_id_idx", ["teacher_id"]],
@@ -411,7 +412,7 @@ function verifyRuntimeIndexes() {
   } finally {
     db.close();
   }
-  report("12 个 runtime 索引的名称与列顺序，以及 8 条热点查询计划");
+  report("13 个 runtime 索引的名称与列顺序，以及 8 条热点查询计划");
 }
 
 async function createSchedulerCookies() {

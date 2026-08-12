@@ -477,6 +477,22 @@ function readDatabaseValue(sql, ...parameters) {
   }
 }
 
+function currentAccountRevision(accountId) {
+  // 每项既有认证竞态都在真正管理员 PATCH 前读取当前公开状态版本。密码重置不会
+  // 改动它；停用再启用则必须使用前一项成功响应留下的新版本，不能硬编码 revision 1。
+  const row = readDatabaseValue("SELECT revision FROM app_users WHERE id = ?", accountId);
+  assert(row && Number.isSafeInteger(row.revision) && row.revision >= 1,
+    `Account ${accountId} did not expose a valid status revision.`);
+  return row.revision;
+}
+
+function administratorAccountAction(accountId, action) {
+  // resetPassword 有独立 hash/session CAS；只有 status 命令需要绑定管理员看到的版本。
+  return action.action === "status"
+    ? { userId: accountId, ...action, expectedRevision: currentAccountRevision(accountId) }
+    : { userId: accountId, ...action };
+}
+
 async function waitForPendingRollbackJournalWriter(description, timeoutMilliseconds = 3_000) {
   // DELETE journal 中，writer 完成业务 SQL 并开始 COMMIT 时会先取得 PENDING 锁，
   // 阻止新的 reader 加入，再等待旧 SHARED reader 退出。用 busy_timeout=0 的新连接
@@ -572,15 +588,20 @@ async function verifyConcurrentMasterDataAndSectionResize(serverA, serverB, fixt
     { server: serverA, cookie: fixture.schedulerACookie, sectionCount: 3 },
     { server: serverB, cookie: fixture.schedulerBCookie, sectionCount: 4 },
   ];
-  const resizeResults = await Promise.all(resizeAttempts.map(async (attempt) => ({
-    attempt,
-    result: await requestApi(attempt.server, `/api/courses/${fixture.courseId}/sections`, {
-      method: "PATCH",
-      cookie: attempt.cookie,
-      expectedStatus: [200, 409],
-      json: { sectionCount: attempt.sectionCount, revision: fixture.setupRevision },
-    }),
-  })));
+  const resizeResults = await runWhileBothWritersAreBlocked(
+    "Concurrent Course section resize",
+    serverA,
+    serverB,
+    ...resizeAttempts.map((attempt) => async () => ({
+      attempt,
+      result: await requestApi(attempt.server, `/api/courses/${fixture.courseId}/sections`, {
+        method: "PATCH",
+        cookie: attempt.cookie,
+        expectedStatus: [200, 409],
+        json: { sectionCount: attempt.sectionCount, revision: fixture.setupRevision },
+      }),
+    })),
+  );
   assert.deepEqual(resizeResults.map(({ result }) => result.response.status).sort(), [200, 409]);
   const resizeWinner = resizeResults.find(({ result }) => result.response.status === 200);
   const resizeLoser = resizeResults.find(({ result }) => result.response.status === 409);
@@ -599,7 +620,36 @@ async function verifyConcurrentMasterDataAndSectionResize(serverA, serverB, fixt
     (await requestApi(serverB, `/api/courses/${fixture.courseId}/sections`, { cookie: fixture.schedulerBCookie })).body.map((section) => section.id),
     originalSectionIds,
   );
-  report("主资料与班次数量 CAS 在两个 standalone 间只允许一个赢家");
+
+  // 两个 standalone 同时确认删除同一门空课程时，IMMEDIATE 事务必须形成明确顺序：
+  // 一个请求删除成功，另一个随后看到404；不能双200，也不能留下孤立 section。
+  const deletionCourse = (await requestApi(serverA, "/api/courses", {
+    method: "POST",
+    cookie: fixture.schedulerACookie,
+    expectedStatus: 201,
+    json: { code: "CROSS_COURSE_DELETE", catalog: "Concurrent delete", sectionCount: 2 },
+  })).body;
+  const deletionResults = await runWhileBothWritersAreBlocked(
+    "Concurrent Course DELETE",
+    serverA,
+    serverB,
+    () => requestApi(serverA, `/api/courses/${deletionCourse.id}`, {
+      method: "DELETE",
+      cookie: fixture.schedulerACookie,
+      expectedStatus: [200, 404],
+      json: { revision: deletionCourse.revision },
+    }),
+    () => requestApi(serverB, `/api/courses/${deletionCourse.id}`, {
+      method: "DELETE",
+      cookie: fixture.schedulerBCookie,
+      expectedStatus: [200, 404],
+      json: { revision: deletionCourse.revision },
+    }),
+  );
+  assert.deepEqual(deletionResults.map((result) => result.response.status).sort(), [200, 404]);
+  assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM courses WHERE id = ?", deletionCourse.id).count, 0);
+  assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM course_sections WHERE course_id = ?", deletionCourse.id).count, 0);
+  report("主资料、班次数量与 Course DELETE CAS 在两个 standalone 间只允许一个赢家");
 }
 
 async function verifyCandidateSnapshotConsistency(serverA, serverB, fixture) {
@@ -2434,7 +2484,7 @@ async function verifyAuthenticationRevocationRace(serverA, serverB, options) {
     await requestApi(serverA, "/api/auth/accounts", {
       method: "PATCH",
       cookie: administratorCookie,
-      json: { userId: accountId, ...administratorAction },
+      json: administratorAccountAction(accountId, administratorAction),
     });
     // release 前直接读取管理员已提交状态，明确建立“撤销提交发生在登录继续之前”的顺序。
     const accountAfterAction = readDatabaseValue(
@@ -2512,7 +2562,7 @@ async function verifyOwnPasswordRevocationRace(serverA, serverB, options) {
     await requestApi(serverA, "/api/auth/accounts", {
       method: "PATCH",
       cookie: administratorCookie,
-      json: { userId: accountId, ...administratorAction },
+      json: administratorAccountAction(accountId, administratorAction),
     });
     const revokedState = readDatabaseValue(
       "SELECT password_hash, is_active FROM app_users WHERE id = ?",
@@ -2536,7 +2586,7 @@ async function verifyOwnPasswordRevocationRace(serverA, serverB, options) {
       await requestApi(serverA, "/api/auth/accounts", {
         method: "PATCH",
         cookie: administratorCookie,
-        json: { userId: accountId, action: "status", isActive: true },
+        json: administratorAccountAction(accountId, { action: "status", isActive: true }),
       });
     }
     administratorWinningState = readDatabaseValue(
@@ -2649,7 +2699,7 @@ async function verifyOwnPasswordPreReadRevocationRace(serverA, serverB, options)
     await requestApi(serverA, "/api/auth/accounts", {
       method: "PATCH",
       cookie: administratorCookie,
-      json: { userId: accountId, ...administratorAction },
+      json: administratorAccountAction(accountId, administratorAction),
     });
     administratorWinningState = readDatabaseValue(
       "SELECT password_hash, is_active FROM app_users WHERE id = ?",
@@ -2706,7 +2756,7 @@ async function verifyOwnPasswordPreReadRevocationRace(serverA, serverB, options)
     await requestApi(serverA, "/api/auth/accounts", {
       method: "PATCH",
       cookie: administratorCookie,
-      json: { userId: accountId, action: "status", isActive: true },
+      json: administratorAccountAction(accountId, { action: "status", isActive: true }),
     });
     const proposedLogin = await login(serverB, username, proposedPassword, 401);
     assert.deepEqual(proposedLogin.body, { error: "Username or password is incorrect." });
@@ -2727,6 +2777,81 @@ async function verifyOwnPasswordPreReadRevocationRace(serverA, serverB, options)
     0,
   );
   report(description);
+}
+
+async function verifyConcurrentAccountStatusCas(serverA, serverB, fixture) {
+  const account = fixture.accounts.get("cross-account-status-cas");
+  assert(account);
+  assert.equal(account.revision, 1);
+  const scheduler = await login(serverA, "cross-account-status-cas", account.password);
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", account.id).count,
+    1,
+  );
+
+  // 第三连接先挡住两个真实 standalone writer；A/B 都报告已到达 `.immediate()` 后才
+  // 同时放行。两者使用同一 revision 1，因此无论操作系统先调度谁，都只能一项提交。
+  const results = await runWhileBothWritersAreBlocked(
+    "concurrent account-status CAS",
+    serverA,
+    serverB,
+    () => requestApi(serverA, "/api/auth/accounts", {
+      method: "PATCH",
+      cookie: administratorCookie,
+      expectedStatus: [200, 409],
+      json: { action: "status", userId: account.id, isActive: false, expectedRevision: 1 },
+    }),
+    () => requestApi(serverB, "/api/auth/accounts", {
+      method: "PATCH",
+      cookie: administratorCookie,
+      expectedStatus: [200, 409],
+      json: { action: "status", userId: account.id, isActive: false, expectedRevision: 1 },
+    }),
+  );
+  assert.deepEqual(results.map((result) => result.response.status).sort(), [200, 409]);
+  const winner = results.find((result) => result.response.status === 200);
+  const loser = results.find((result) => result.response.status === 409);
+  assert.deepEqual(winner.body, { ok: true, revision: 2, changed: true });
+  assert.deepEqual(loser.body, {
+    code: "ACCOUNT_CHANGED",
+    error: "This account was changed by another administrator. Review the latest account list before trying again.",
+  });
+  assert.deepEqual(
+    readDatabaseValue("SELECT is_active, revision FROM app_users WHERE id = ?", account.id),
+    { is_active: 0, revision: 2 },
+  );
+  assert.equal(
+    readDatabaseValue("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", account.id).count,
+    0,
+  );
+  assert.equal((await requestApi(serverB, "/api/auth/status", { cookie: scheduler.cookie })).body.user, null);
+
+  // 当前版本的同值请求是真 no-op；随后重新启用形成 revision 3。原始页面再提交
+  // revision 1 时，即使其 desired 与历史值相同，也必须稳定409而不能完成 ABA 覆盖。
+  const noOp = await requestApi(serverA, "/api/auth/accounts", {
+    method: "PATCH",
+    cookie: administratorCookie,
+    json: { action: "status", userId: account.id, isActive: false, expectedRevision: 2 },
+  });
+  assert.deepEqual(noOp.body, { ok: true, revision: 2, changed: false });
+  const enabled = await requestApi(serverB, "/api/auth/accounts", {
+    method: "PATCH",
+    cookie: administratorCookie,
+    json: { action: "status", userId: account.id, isActive: true, expectedRevision: 2 },
+  });
+  assert.deepEqual(enabled.body, { ok: true, revision: 3, changed: true });
+  const abaConflict = await requestApi(serverA, "/api/auth/accounts", {
+    method: "PATCH",
+    cookie: administratorCookie,
+    expectedStatus: 409,
+    json: { action: "status", userId: account.id, isActive: false, expectedRevision: 1 },
+  });
+  assert.equal(abaConflict.body.code, "ACCOUNT_CHANGED");
+  assert.deepEqual(
+    readDatabaseValue("SELECT is_active, revision FROM app_users WHERE id = ?", account.id),
+    { is_active: 1, revision: 3 },
+  );
+  report("两个 standalone 同版本启停严格一项200／一项 ACCOUNT_CHANGED，且阻止 ABA");
 }
 
 async function verifyAuthenticationRaces(serverA, serverB, fixture) {
@@ -2761,7 +2886,7 @@ async function verifyAuthenticationRaces(serverA, serverB, fixture) {
   await requestApi(serverA, "/api/auth/accounts", {
     method: "PATCH",
     cookie: administratorCookie,
-    json: { userId: disabledAccount.id, action: "status", isActive: true },
+    json: administratorAccountAction(disabledAccount.id, { action: "status", isActive: true }),
   });
   const reenabledLogin = await login(serverB, "cross-disable-race", disabledAccount.password);
   await requestApi(serverB, "/api/auth/logout", { method: "POST", cookie: reenabledLogin.cookie });
@@ -3259,6 +3384,7 @@ async function run() {
   await verifyConcurrentRuleAndWindowConflicts(serverA, serverB, fixture);
   await verifyRulesWorkspaceSnapshotConsistency(serverA, serverB, fixture);
   await verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture);
+  await verifyConcurrentAccountStatusCas(serverA, serverB, fixture);
   await verifyAuthenticationRaces(serverA, serverB, fixture);
   await verifyAtomicFullSystemRestore(serverA, serverB);
 
@@ -3278,6 +3404,7 @@ async function initializeFixtureAfterAdministrator(serverA, serverB) {
     ["cross-own-disable-race", "OwnDisableOld123!"],
     ["cross-own-preread-reset", "PreReadResetOld123!"],
     ["cross-own-preread-disable", "PreReadDisableOld123!"],
+    ["cross-account-status-cas", "AccountStatusCross123!"],
   ];
   const accounts = new Map();
   for (const [username, password] of accountDefinitions) {
