@@ -2957,6 +2957,53 @@ async function verifyCrudAndRevisions() {
   };
 }
 
+async function verifyPersonalTimetableContracts(ids) {
+  const otherTeacher = (await requestApi("/api/teachers")).body.find((teacher) => teacher.id !== ids.teacherId);
+  assert(otherTeacher, "The personal timetable contract fixture needs a second teacher.");
+
+  const createdWindows = [];
+  try {
+    for (const input of [
+      { kind: "Teacher", ownerId: ids.teacherId, dayOfWeek: 4, startHour: 10, endHour: 11 },
+      { kind: "Teacher", ownerId: otherTeacher.id, dayOfWeek: 5, startHour: 15, endHour: 16 },
+    ]) {
+      const created = await requestApi("/api/unavailability", {
+        method: "POST",
+        expectedStatus: 201,
+        json: input,
+      });
+      createdWindows.push({ id: created.body.id, kind: input.kind });
+    }
+
+    const [teacherTimetable, groupTimetable, roomTimetable] = await Promise.all([
+      requestApi(`/api/schedule/personal?kind=Teacher&ownerId=${encodeURIComponent(ids.teacherId)}`),
+      requestApi(`/api/schedule/personal?kind=StudentGroup&ownerId=${encodeURIComponent(ids.studentGroupId)}`),
+      requestApi(`/api/schedule/personal?kind=Room&ownerId=${encodeURIComponent(ids.roomId)}`),
+    ]);
+    for (const timetable of [teacherTimetable, groupTimetable, roomTimetable]) {
+      assert.deepEqual(Object.keys(timetable.body).sort(), ["lessons", "unavailableWindows"]);
+      assert(Array.isArray(timetable.body.lessons));
+      assert(Array.isArray(timetable.body.unavailableWindows));
+      assert(timetable.body.lessons.some((lesson) => lesson.id === ids.lessonId));
+    }
+
+    assert(teacherTimetable.body.unavailableWindows.some((window) => window.id === createdWindows[0].id));
+    assert(!teacherTimetable.body.unavailableWindows.some((window) => window.id === createdWindows[1].id));
+    assert(teacherTimetable.body.unavailableWindows.every((window) => (
+      window.kind === "Teacher" && window.ownerId === ids.teacherId
+    )));
+    assert.deepEqual(groupTimetable.body.unavailableWindows, []);
+    assert.deepEqual(roomTimetable.body.unavailableWindows, []);
+  } finally {
+    for (const window of createdWindows.reverse()) {
+      await requestApi(`/api/unavailability?id=${encodeURIComponent(window.id)}&kind=${window.kind}`, {
+        method: "DELETE",
+      }).catch(() => undefined);
+    }
+  }
+  report("Personal timetable lessons and teacher-only unavailable-window contract");
+}
+
 async function verifyTeachingWeekRuleIsolation() {
   // 这个 fixture 专门保护“课程日期相同，但教学周不相同”的规则语义。
   // 所有资料都经 production CRUD API 建立；finally 只从本次临时数据库清理这些专用 ID。
@@ -4186,8 +4233,12 @@ async function verifySystemBackupAcrossColumnOrders() {
   // 恢复前状态。响应只给 basename，不能允许路径跳出固定安全目录。
   assert.equal(path.basename(restored.body.safetyBackupFilename), restored.body.safetyBackupFilename);
   const safetyPath = path.join(safetyDirectory, restored.body.safetyBackupFilename);
-  assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
-  assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  // Windows does not expose POSIX chmod semantics through stat(). Keep the production
+  // Railway/Linux permission assertions intact while allowing local Windows regression runs.
+  if (process.platform !== "win32") {
+    assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
+    assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  }
   assert.deepEqual(readBusinessSnapshotFrom(safetyPath), stateAfterMarker);
   const safetyDatabase = new Database(safetyPath, { readonly: true });
   try {
@@ -4796,6 +4847,7 @@ async function run() {
   await verifyTeachingWeekRuleIsolation();
   await verifyManagementSnapshots(relationshipIds);
   await verifyRulesWorkspaceContracts(relationshipIds);
+  await verifyPersonalTimetableContracts(relationshipIds);
   await verifyAtomicMasterDataWarnings(relationshipIds);
   await verifySystemBackupAcrossColumnOrders();
   await verifyAtomicCycleActions(relationshipIds);

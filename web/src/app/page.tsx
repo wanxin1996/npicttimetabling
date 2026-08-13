@@ -81,6 +81,7 @@ type ScheduledLesson = { id: string; sectionId: string; sectionLabel: string; co
 type TimetableLoadResult = { loaded: boolean; reopenedLesson: ScheduledLesson | null; unscheduledSections: UnscheduledSection[] };
 type UnscheduledSection = { id: string; sectionId: string; label: string; teacherName: string | null; teacherIsActive: boolean | null; staffType: "FT" | "PT" | null; durationHours: number; studentGroupIds: string[]; studentGroups: string[]; occurrence: number; sessionsPerWeek: number };
 type UnavailableWindow = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
+type PersonalTimetableWorkspace = { lessons: ScheduledLesson[]; unavailableWindows: UnavailableWindow[] };
 type ScheduleIssue = { id: string; lessonId: string; sectionId: string; occurrence: number; sectionLabel: string; primaryYear: number; dayOfWeek: number; startHour: number; endHour: number; teacherName: string | null; roomCode: string | null; studentGroups: string[]; category: "Assignment" | "Availability" | "Conflict" | "Course rule" | "Preference" | "Room" | "Travel" | "Workload"; severity: "High" | "Warning" | "Advisory"; message: string };
 type YearTimetableWorkspace = { lessons: ScheduledLesson[]; unscheduledSections: UnscheduledSection[]; issues: ScheduleIssue[]; teachers: Teacher[]; rooms: Room[] };
 type CandidateSlot = { dayOfWeek: number; startHour: number; endHour: number; roomId: string; roomCode: string; roomCapacity: number; roomFeatures: string[] };
@@ -144,6 +145,19 @@ function parseYearTimetableWorkspace(payload: unknown): YearTimetableWorkspace {
     issues: requireArrayPayload<ScheduleIssue>(candidate.issues, "The year timetable issues were missing."),
     teachers: requireArrayPayload<Teacher>(candidate.teachers, "The year timetable teachers were missing."),
     rooms: requireArrayPayload<Room>(candidate.rooms, "The year timetable rooms were missing."),
+  };
+}
+
+function parsePersonalTimetableWorkspace(payload: unknown): PersonalTimetableWorkspace {
+  // 个人课表的课程与教师不可上课时段来自同一次服务端快照；两个字段都必须是数组，
+  // 否则保留上一份完整画面，不能把新课程与旧黑色时段混在一起。
+  if (typeof payload !== "object" || payload === null) {
+    throw new Error("The personal timetable response was invalid.");
+  }
+  const candidate = payload as Record<string, unknown>;
+  return {
+    lessons: requireArrayPayload<ScheduledLesson>(candidate.lessons, "The personal timetable lessons were missing."),
+    unavailableWindows: requireArrayPayload<UnavailableWindow>(candidate.unavailableWindows, "The personal timetable unavailable windows were missing."),
   };
 }
 
@@ -398,8 +412,9 @@ function positionTimetableLessons(lessons: ScheduledLesson[]): PositionedLesson[
   return positioned;
 }
 
-function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }: {
+function WeeklyTimetableGrid({ lessons, unavailableWindows = [], renderLesson, onCellDrop, focusLesson }: {
   lessons: ScheduledLesson[];
+  unavailableWindows?: UnavailableWindow[];
   renderLesson: (lesson: ScheduledLesson, isDense: boolean) => React.ReactNode;
   onCellDrop?: (event: DragEvent<HTMLDivElement>, dayOfWeek: number, startHour: number) => void;
   focusLesson?: { id: string; requestNumber: number } | null;
@@ -504,6 +519,23 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
           <div key={`overlay-${dayIndex + 1}`} className="pointer-events-none relative z-10" style={{ gridColumn: dayIndex + 2, gridRow: "2 / span 10" }}>
             {/* 绿色目标行显示在已有课程卡上方但不截获鼠标事件，因此老师能看见确切落点，同时拖放仍由下方课程或小时格处理。 */}
             {dropTarget?.dayOfWeek === dayIndex + 1 && <div className="pointer-events-none absolute z-30 flex items-start rounded border-2 border-emerald-500 bg-emerald-200/70 px-1 py-0.5 font-black text-emerald-950 shadow-sm" style={{ top: `${((dropTarget.startHour - timetableHours[0]) / timetableHours.length) * 100}%`, height: `${100 / timetableHours.length}%`, left: 1, right: 1 }}><span className="rounded bg-white/90 px-1">Drop {String(dropTarget.startHour).padStart(2, "0")}:00</span></div>}
+            {unavailableWindows.filter((window) => window.dayOfWeek === dayIndex + 1).map((window) => {
+              const top = ((window.startHour - timetableHours[0]) / timetableHours.length) * 100;
+              const height = ((window.endHour - window.startHour) / timetableHours.length) * 100;
+              const dayLabel = timetableDays[window.dayOfWeek - 1] ?? "Selected day";
+              return (
+                <div
+                  key={`unavailable-${window.id}`}
+                  data-unavailable-window-id={window.id}
+                  role="img"
+                  aria-label={`Unavailable: ${dayLabel}, ${String(window.startHour).padStart(2, "0")}:00 to ${String(window.endHour).padStart(2, "0")}:00`}
+                  className="pointer-events-none absolute z-30 flex items-start bg-black p-1 text-[9px] font-bold leading-none text-white"
+                  style={{ top: `calc(${top}% + 2px)`, height: `calc(${height}% - 4px)`, left: 2, right: 2 }}
+                >
+                  <span>Unavailable</span>
+                </div>
+              );
+            })}
             {positionedLessons.filter((item) => item.lesson.dayOfWeek === dayIndex + 1).map(({ lesson, lane, laneCount }) => {
               const laneWidth = 100 / laneCount;
               // 三条以上并排时把卡片之间的空隙从 4px 缩到 2px，把宝贵宽度留给课程编号和教师姓名；普通密度仍保留较清楚的分隔。
@@ -520,7 +552,7 @@ function WeeklyTimetableGrid({ lessons, renderLesson, onCellDrop, focusLesson }:
                   aria-label={`${lesson.sectionLabel}, ${lesson.durationHours} hours`}
                   onDragOver={onCellDrop ? (event) => allowCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
                   onDrop={onCellDrop ? (event) => finishCellDrop(event, lesson.dayOfWeek, hourInsideLesson(event, lesson)) : undefined}
-                  className={`pointer-events-auto absolute transition ${focusLesson?.id === lesson.id ? "z-20 rounded-md ring-4 ring-emerald-400 ring-offset-2" : ""}`}
+                  className={`pointer-events-auto absolute z-20 transition ${focusLesson?.id === lesson.id ? "rounded-md ring-4 ring-emerald-400 ring-offset-2" : ""}`}
                   style={{ top: `calc(${top}% + 2px)`, height: `calc(${height}% - 4px)`, left: `calc(${lane * laneWidth}% + ${laneGap}px)`, width: `calc(${laneWidth}% - ${laneGap * 2}px)` }}
                 >
                   {renderLesson(lesson, laneCount > 2)}
@@ -633,6 +665,7 @@ export default function Home() {
   const [personalKind, setPersonalKind] = useState<"Teacher" | "StudentGroup" | "Room">("Teacher");
   const [personalOwnerId, setPersonalOwnerId] = useState("");
   const [personalLessons, setPersonalLessons] = useState<ScheduledLesson[]>([]);
+  const [personalUnavailableWindows, setPersonalUnavailableWindows] = useState<UnavailableWindow[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSetting[]>([]);
   const [currentCycle, setCurrentCycle] = useState<CycleStatus | null>(null);
   const [authScreen, setAuthScreen] = useState<"checking" | "setup" | "login" | "ready" | "load-error">("checking");
@@ -1000,6 +1033,7 @@ export default function Home() {
     clearCandidateSlotWorkspace();
     setPersonalOwnerId("");
     setPersonalLessons([]);
+    setPersonalUnavailableWindows([]);
     setLastSyncedAt(null);
     setUnavailableWindows([]);
     setScheduleIssues([]);
@@ -1480,16 +1514,14 @@ export default function Home() {
         }
         return;
       }
-      const nextPersonalLessons = requireArrayPayload<ScheduledLesson>(
-        await response.json(),
-        "The personal timetable response was invalid.",
-      );
+      const workspace = parsePersonalTimetableWorkspace(await response.json());
       if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       if (requestNumber !== visibleWorkspaceRefreshNumber.current || managementMutationKeyRef.current) return;
       // 只有新课表完整到达后才更新选择器和页面，失败时保留老师仍可阅读的上一版画面。
       setPersonalKind(kind);
       setPersonalOwnerId(ownerId);
-      setPersonalLessons(nextPersonalLessons);
+      setPersonalLessons(workspace.lessons);
+      setPersonalUnavailableWindows(kind === "Teacher" ? workspace.unavailableWindows : []);
       setActiveView("Personal timetables");
       setShowForm(false);
     } catch {
@@ -2346,9 +2378,10 @@ export default function Home() {
         if (view === "Personal timetables") {
           // 两个数组必须先全部验证成功再一起写入；若教师 payload 损坏，不能先应用
           // 新课表而留下旧教师清单，制造数据库中从未同时存在过的混合页面。
-          const nextPersonalLessons = requireArrayPayload<ScheduledLesson>(payloads[0], "The personal timetable poll response was invalid.");
+          const workspace = parsePersonalTimetableWorkspace(payloads[0]);
           const nextTeachers = requireArrayPayload<Teacher>(payloads[1], "The teacher poll response was invalid.");
-          setPersonalLessons(nextPersonalLessons);
+          setPersonalLessons(workspace.lessons);
+          setPersonalUnavailableWindows(personalKind === "Teacher" ? workspace.unavailableWindows : []);
           setTeachers(nextTeachers);
         }
         setLastSyncedAt(new Date());
@@ -4065,11 +4098,21 @@ export default function Home() {
                 </label>
               </div>
               <div className="mb-3 flex items-center justify-between">
-                <div><p className="font-black text-slate-950">Weekly timetable</p><p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p></div>
+                <div>
+                  <p className="font-black text-slate-950">Weekly timetable</p>
+                  <p className="text-xs text-slate-500">{personalLessons.length} scheduled lessons across all year master tables</p>
+                  {personalKind === "Teacher" && (
+                    <p className="mt-1 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                      <span className="h-3 w-3 bg-black" aria-hidden="true" />
+                      Unavailable
+                    </p>
+                  )}
+                </div>
                 <Pill tone={personalIssueTone}>{personalIssueLabel}</Pill>
               </div>
               <WeeklyTimetableGrid
                 lessons={personalLessons}
+                unavailableWindows={personalKind === "Teacher" ? personalUnavailableWindows : []}
                 renderLesson={(lesson) => {
                   // 个人课表沿用总表的跨小时布局但保持只读；卡片只显示与当前查看对象最有关联的教师或教室信息。
                   const issueClasses = lessonIssueClasses(lesson.warningSeverity);

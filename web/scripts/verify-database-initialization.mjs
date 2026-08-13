@@ -621,18 +621,36 @@ async function verifyPersistentStorageBoundary() {
     assert.match(outsideVolumeResult.stderr, /must stay inside/i);
 
     const danglingLinkPath = path.join(volumeDirectory, "linked.sqlite");
-    await symlink(path.join(outsideDirectory, "created-after-check.sqlite"), danglingLinkPath);
-    const danglingLinkResult = runStorageCheck({
-      RAILWAY_ENVIRONMENT: "production",
-      RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
-      TIMETABLING_DATABASE_PATH: danglingLinkPath,
-    });
-    assert.notEqual(danglingLinkResult.status, 0);
-    assert.match(danglingLinkResult.stderr, /must not be a symbolic link/i);
+    let canCreateFileSymlink = true;
+    try {
+      await symlink(path.join(outsideDirectory, "created-after-check.sqlite"), danglingLinkPath);
+    } catch (error) {
+      // Windows without Developer Mode cannot create file symlinks as an unprivileged user.
+      // Railway runs on Linux, so retain this assertion there and keep the Windows suite useful
+      // by covering the same volume-escape boundary with a directory junction below.
+      if (process.platform === "win32" && error?.code === "EPERM") {
+        canCreateFileSymlink = false;
+      } else {
+        throw error;
+      }
+    }
+    if (canCreateFileSymlink) {
+      const danglingLinkResult = runStorageCheck({
+        RAILWAY_ENVIRONMENT: "production",
+        RAILWAY_VOLUME_MOUNT_PATH: volumeDirectory,
+        TIMETABLING_DATABASE_PATH: danglingLinkPath,
+      });
+      assert.notEqual(danglingLinkResult.status, 0);
+      assert.match(danglingLinkResult.stderr, /must not be a symbolic link/i);
+    }
 
     await mkdir(outsideDirectory, { recursive: true });
     const directoryLinkPath = path.join(volumeDirectory, "escape");
-    await symlink(outsideDirectory, directoryLinkPath);
+    await symlink(
+      outsideDirectory,
+      directoryLinkPath,
+      process.platform === "win32" ? "junction" : "dir",
+    );
     const escapedSubdirectory = path.join(outsideDirectory, "must-not-be-created");
     const directoryLinkResult = runStorageCheck({
       RAILWAY_ENVIRONMENT: "production",

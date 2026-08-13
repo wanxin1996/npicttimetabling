@@ -3235,8 +3235,12 @@ async function verifyAtomicFullSystemRestore(serverA, serverB) {
   assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM teachers WHERE id = ?", postRestoreTeacherId).count, 1);
 
   const safetyPath = path.join(safetyDirectory, restored.body.safetyBackupFilename);
-  assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
-  assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  // Windows does not expose POSIX chmod semantics through stat(). Railway/Linux must
+  // still prove that restore safety directories and files use restrictive permissions.
+  if (process.platform !== "win32") {
+    assert.equal((await stat(safetyDirectory)).mode & 0o777, 0o700);
+    assert.equal((await stat(safetyPath)).mode & 0o777, 0o600);
+  }
   const expectedSafety = { ...beforeRestore, sessions: [] };
   assert.deepEqual(readFullBusinessSnapshotFrom(safetyPath), expectedSafety);
   const safetyDatabase = new Database(safetyPath, { readonly: true });

@@ -522,17 +522,32 @@ async function verifyReadPerformance(schedulerCookies) {
       ["Room", "perf-room-001"],
     ]) {
       const personal = await requestApi(`/api/schedule/personal?kind=${kind}&ownerId=${ownerId}`, { cookie: schedulerCookies[0] });
-      const actualIds = personal.body.map((lesson) => lesson.id).sort();
+      assert.deepEqual(Object.keys(personal.body).sort(), ["lessons", "unavailableWindows"]);
+      const actualIds = personal.body.lessons.map((lesson) => lesson.id).sort();
       assert.equal(new Set(actualIds).size, actualIds.length, `${kind} personal timetable returned duplicate lessons.`);
       assert.deepEqual(actualIds, expectedPersonalIds(kind, ownerId));
+      if (kind === "Teacher") {
+        assert.deepEqual(personal.body.unavailableWindows, [{
+          id: "perf-teacher-window-01",
+          kind: "Teacher",
+          ownerId: "perf-teacher-001",
+          ownerLabel: "PERF TEACHER 001",
+          dayOfWeek: 1,
+          startHour: 10,
+          endHour: 12,
+        }]);
+      } else {
+        assert.deepEqual(personal.body.unavailableWindows, [], `${kind} personal timetable exposed unavailable windows.`);
+      }
       // 第一条 fixture 课同时连接 Year 1 与 Year 2；三种个人视图都必须返回完整关联标签。
-      const crossLevelLesson = personal.body.find((lesson) => lesson.id === "perf-lesson-001");
+      const crossLevelLesson = personal.body.lessons.find((lesson) => lesson.id === "perf-lesson-001");
       assert(crossLevelLesson, `${kind} personal timetable omitted the shared cross-level lesson.`);
       assert.deepEqual([...crossLevelLesson.studentGroupIds].sort(), ["perf-group-001", "perf-group-020"]);
       assert.deepEqual([...crossLevelLesson.studentGroups].sort(), ["PERF_Y1_01", "PERF_Y2_20"]);
     }
     const secondCrossLevelGroup = await requestApi("/api/schedule/personal?kind=StudentGroup&ownerId=perf-group-020", { cookie: schedulerCookies[1] });
-    assert(secondCrossLevelGroup.body.some((lesson) => lesson.id === "perf-lesson-001"), "The second cross-level student group omitted its shared lesson.");
+    assert(secondCrossLevelGroup.body.lessons.some((lesson) => lesson.id === "perf-lesson-001"), "The second cross-level student group omitted its shared lesson.");
+    assert.deepEqual(secondCrossLevelGroup.body.unavailableWindows, []);
     report("教师、学生班级和教室个人时间表关系完整且无重复");
 
     // 三批、每批六个独立账号同时读取问题清单，记录每批 p95 的中位数。
@@ -796,11 +811,15 @@ async function readStatementAuditReport() {
 }
 
 async function captureCompletedStatementAudit() {
-  // 业务 HTTP 已经完整返回后才向测试进程发送 SIGUSR2。preload 在同一事件循环中同步
+  // 业务 HTTP 已经完整返回后才写入带随机 nonce 的快照请求。preload 在同一事件循环中同步
   // 写入更高 snapshotSequence，主测试因此不会误读目标请求执行到一半时的旧定时快照。
   const beforeSignal = await readStatementAuditReport();
   const previousSequence = beforeSignal?.runToken === statementAuditToken ? beforeSignal.snapshotSequence : 0;
-  assert(serverProcess && serverProcess.kill("SIGUSR2"), "The statement audit server could not receive its snapshot signal.");
+  await writeFile(
+    `${statementAuditReportPath}.snapshot-request`,
+    `${statementAuditToken}:${randomBytes(16).toString("hex")}`,
+    { mode: 0o600 },
+  );
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const auditReport = await readStatementAuditReport();
@@ -843,6 +862,7 @@ async function runStatementAudit(auditName, label, schedulerCookie, auditedReque
   statementAuditToken = randomBytes(32).toString("hex");
   statementAuditReportPath = path.join(temporaryDirectory, `statement-audit-${auditName}.json`);
   await rm(statementAuditReportPath, { force: true });
+  await rm(`${statementAuditReportPath}.snapshot-request`, { force: true });
   await writeFile(path.join(temporaryDirectory, "statement-audit.marker"), statementAuditToken, { mode: 0o600 });
   await startServer({ auditStatements: true });
   try {

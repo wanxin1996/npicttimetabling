@@ -15,6 +15,7 @@ const runToken = process.env.TIMETABLING_STATEMENT_AUDIT_TOKEN || "";
 const databasePath = path.resolve(process.env.TIMETABLING_DATABASE_PATH || "");
 const temporaryRoot = path.dirname(databasePath);
 const reportPath = path.resolve(process.env.TIMETABLING_STATEMENT_AUDIT_REPORT || "");
+const snapshotRequestPath = `${reportPath}.snapshot-request`;
 const markerPath = path.join(temporaryRoot, "statement-audit.marker");
 const systemTemporaryDirectory = path.resolve(os.tmpdir());
 
@@ -41,6 +42,7 @@ const statementSources = new WeakMap();
 const patchedStatementPrototypes = new WeakSet();
 const counters = new Map();
 let lastCounterJson = "";
+let lastSnapshotRequest = "";
 let snapshotSequence = 0;
 
 function normalizedSql(sql) {
@@ -115,9 +117,26 @@ function writeReport(force = false) {
   fs.renameSync(temporaryReportPath, reportPath);
 }
 
+function publishRequestedSnapshot() {
+  let request;
+  try {
+    request = fs.readFileSync(snapshotRequestPath, "utf8").trim();
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (request === lastSnapshotRequest) return;
+  const expectedRequestPattern = new RegExp(`^${runToken}:[a-f0-9]{32}$`);
+  if (!expectedRequestPattern.test(request)) return;
+  lastSnapshotRequest = request;
+  writeReport(true);
+}
+
 // 100ms 的 unref 定时器不会阻止服务退出；正常运行中持续留下最新完整报告，
-// 因此无需接管 SIGTERM，也不会影响 Next.js 自己的优雅停止处理。
-const reportTimer = setInterval(writeReport, 100);
+// 随机令牌快照请求也由这个低频循环处理，避免依赖 Windows 不支持的 Unix 信号。
+const reportTimer = setInterval(() => {
+  publishRequestedSnapshot();
+  writeReport();
+}, 100);
 reportTimer.unref();
-process.on("SIGUSR2", () => writeReport(true));
 process.once("exit", () => writeReport(true));

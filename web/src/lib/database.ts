@@ -195,6 +195,11 @@ export type UnscheduledSectionRecord = {
 
 export type UnavailableWindowRecord = { id: string; kind: "Teacher" | "Year"; ownerId: string; ownerLabel: string; dayOfWeek: number; startHour: number; endHour: number };
 
+export type PersonalTimetableWorkspaceRecord = {
+  lessons: ScheduledLessonRecord[];
+  unavailableWindows: UnavailableWindowRecord[];
+};
+
 export type ScheduleIssueRecord = {
   id: string;
   lessonId: string;
@@ -887,10 +892,19 @@ function assertRestorableSystemBackup(source: DatabaseInstance, live: DatabaseIn
 
 function synchronizeDirectory(directory: string) {
   // fsync 文件只保证文件内容；rename 所在目录也需要 fsync，突然断电或容器崩溃后
-  // 文件名才有持久化保证。Railway 的持久卷和本地 APFS/ext4 都支持目录同步。
+  // 文件名才有持久化保证。Railway 的持久卷和本地 APFS/ext4 都支持目录同步；
+  // Windows 不提供等价的目录 fsync，但上方的文件 fsync 与原子 rename 仍然保留。
   const descriptor = openSync(directory, "r");
   try {
-    fsyncSync(descriptor);
+    try {
+      fsyncSync(descriptor);
+    } catch (error) {
+      const isUnsupportedWindowsDirectorySync = process.platform === "win32"
+        && error instanceof Error
+        && "code" in error
+        && (error.code === "EPERM" || error.code === "EINVAL");
+      if (!isUnsupportedWindowsDirectorySync) throw error;
+    }
   } finally {
     closeSync(descriptor);
   }
@@ -3299,10 +3313,9 @@ export function listScheduledLessons(year: number): ScheduledLessonRecord[] {
   });
 }
 
-export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
+function readPersonalScheduledLessons(db: DatabaseInstance, kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
   // 教师、学生班级和教室视图都查询三个年级共用的同一批排课记录，
   // 系统不会为个人视图复制另一份时间表数据。
-  const db = database();
   // 教师和教室日程横跨三个年级总表；学生班级日程通过关联表查询，
   // 因而跨年级课程会出现在每个参与班级的视图中。
   const ownerFilter = kind === "Teacher"
@@ -3345,6 +3358,46 @@ export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | 
     const warnings = JSON.parse(row.warnings_json) as string[];
     return { id: row.id, sectionId: row.section_id, sectionLabel: `${row.code}_${String(row.sequence).padStart(2, "0")}${row.sessions_per_week > 1 ? ` · Session ${row.occurrence}` : ""}${weekRangeSuffix(row.week_start, row.week_end)}`, courseCode: row.code, teacherId: row.teacher_id, teacherName: row.teacher_name, dayOfWeek: row.day_of_week, startHour: row.start_hour, durationHours: row.duration_hours, roomId: row.room_id, roomCode: row.room_code, studentGroupIds: row.student_group_ids ? row.student_group_ids.split(",") : [], studentGroups: row.student_groups ? row.student_groups.split(", ") : [], occurrence: row.occurrence, sessionsPerWeek: row.sessions_per_week, revision: row.revision, warnings, warningSeverity: highestIssueSeverity(warnings) };
   });
+}
+
+export function listPersonalScheduledLessons(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): ScheduledLessonRecord[] {
+  return readPersonalScheduledLessons(database(), kind, ownerId);
+}
+
+function readPersonalTeacherUnavailableWindows(db: DatabaseInstance, teacherId: string): UnavailableWindowRecord[] {
+  const rows = db.prepare(`
+    SELECT windows.id, windows.teacher_id AS owner_id, teachers.name AS owner_label,
+      windows.day_of_week, windows.start_hour, windows.end_hour
+    FROM teacher_unavailable_windows windows
+    JOIN teachers ON teachers.id = windows.teacher_id
+    WHERE windows.teacher_id = ?
+    ORDER BY windows.day_of_week, windows.start_hour, windows.end_hour, windows.id
+  `).all(teacherId) as Array<{ id: string; owner_id: string; owner_label: string; day_of_week: number; start_hour: number; end_hour: number }>;
+  return rows.map((row) => ({
+    id: row.id,
+    kind: "Teacher" as const,
+    ownerId: row.owner_id,
+    ownerLabel: row.owner_label,
+    dayOfWeek: row.day_of_week,
+    startHour: row.start_hour,
+    endHour: row.end_hour,
+  }));
+}
+
+export function listPersonalTimetableWorkspace(kind: "Teacher" | "StudentGroup" | "Room", ownerId: string): PersonalTimetableWorkspaceRecord {
+  // 课程和教师不可上课时段属于同一个个人课表快照；若规则刚被另一进程修改，浏览器只能在
+  // 下一次轮询中看到整组新数据，不能把旧课程与新时段（或反向组合）拼在一起。
+  try {
+    const db = database();
+    const readWorkspace = db.transaction(() => ({
+      lessons: readPersonalScheduledLessons(db, kind, ownerId),
+      unavailableWindows: kind === "Teacher" ? readPersonalTeacherUnavailableWindows(db, ownerId) : [],
+    }));
+    return readWorkspace.deferred();
+  } catch (error) {
+    if (isSqliteBusyError(error)) throw new DatabaseBusyError();
+    throw error;
+  }
 }
 
 export function listUnscheduledSections(year: number): UnscheduledSectionRecord[] {
