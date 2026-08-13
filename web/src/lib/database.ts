@@ -262,14 +262,25 @@ export type CycleStatusRecord = {
   backup: null | { id: string; createdAt: string; courses: number; sections: number; lessons: number };
 };
 
-// 紧急快照只保存当前排课周期的数据，例如课程、班次和已排课记录。
+// 紧急快照只保存当前排课周期的数据，例如课程、班次、已排课记录和本周期不可用时段。
 // 教师、教室等基础资料以及账号数据不会写入快照，因为开始新周期时必须继续保留它们。
 type CourseSnapshotRow = { id: string; code: string; catalog: string | null; revision?: number; duration_hours: number | null; sessions_per_week: number; primary_year: number | null; minimum_room_capacity: number | null; requires_lab: number; requires_multi_projector: number; requires_smart_classroom: number; separate_sections_across_days: number; week_pattern: "ALL" | "W1_4" | "W5_8"; week_start?: number | null; week_end?: number | null; created_at: string; updated_at: string };
 type AllocationSnapshotRow = { id: string; course_id: string; teacher_id: string; assigned_group_count: number };
 type SectionSnapshotRow = { id: string; course_id: string; sequence: number; teacher_id: string | null; allocation_teacher_id?: string | null; revision?: number };
 type SectionGroupSnapshotRow = { section_id: string; student_group_id: string };
 type LessonSnapshotRow = { id: string; section_id: string; occurrence: number; day_of_week: number; start_hour: number; duration_hours: number; room_id: string | null; warnings_json: string; revision: number };
-type CycleSnapshot = { courses: CourseSnapshotRow[]; allocations: AllocationSnapshotRow[]; sections: SectionSnapshotRow[]; sectionGroups: SectionGroupSnapshotRow[]; lessons: LessonSnapshotRow[] };
+type TeacherUnavailableWindowSnapshotRow = { id: string; teacher_id: string; day_of_week: number; start_hour: number; end_hour: number };
+type YearBlockedWindowSnapshotRow = { id: string; year: number; day_of_week: number; start_hour: number; end_hour: number };
+type CycleSnapshot = {
+  courses: CourseSnapshotRow[];
+  allocations: AllocationSnapshotRow[];
+  sections: SectionSnapshotRow[];
+  sectionGroups: SectionGroupSnapshotRow[];
+  lessons: LessonSnapshotRow[];
+  // 旧版紧急快照没有这两个字段；解析与恢复保留向后兼容。
+  teacherUnavailableWindows?: TeacherUnavailableWindowSnapshotRow[];
+  yearBlockedWindows?: YearBlockedWindowSnapshotRow[];
+};
 
 type DatabaseInstance = InstanceType<typeof Database>;
 
@@ -2333,6 +2344,8 @@ function readCycleSnapshot(db: DatabaseInstance): CycleSnapshot {
     sections: db.prepare("SELECT id, course_id, sequence, teacher_id, allocation_teacher_id, revision FROM course_sections ORDER BY id").all() as SectionSnapshotRow[],
     sectionGroups: db.prepare("SELECT section_id, student_group_id FROM section_student_groups ORDER BY section_id, student_group_id").all() as SectionGroupSnapshotRow[],
     lessons: db.prepare("SELECT id, section_id, occurrence, day_of_week, start_hour, duration_hours, room_id, warnings_json, revision FROM scheduled_lessons ORDER BY id").all() as LessonSnapshotRow[],
+    teacherUnavailableWindows: db.prepare("SELECT id, teacher_id, day_of_week, start_hour, end_hour FROM teacher_unavailable_windows ORDER BY id").all() as TeacherUnavailableWindowSnapshotRow[],
+    yearBlockedWindows: db.prepare("SELECT id, year, day_of_week, start_hour, end_hour FROM year_blocked_windows ORDER BY id").all() as YearBlockedWindowSnapshotRow[],
   };
 }
 
@@ -2367,14 +2380,20 @@ function hasUniqueValues(values: string[]) {
 }
 
 function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
-  // 紧急备份以后会直接重建五张 live 表，因此不能只检查“五个数组存在”。这里验证
-  // 每个字段的业务 domain、稳定 ID、数组间引用和 section 连续性；损坏快照在 Cycle
-  // 状态页被隐藏，在 Restore 则成为明确 409，绝不会先清空当前周期再发现问题。
+  // 紧急备份以后会直接重建周期表，因此不能只检查数组存在。这里验证每个字段的业务
+  // domain、稳定 ID、数组间引用和 section 连续性；损坏快照在 Cycle 状态页被隐藏，
+  // 在 Restore 则成为明确 409，绝不会先清空当前周期再发现问题。
   try {
     const parsed: unknown = JSON.parse(snapshotJson);
     if (!isPlainRecord(parsed)) return null;
     const candidate = parsed as Partial<Record<keyof CycleSnapshot, unknown>>;
     if (![candidate.courses, candidate.allocations, candidate.sections, candidate.sectionGroups, candidate.lessons].every(Array.isArray)) return null;
+    // 新格式必须同时保存两类窗口；两者都缺失才是允许恢复的旧格式快照。
+    const hasTeacherUnavailableWindows = candidate.teacherUnavailableWindows !== undefined;
+    const hasYearBlockedWindows = candidate.yearBlockedWindows !== undefined;
+    if (hasTeacherUnavailableWindows !== hasYearBlockedWindows) return null;
+    if (hasTeacherUnavailableWindows
+      && (!Array.isArray(candidate.teacherUnavailableWindows) || !Array.isArray(candidate.yearBlockedWindows))) return null;
     const snapshot = candidate as CycleSnapshot;
     if (snapshot.courses.length === 0) return null;
 
@@ -2481,6 +2500,30 @@ function parseCycleSnapshot(snapshotJson: string): CycleSnapshot | null {
     if (!lessonsAreValid) return null;
     if (!hasUniqueValues(snapshot.lessons.map((lesson) => lesson.id))) return null;
     if (!hasUniqueValues(snapshot.lessons.map((lesson) => `${lesson.section_id}\u0000${lesson.occurrence}`))) return null;
+
+    const teacherUnavailableWindows = snapshot.teacherUnavailableWindows ?? [];
+    const teacherWindowsAreValid = teacherUnavailableWindows.every((window: unknown) => isPlainRecord(window)
+      && isOpaqueResourceId(window.id)
+      && isOpaqueResourceId(window.teacher_id)
+      && isIntegerBetween(window.day_of_week, 1, 5)
+      && isIntegerBetween(window.start_hour, 8, 17)
+      && isIntegerBetween(window.end_hour, 9, 18)
+      && window.end_hour > window.start_hour);
+    if (!teacherWindowsAreValid) return null;
+    if (!hasUniqueValues(teacherUnavailableWindows.map((window) => window.id))) return null;
+    if (!hasUniqueValues(teacherUnavailableWindows.map((window) => `${window.teacher_id}\u0000${window.day_of_week}\u0000${window.start_hour}\u0000${window.end_hour}`))) return null;
+
+    const yearBlockedWindows = snapshot.yearBlockedWindows ?? [];
+    const yearWindowsAreValid = yearBlockedWindows.every((window: unknown) => isPlainRecord(window)
+      && isOpaqueResourceId(window.id)
+      && isIntegerBetween(window.year, 1, 3)
+      && isIntegerBetween(window.day_of_week, 1, 5)
+      && isIntegerBetween(window.start_hour, 8, 17)
+      && isIntegerBetween(window.end_hour, 9, 18)
+      && window.end_hour > window.start_hour);
+    if (!yearWindowsAreValid) return null;
+    if (!hasUniqueValues(yearBlockedWindows.map((window) => window.id))) return null;
+    if (!hasUniqueValues(yearBlockedWindows.map((window) => `${window.year}\u0000${window.day_of_week}\u0000${window.start_hour}\u0000${window.end_hour}`))) return null;
     return snapshot;
   } catch {
     return null;
@@ -2535,7 +2578,7 @@ export function cycleStatus(): CycleStatusRecord {
   // 返回当前排课数据总数，以及开始新周期后可用于一次撤销操作的最新紧急快照。
   const db = cycleDatabase();
   const statusTransaction = db.transaction(() => {
-    // 当前五张周期表和最新备份都在同一个只读事务快照中读取，避免 GET 把两个并发版本拼在一起。
+    // 当前周期表和最新备份都在同一个只读事务快照中读取，避免 GET 把两个并发版本拼在一起。
     const currentSnapshot = readCycleSnapshot(db);
     const backup = db.prepare("SELECT id, snapshot_json, created_at FROM schedule_backups ORDER BY created_at DESC LIMIT 1").get() as { id: string; snapshot_json: string; created_at: string } | undefined;
     const backupSnapshot = backup ? parseCycleSnapshot(backup.snapshot_json) : null;
@@ -2557,11 +2600,11 @@ export function cycleStatus(): CycleStatusRecord {
 }
 
 export function startNewCycle(expectedCurrentToken: string): CycleStatusRecord {
-  // 先快照当前排课工作，再在一个事务中清空课程、生成班次和排课记录；
+  // 先快照当前排课工作，再在一个事务中清空课程、生成班次、排课记录和不可用时段；
   // 教师、学生班级、教室、规则及账号继续保留供新周期使用。
   const db = cycleDatabase();
   const replaceCycle = db.transaction(() => {
-    // 取得 IMMEDIATE 写锁之后再执行五张表的快照查询，保证数组彼此来自同一数据库版本；
+    // 取得 IMMEDIATE 写锁之后再执行全部周期表的快照查询，保证数组彼此来自同一数据库版本；
     // 其他账号不能在快照完成后、清空之前再插入一门不在备份里的课程。
     const snapshot = readCycleSnapshot(db);
     if (cycleSnapshotToken(snapshot) !== expectedCurrentToken) throw new CycleActionConflictError("The current cycle changed. Refresh this page and review the latest contents before starting a new cycle.");
@@ -2574,6 +2617,8 @@ export function startNewCycle(expectedCurrentToken: string): CycleStatusRecord {
     db.prepare("DELETE FROM schedule_backups").run();
     db.prepare("INSERT INTO schedule_backups (id, snapshot_json, created_at) VALUES (?, ?, ?)").run(backupId, JSON.stringify(snapshot), createdAt);
     db.prepare("DELETE FROM courses").run();
+    db.prepare("DELETE FROM teacher_unavailable_windows").run();
+    db.prepare("DELETE FROM year_blocked_windows").run();
     // 在事务函数内构造响应，避免提交后再查状态失败而出现“接口说失败但周期已经清空”。
     const clearedSnapshot = readCycleSnapshot(db);
     return {
@@ -2595,7 +2640,7 @@ export function startNewCycle(expectedCurrentToken: string): CycleStatusRecord {
 
 export function restoreLastCycleBackup(expectedBackupId: string, expectedCurrentToken: string): CycleStatusRecord {
   // 在单一事务中用最新紧急 JSON 快照替换当前周期数据，随后根据目前保留的规则
-  // 和不可用时段重新计算全部警告。
+  // 和快照恢复的不可用时段重新计算全部警告。
   const db = cycleDatabase();
   const restore = db.transaction(() => {
     // 在取得 IMMEDIATE 写锁后才选择最新备份，并与页面确认的稳定 ID 比较。
@@ -2613,6 +2658,16 @@ export function restoreLastCycleBackup(expectedBackupId: string, expectedCurrent
     // 按父表到子表的顺序恢复，确保每一步外键都有效。清空、重建和 warning 重算
     // 都在同一个事务中；如果基础资料已经不存在或任一步失败，当前周期完整回滚。
     db.prepare("DELETE FROM courses").run();
+    if (snapshot.teacherUnavailableWindows && snapshot.yearBlockedWindows) {
+      // 新格式备份完整替换两类周期窗口；旧格式没有窗口字段时保留当前窗口，
+      // 避免恢复历史课程时意外抹掉旧版本从未备份的资料。
+      db.prepare("DELETE FROM teacher_unavailable_windows").run();
+      db.prepare("DELETE FROM year_blocked_windows").run();
+      const insertTeacherWindow = db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)");
+      for (const row of snapshot.teacherUnavailableWindows) insertTeacherWindow.run(row.id, row.teacher_id, row.day_of_week, row.start_hour, row.end_hour);
+      const insertYearWindow = db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)");
+      for (const row of snapshot.yearBlockedWindows) insertYearWindow.run(row.id, row.year, row.day_of_week, row.start_hour, row.end_hour);
+    }
     const insertCourse = db.prepare(`INSERT INTO courses (id, code, catalog, revision, duration_hours, sessions_per_week, primary_year, minimum_room_capacity, requires_lab, requires_multi_projector, requires_smart_classroom, separate_sections_across_days, week_pattern, week_start, week_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const row of snapshot.courses) {
       // 旧备份只包含 week_pattern；在升级后的结构中恢复时，

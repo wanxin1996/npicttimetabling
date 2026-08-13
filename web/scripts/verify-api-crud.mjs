@@ -297,14 +297,16 @@ async function pathExists(filename) {
 }
 
 function cyclePayloadFromSnapshot(snapshot) {
-  // 紧急备份只允许包含这五组周期资料；共用转换器让测试与数据库 JSON 按同一字段名比较，
-  // 不会把教师、教室、账号等应跨周期保留的资料误算进快照。
+  // 紧急备份包含课程周期与本周期的两类不可用时段；教师、教室、账号等
+  // 跨周期基础资料不在这个 JSON 中。
   return {
     courses: snapshot.courses,
     allocations: snapshot.allocations,
     sections: snapshot.sections,
     sectionGroups: snapshot.sectionGroups,
     lessons: snapshot.lessons,
+    teacherUnavailableWindows: snapshot.teacherUnavailableWindows,
+    yearBlockedWindows: snapshot.yearBlockedWindows,
   };
 }
 
@@ -314,8 +316,6 @@ function retainedPayloadFromSnapshot(snapshot) {
     teachers: snapshot.teachers,
     studentGroups: snapshot.studentGroups,
     rooms: snapshot.rooms,
-    teacherUnavailableWindows: snapshot.teacherUnavailableWindows,
-    yearBlockedWindows: snapshot.yearBlockedWindows,
     ruleSettings: snapshot.ruleSettings,
     appUsers: snapshot.appUsers,
   };
@@ -4325,9 +4325,103 @@ async function verifyAtomicCycleActions(ids) {
   assert.deepEqual(noBackup.body, { error: "No emergency cycle backup is available." });
   assert.deepEqual(readBusinessSnapshot(), stateBeforeInputErrors);
 
+  // 周期 token 必须直接绑定两类不可用时段，而不能偶然依赖 warning 的变化。
+  // 此处选取与任何已排课都不重叠的老师和年级时段，再直接插入 fixture；
+  // 因此 lessons/warnings 逐字段不变，token 变化只能来自新纳入的窗口数组。
+  const cycleSnapshotBeforeAvailability = readBusinessSnapshot();
+  const sectionByIdForAvailability = new Map(cycleSnapshotBeforeAvailability.sections.map((section) => [section.id, section]));
+  const courseByIdForAvailability = new Map(cycleSnapshotBeforeAvailability.courses.map((course) => [course.id, course]));
+  const studentGroupYearByIdForAvailability = new Map(cycleSnapshotBeforeAvailability.studentGroups.map((group) => [group.id, group.year]));
+  const groupYearsBySectionForAvailability = new Map();
+  for (const link of cycleSnapshotBeforeAvailability.sectionGroups) {
+    const years = groupYearsBySectionForAvailability.get(link.section_id) ?? new Set();
+    const groupYear = studentGroupYearByIdForAvailability.get(link.student_group_id);
+    if (groupYear) years.add(groupYear);
+    groupYearsBySectionForAvailability.set(link.section_id, years);
+  }
+  const scheduledTeacherIds = new Set(cycleSnapshotBeforeAvailability.lessons
+    .map((lesson) => sectionByIdForAvailability.get(lesson.section_id)?.teacher_id)
+    .filter(Boolean));
+  const availabilityTeacher = cycleSnapshotBeforeAvailability.teachers
+    .find((teacher) => !scheduledTeacherIds.has(teacher.id));
+  assert(availabilityTeacher, "The cycle availability fixture needs a teacher without a scheduled lesson.");
+
+  let teacherWindowFixture = null;
+  for (let dayOfWeek = 1; dayOfWeek <= 5 && !teacherWindowFixture; dayOfWeek += 1) {
+    for (let startHour = 8; startHour < 18; startHour += 1) {
+      const duplicate = cycleSnapshotBeforeAvailability.teacherUnavailableWindows.some((window) => (
+        window.teacher_id === availabilityTeacher.id
+        && window.day_of_week === dayOfWeek
+        && window.start_hour === startHour
+        && window.end_hour === startHour + 1
+      ));
+      if (!duplicate) teacherWindowFixture = {
+        id: randomUUID(),
+        teacher_id: availabilityTeacher.id,
+        day_of_week: dayOfWeek,
+        start_hour: startHour,
+        end_hour: startHour + 1,
+      };
+      if (teacherWindowFixture) break;
+    }
+  }
+  assert(teacherWindowFixture, "The cycle availability fixture could not find a free teacher window key.");
+
+  let yearWindowFixture = null;
+  for (let year = 1; year <= 3 && !yearWindowFixture; year += 1) {
+    for (let dayOfWeek = 1; dayOfWeek <= 5 && !yearWindowFixture; dayOfWeek += 1) {
+      for (let startHour = 8; startHour < 18; startHour += 1) {
+        const endHour = startHour + 1;
+        const duplicate = cycleSnapshotBeforeAvailability.yearBlockedWindows.some((window) => (
+          window.year === year
+          && window.day_of_week === dayOfWeek
+          && window.start_hour === startHour
+          && window.end_hour === endHour
+        ));
+        const overlapsLesson = cycleSnapshotBeforeAvailability.lessons.some((lesson) => {
+          const section = sectionByIdForAvailability.get(lesson.section_id);
+          const course = section ? courseByIdForAvailability.get(section.course_id) : null;
+          const affectedYears = new Set(groupYearsBySectionForAvailability.get(lesson.section_id) ?? []);
+          if (course?.primary_year) affectedYears.add(course.primary_year);
+          return affectedYears.has(year)
+            && lesson.day_of_week === dayOfWeek
+            && lesson.start_hour < endHour
+            && lesson.start_hour + lesson.duration_hours > startHour;
+        });
+        if (!duplicate && !overlapsLesson) yearWindowFixture = {
+          id: randomUUID(),
+          year,
+          day_of_week: dayOfWeek,
+          start_hour: startHour,
+          end_hour: endHour,
+        };
+        if (yearWindowFixture) break;
+      }
+    }
+  }
+  assert(yearWindowFixture, "The cycle availability fixture could not find a year window outside scheduled lessons.");
+  executeTestDatabase((db) => db.transaction(() => {
+    db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(teacherWindowFixture.id, teacherWindowFixture.teacher_id, teacherWindowFixture.day_of_week, teacherWindowFixture.start_hour, teacherWindowFixture.end_hour);
+    db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(yearWindowFixture.id, yearWindowFixture.year, yearWindowFixture.day_of_week, yearWindowFixture.start_hour, yearWindowFixture.end_hour);
+  }).immediate());
+  const stateAfterAvailabilityMarker = readBusinessSnapshot();
+  assert.deepEqual(stateAfterAvailabilityMarker.lessons, cycleSnapshotBeforeAvailability.lessons);
+  const statusAfterAvailabilityMarker = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert.notEqual(statusAfterAvailabilityMarker.body.currentToken, initialStatus.body.currentToken);
+  const staleAvailabilityStart = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: initialStatus.body.currentToken },
+  });
+  assert.deepEqual(staleAvailabilityStart.body, { error: "The current cycle changed. Refresh this page and review the latest contents before starting a new cycle." });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterAvailabilityMarker);
+
   // 页面取得 T0 后，另一请求新增课程。旧 T0 的 Start 必须被拒绝，不能清空老师
   // 从未在确认页面看过的 marker；重新 GET 才得到新的稳定 T1。
-  const tokenBeforeMarker = initialStatus.body.currentToken;
+  const tokenBeforeMarker = statusAfterAvailabilityMarker.body.currentToken;
   await requestApi("/api/courses", {
     method: "POST",
     cookie: schedulerCookie,
@@ -4370,6 +4464,27 @@ async function verifyAtomicCycleActions(ids) {
     assert.deepEqual(readBusinessSnapshot(), stateBeforeFailedStart);
   } finally {
     executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_cycle_clear"));
+  }
+
+  // 再把故障放在已替换 backup、已删除 courses 之后的教师窗口清空阶段。这个失败
+  // 必须把课程删除、新 backup 以及两类窗口的任何中间状态一起回滚。
+  executeTestDatabase((db) => {
+    const teacherWindowIdLiteral = db.prepare("SELECT quote(?) AS value").get(teacherWindowFixture.id).value;
+    db.exec(`CREATE TRIGGER zz_fail_cycle_window_clear BEFORE DELETE ON teacher_unavailable_windows WHEN OLD.id = ${teacherWindowIdLiteral} BEGIN SELECT RAISE(ABORT, 'forced cycle window clear failure'); END;`);
+  });
+  const stateBeforeFailedWindowStart = readBusinessSnapshot();
+  try {
+    const failedWindowStart = await requestApi("/api/cycle", {
+      method: "POST",
+      cookie: schedulerCookie,
+      expectedStatus: 500,
+      json: { action: "start", confirmation: "START NEW CYCLE", currentToken: statusBeforeStart.body.currentToken },
+    });
+    assert.deepEqual(failedWindowStart.body, { error: "The cycle action could not be completed. Try again." });
+    assert.deepEqual(readBusinessSnapshot(), stateBeforeFailedWindowStart);
+    assert.equal((await requestApi("/api/cycle", { cookie: schedulerCookie })).body.currentToken, statusBeforeStart.body.currentToken);
+  } finally {
+    executeTestDatabase((db) => db.exec("DROP TRIGGER IF EXISTS zz_fail_cycle_window_clear"));
   }
 
   // 同一个 token 正常 Start 后，活动周期五表必须全空，新 backup 必须逐字段等于
@@ -4520,6 +4635,36 @@ async function verifyAtomicCycleActions(ids) {
   invalidOpaqueIdSnapshot.allocations[0].id = "X".repeat(129);
   await expectIndependentlyInvalidCycleSnapshot(invalidOpaqueIdSnapshot, "Cycle opaque resource-ID fixture");
 
+  // 新格式的两类窗口必须成对出现，并且不能用非法日期／时间或重复自然键
+  // 绕过 live SQLite 表的 CHECK/UNIQUE 约束。所有拒绝都发生在删除当前周期之前。
+  const partialAvailabilitySnapshot = JSON.parse(validBackupJson);
+  delete partialAvailabilitySnapshot.yearBlockedWindows;
+  await expectIndependentlyInvalidCycleSnapshot(partialAvailabilitySnapshot, "Cycle partial availability fixture");
+
+  const invalidTeacherWindowSnapshot = JSON.parse(validBackupJson);
+  assert(invalidTeacherWindowSnapshot.teacherUnavailableWindows.length > 0, "The cycle teacher-window fixture needs one row.");
+  invalidTeacherWindowSnapshot.teacherUnavailableWindows[0].day_of_week = 6;
+  await expectIndependentlyInvalidCycleSnapshot(invalidTeacherWindowSnapshot, "Cycle invalid teacher-window weekday fixture");
+
+  const duplicateTeacherWindowSnapshot = JSON.parse(validBackupJson);
+  duplicateTeacherWindowSnapshot.teacherUnavailableWindows.push({
+    ...duplicateTeacherWindowSnapshot.teacherUnavailableWindows[0],
+    id: randomUUID(),
+  });
+  await expectIndependentlyInvalidCycleSnapshot(duplicateTeacherWindowSnapshot, "Cycle duplicate teacher-window fixture");
+
+  const invalidYearWindowSnapshot = JSON.parse(validBackupJson);
+  assert(invalidYearWindowSnapshot.yearBlockedWindows.length > 0, "The cycle year-window fixture needs one row.");
+  invalidYearWindowSnapshot.yearBlockedWindows[0].year = 4;
+  await expectIndependentlyInvalidCycleSnapshot(invalidYearWindowSnapshot, "Cycle invalid year-window owner fixture");
+
+  const duplicateYearWindowSnapshot = JSON.parse(validBackupJson);
+  duplicateYearWindowSnapshot.yearBlockedWindows.push({
+    ...duplicateYearWindowSnapshot.yearBlockedWindows[0],
+    id: randomUUID(),
+  });
+  await expectIndependentlyInvalidCycleSnapshot(duplicateYearWindowSnapshot, "Cycle duplicate year-window fixture");
+
   // 不能只把现有 section 改成1000，否则连续性缺口也会拒绝并掩盖999上限。这里为
   // 同一课程构造从1到1000连续、唯一且无额外引用的 sections；若移除数量／sequence
   // 上限而保留连续性检查，这份夹具就会错误通过，从而让回归准确失败。
@@ -4599,6 +4744,40 @@ async function verifyAtomicCycleActions(ids) {
   assert.deepEqual(readBusinessSnapshot(), stateBeforeStaleRestore);
   const statusBeforeRestore = await requestApi("/api/cycle", { cookie: schedulerCookie });
 
+  // Start 后为新周期新建的窗口属于当前 live 状态。Restore 必须把它们完整替换为
+  // 备份中的旧窗口，而不是合并、重复或保留新周期的限制。旧 token 也必须立即失效。
+  const replacementTeacherWindow = {
+    id: randomUUID(),
+    teacher_id: availabilityTeacher.id,
+    day_of_week: teacherWindowFixture.day_of_week === 5 ? 4 : 5,
+    start_hour: 17,
+    end_hour: 18,
+  };
+  const replacementYearWindow = {
+    id: randomUUID(),
+    year: yearWindowFixture.year === 3 ? 2 : 3,
+    day_of_week: yearWindowFixture.day_of_week === 5 ? 4 : 5,
+    start_hour: 17,
+    end_hour: 18,
+  };
+  executeTestDatabase((db) => db.transaction(() => {
+    db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(replacementTeacherWindow.id, replacementTeacherWindow.teacher_id, replacementTeacherWindow.day_of_week, replacementTeacherWindow.start_hour, replacementTeacherWindow.end_hour);
+    db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(replacementYearWindow.id, replacementYearWindow.year, replacementYearWindow.day_of_week, replacementYearWindow.start_hour, replacementYearWindow.end_hour);
+  }).immediate());
+  const stateAfterReplacementWindows = readBusinessSnapshot();
+  const staleAvailabilityRestore = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    expectedStatus: 409,
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeRestore.body.currentToken, backupId },
+  });
+  assert.deepEqual(staleAvailabilityRestore.body, { error: "The current cycle changed. Refresh this page and review the latest contents before restoring." });
+  assert.deepEqual(readBusinessSnapshot(), stateAfterReplacementWindows);
+  const statusBeforeAvailabilityRestore = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert.notEqual(statusBeforeAvailabilityRestore.body.currentToken, statusBeforeRestore.body.currentToken);
+
   // 让 warning 重算在排序最后一条备份课程上失败，可证明前面已执行的 warning UPDATE、
   // 全部恢复 INSERT 和原活动周期 DELETE 会被同一个外层事务一起回滚。
   const lastBackupLesson = expectedCyclePayload.lessons.at(-1);
@@ -4613,7 +4792,7 @@ async function verifyAtomicCycleActions(ids) {
       method: "POST",
       cookie: schedulerCookie,
       expectedStatus: 500,
-      json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeRestore.body.currentToken, backupId },
+      json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeAvailabilityRestore.body.currentToken, backupId },
     });
     assert.deepEqual(failedRestore.body, { error: "The cycle action could not be completed. Try again." });
     assert.deepEqual(readBusinessSnapshot(), stateBeforeFailedRestore);
@@ -4626,10 +4805,12 @@ async function verifyAtomicCycleActions(ids) {
   const restored = await requestApi("/api/cycle", {
     method: "POST",
     cookie: schedulerCookie,
-    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeRestore.body.currentToken, backupId },
+    json: { action: "restore", confirmation: "RESTORE LAST BACKUP", currentToken: statusBeforeAvailabilityRestore.body.currentToken, backupId },
   });
   const stateAfterRestore = readBusinessSnapshot();
   assert.deepEqual(cyclePayloadFromSnapshot(stateAfterRestore), expectedCyclePayload);
+  assert(!stateAfterRestore.teacherUnavailableWindows.some((window) => window.id === replacementTeacherWindow.id));
+  assert(!stateAfterRestore.yearBlockedWindows.some((window) => window.id === replacementYearWindow.id));
   assert.deepEqual(retainedPayloadFromSnapshot(stateAfterRestore), retainedBeforeStart);
   assert.deepEqual(stateAfterRestore.scheduleBackups, stateAfterStart.scheduleBackups);
   assert.equal(restored.body.courses, expectedCyclePayload.courses.length);
@@ -4640,12 +4821,102 @@ async function verifyAtomicCycleActions(ids) {
   const finalCycleStatus = await requestApi("/api/cycle", { cookie: schedulerCookie });
   assert.deepEqual(finalCycleStatus.body, restored.body);
 
+  // 发布新语义前已经存在的应急备份只有原来五个数组。模拟这种旧 JSON 后，
+  // Restore 应恢复课程与课表，但保留新周期当前的两类 live 窗口；绝不能因为
+  // 历史快照不知道窗口字段就默默清空它们。
+  const legacyStart = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: finalCycleStatus.body.currentToken },
+  });
+  const legacyBackupId = legacyStart.body.backup.id;
+  const legacySnapshot = executeTestDatabase((db) => {
+    const snapshot = JSON.parse(db.prepare("SELECT snapshot_json FROM schedule_backups WHERE id = ?").get(legacyBackupId).snapshot_json);
+    delete snapshot.teacherUnavailableWindows;
+    delete snapshot.yearBlockedWindows;
+    db.prepare("UPDATE schedule_backups SET snapshot_json = ? WHERE id = ?").run(JSON.stringify(snapshot), legacyBackupId);
+    return snapshot;
+  });
+  const legacyTeacherWindow = {
+    id: randomUUID(),
+    teacher_id: availabilityTeacher.id,
+    day_of_week: 4,
+    start_hour: 16,
+    end_hour: 17,
+  };
+  const legacySectionById = new Map(legacySnapshot.sections.map((section) => [section.id, section]));
+  const legacyCourseById = new Map(legacySnapshot.courses.map((course) => [course.id, course]));
+  const legacyStudentGroupYearById = new Map(stateAfterRestore.studentGroups.map((group) => [group.id, group.year]));
+  const legacyGroupYearsBySection = new Map();
+  for (const link of legacySnapshot.sectionGroups) {
+    const years = legacyGroupYearsBySection.get(link.section_id) ?? new Set();
+    const groupYear = legacyStudentGroupYearById.get(link.student_group_id);
+    if (groupYear) years.add(groupYear);
+    legacyGroupYearsBySection.set(link.section_id, years);
+  }
+  let legacyYearWindow = null;
+  for (let year = 1; year <= 3 && !legacyYearWindow; year += 1) {
+    for (let dayOfWeek = 1; dayOfWeek <= 5 && !legacyYearWindow; dayOfWeek += 1) {
+      for (let startHour = 8; startHour < 18; startHour += 1) {
+        const overlapsLesson = legacySnapshot.lessons.some((lesson) => {
+          const section = legacySectionById.get(lesson.section_id);
+          const course = section ? legacyCourseById.get(section.course_id) : null;
+          const affectedYears = new Set(legacyGroupYearsBySection.get(lesson.section_id) ?? []);
+          if (course?.primary_year) affectedYears.add(course.primary_year);
+          return affectedYears.has(year)
+            && lesson.day_of_week === dayOfWeek
+            && lesson.start_hour < startHour + 1
+            && lesson.start_hour + lesson.duration_hours > startHour;
+        });
+        if (!overlapsLesson) legacyYearWindow = {
+          id: randomUUID(),
+          year,
+          day_of_week: dayOfWeek,
+          start_hour: startHour,
+          end_hour: startHour + 1,
+        };
+        if (legacyYearWindow) break;
+      }
+    }
+  }
+  assert(legacyYearWindow, "The legacy backup fixture needs a year window outside scheduled lessons.");
+  executeTestDatabase((db) => db.transaction(() => {
+    db.prepare("INSERT INTO teacher_unavailable_windows (id, teacher_id, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(legacyTeacherWindow.id, legacyTeacherWindow.teacher_id, legacyTeacherWindow.day_of_week, legacyTeacherWindow.start_hour, legacyTeacherWindow.end_hour);
+    db.prepare("INSERT INTO year_blocked_windows (id, year, day_of_week, start_hour, end_hour) VALUES (?, ?, ?, ?, ?)")
+      .run(legacyYearWindow.id, legacyYearWindow.year, legacyYearWindow.day_of_week, legacyYearWindow.start_hour, legacyYearWindow.end_hour);
+  }).immediate());
+  const legacyRestoreStatus = await requestApi("/api/cycle", { cookie: schedulerCookie });
+  assert(legacyRestoreStatus.body.backup, "The legacy cycle backup must remain visible and restorable.");
+  const restoredLegacy = await requestApi("/api/cycle", {
+    method: "POST",
+    cookie: schedulerCookie,
+    json: {
+      action: "restore",
+      confirmation: "RESTORE LAST BACKUP",
+      currentToken: legacyRestoreStatus.body.currentToken,
+      backupId: legacyBackupId,
+    },
+  });
+  const stateAfterLegacyRestore = readBusinessSnapshot();
+  assert.deepEqual({
+    courses: stateAfterLegacyRestore.courses,
+    allocations: stateAfterLegacyRestore.allocations,
+    sections: stateAfterLegacyRestore.sections,
+    sectionGroups: stateAfterLegacyRestore.sectionGroups,
+    lessons: stateAfterLegacyRestore.lessons,
+  }, legacySnapshot);
+  assert.deepEqual(stateAfterLegacyRestore.teacherUnavailableWindows, [legacyTeacherWindow]);
+  assert.deepEqual(stateAfterLegacyRestore.yearBlockedWindows, [legacyYearWindow]);
+  assert.equal(restoredLegacy.body.backup.id, legacyBackupId);
+  const finalCycleStatusAfterLegacyRestore = await requestApi("/api/cycle", { cookie: schedulerCookie });
+
   // Start 后 master data 可以只被紧急 JSON 引用。删除这种教室不会破坏 live FK；完整
   // 备份仍必须可下载及恢复，因为 Cycle Restore 已有专门的 FK 409 和完整事务回滚。
   const orphanedMasterCycle = await requestApi("/api/cycle", {
     method: "POST",
     cookie: schedulerCookie,
-    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: finalCycleStatus.body.currentToken },
+    json: { action: "start", confirmation: "START NEW CYCLE", currentToken: finalCycleStatusAfterLegacyRestore.body.currentToken },
   });
   const orphanedBackupId = orphanedMasterCycle.body.backup.id;
   const orphanedSnapshot = executeTestDatabase((db) => JSON.parse(db.prepare("SELECT snapshot_json FROM schedule_backups WHERE id = ?").get(orphanedBackupId).snapshot_json));

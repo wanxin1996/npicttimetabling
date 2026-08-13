@@ -2914,13 +2914,34 @@ export default function Home() {
     }
   }
 
+  function clearCycleDependentWorkspace() {
+    setLessons([]);
+    setUnscheduledSections([]);
+    setUnavailableWindows([]);
+    setScheduleIssues([]);
+    setPersonalLessons([]);
+    setPersonalUnavailableWindows([]);
+    setLastSyncedAt(null);
+    setSelectedCourse(null);
+    setSections([]);
+    setAllocationVariances([]);
+    editingLessonRef.current = null;
+    setEditingLesson(null);
+    setLessonDraftIsStale(false);
+    setPlacingSection(null);
+    clearCandidateSlotWorkspace();
+    setShowTimetableInspector(false);
+    setShowUnscheduledDrawer(true);
+    setRecentlySavedLesson(null);
+  }
+
   async function beginNewCycle(event: FormEvent<HTMLFormElement>) {
-    // 开始新周期要求两个勾选和完全一致的确认短语，构成约定的多重确认；服务端清空前还会独立验证一次。
+    // 开始新周期要求三个勾选和完全一致的确认短语，构成约定的多重确认；服务端清空前还会独立验证一次。
     event.preventDefault();
     // 清空请求和资料重载都是异步操作，因此先保存表单元素；最终重置时不能再依赖临时 event.currentTarget。
     const form = event.currentTarget;
     const data = new FormData(form);
-    if (!data.get("understandClear") || !data.get("understandBackup")) return setNotice("Complete both confirmations before starting a new cycle.", "warning");
+    if (!data.get("understandClear") || !data.get("understandAvailabilityClear") || !data.get("understandBackup")) return setNotice("Complete all confirmations before starting a new cycle.", "warning");
     const mutationKey = "cycle-start";
     if (!beginManagementMutation(mutationKey)) return;
     const sessionRequestGeneration = authenticatedSessionGeneration.current;
@@ -2942,21 +2963,23 @@ export default function Home() {
       const body = await response.json() as CycleStatus;
       if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setCurrentCycle(body);
-      setLessons([]);
-      setUnscheduledSections([]);
-      setSelectedCourse(null);
-      setSections([]);
+      clearCycleDependentWorkspace();
       form.reset();
       try {
         if (!await loadData()) throw new Error("The new-cycle master-data workspace refresh was superseded.");
+        if (!await refreshRulesWorkspace(mutationKey, sessionRequestGeneration)) throw new Error("The new-cycle rules workspace refresh was superseded.");
         if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
-        setNotice("New cycle started. Courses and timetable work were cleared after the emergency backup was saved.", "success");
+        setNotice("New cycle started. Courses, timetable work, teacher unavailable times and year blocked times were cleared after the emergency backup was saved.", "success");
       } catch (error) {
         if (error instanceof ProtectedSessionExpiredError || !sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before refreshing the new cycle.");
+          return;
+        }
         // 清空已经提交后，旧课程清单不再可信。切到不可编辑错误画面，防止老师在
         // 重新载入前继续操作已从数据库删除的记录。
         setAuthScreen("load-error");
-        setNotice("The new cycle was started, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+        setNotice("The new cycle was started, but the latest workspace data could not be loaded. Refresh before continuing.", "warning");
       }
     } catch {
       if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
@@ -2978,7 +3001,7 @@ export default function Home() {
     // 等待恢复接口前保存稳定表单引用，确保成功后可以安全清空确认内容。
     const form = event.currentTarget;
     const data = new FormData(form);
-    if (!data.get("understandRestore")) return setNotice("Confirm that current cycle work may be replaced before restoring.", "warning");
+    if (!data.get("understandRestore")) return setNotice("Confirm that current cycle and availability data may be replaced before restoring.", "warning");
     const mutationKey = "cycle-restore";
     if (!beginManagementMutation(mutationKey)) return;
     const sessionRequestGeneration = authenticatedSessionGeneration.current;
@@ -2998,16 +3021,22 @@ export default function Home() {
       const body = await response.json() as CycleStatus;
       if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
       setCurrentCycle(body);
+      clearCycleDependentWorkspace();
       form.reset();
       try {
         if (!await loadData()) throw new Error("The restored-cycle master-data workspace refresh was superseded.");
+        if (!await refreshRulesWorkspace(mutationKey, sessionRequestGeneration)) throw new Error("The restored-cycle rules workspace refresh was superseded.");
         if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
-        setNotice("The last emergency cycle backup was restored.", "success");
+        setNotice("The last emergency cycle backup was restored and the active rules workspace was refreshed.", "success");
       } catch (error) {
         if (error instanceof ProtectedSessionExpiredError || !sessionRequestIsCurrent(sessionRequestGeneration)) return;
+        if (error instanceof RulesWorkspaceRequestError && error.status === 401) {
+          expireSessionAndReturnToLogin("Your session expired. Sign in again before refreshing the restored cycle.");
+          return;
+        }
         // 恢复会替换整套课程资料；刷新失败时隐藏旧可编辑清单，直到完整页面重载。
         setAuthScreen("load-error");
-        setNotice("The emergency cycle backup was restored, but the latest master-data lists could not be loaded. Refresh before continuing.", "warning");
+        setNotice("The emergency cycle backup was restored, but the latest workspace data could not be loaded. Refresh before continuing.", "warning");
       }
     } catch {
       if (!sessionRequestIsCurrent(sessionRequestGeneration)) return;
@@ -3883,7 +3912,7 @@ export default function Home() {
   const pageDescription = view === "Year timetables" ? "Choose a session, place it, and resolve issues without leaving this workspace."
     : view === "Personal timetables" ? "Read the same saved schedule across years for one teacher, student group or room."
       : view === "Rules & issues" ? "Maintain unavailable windows and review every current warning in one place."
-        : view === "Cycle" ? "Back up and clear only cycle data, or restore the latest emergency snapshot."
+        : view === "Cycle" ? "Back up and reset course, timetable and availability data, or restore the latest emergency snapshot."
           : view === "Accounts" ? "Create individual logins for the small scheduling team."
             : view === "Profile" ? "Changing your password signs out all existing sessions for this account."
               : "Maintain teachers, student groups and rooms before importing teaching allocations or placing course sections.";
@@ -4605,29 +4634,30 @@ export default function Home() {
               <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-2">
                 <p className="font-black text-slate-950">Current cycle contents</p>
                 <div className="mt-3 flex flex-wrap gap-2"><Pill tone="blue">{currentCycle.courses} courses</Pill><Pill tone="blue">{currentCycle.sections} sections</Pill><Pill tone="blue">{currentCycle.lessons} scheduled lessons</Pill></div>
-                <p className="mt-3 text-xs leading-5 text-slate-500">Retained after a clear: teachers, rooms, student groups, unavailable times, rule settings and all accounts.</p>
+                <p className="mt-3 text-xs leading-5 text-slate-500">Retained after a clear: teachers, rooms, student groups, rule settings and all accounts. All teacher unavailable times and Year 1–3 blocked times are cleared for the new cycle.</p>
               </div>
               <form onSubmit={beginNewCycle} className="rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
                 <p className="font-black text-red-950">Start a new cycle</p>
-                <p className="mt-1 text-xs leading-5 text-red-800">An emergency snapshot is saved first. The current courses, generated sections, section student groups and scheduled lessons are then cleared together.</p>
+                <p className="mt-1 text-xs leading-5 text-red-800">An emergency snapshot is saved first. The current courses, generated sections, section student groups, scheduled lessons, teacher unavailable times and Year 1–3 blocked times are then cleared together.</p>
                 <div className="mt-4 grid gap-3 text-sm text-red-950">
                   <label className="flex items-start gap-2"><input name="understandClear" type="checkbox" className="mt-1" /><span>I understand that all current course and timetable work will disappear from the active workspace.</span></label>
+                  <label className="flex items-start gap-2"><input name="understandAvailabilityClear" type="checkbox" className="mt-1" /><span>I understand that all teacher unavailable times and Year 1–3 blocked times will be cleared for the new cycle.</span></label>
                   <label className="flex items-start gap-2"><input name="understandBackup" type="checkbox" className="mt-1" /><span>I understand that only the latest emergency snapshot is retained.</span></label>
                   <label className="font-semibold">Type START NEW CYCLE<input name="confirmation" required autoComplete="off" className="mt-1 w-full rounded-xl border border-red-200 bg-white px-3 py-2 font-normal" /></label>
                 </div>
-                <button disabled={currentCycle.courses === 0 || managementMutationKey !== null} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-50" type="submit">{managementMutationKey === "cycle-start" ? "Starting new cycle..." : "Back up and start new cycle"}</button>
+                <button disabled={currentCycle.courses === 0 || managementMutationKey !== null} className="mt-4 rounded-xl bg-red-700 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-50" type="submit">{managementMutationKey === "cycle-start" ? "Starting new cycle..." : "Back up, clear availability and start new cycle"}</button>
               </form>
               <form onSubmit={restoreCycle} className="rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
                 <p className="font-black text-amber-950">Restore latest emergency backup</p>
                 {currentCycle.backup ? (
                   <>
                     <p className="mt-1 text-xs leading-5 text-amber-800">
-                      Saved {new Date(currentCycle.backup.createdAt).toLocaleString()} · {currentCycle.backup.courses} courses · {currentCycle.backup.sections} sections · {currentCycle.backup.lessons} lessons.
+                      Saved {new Date(currentCycle.backup.createdAt).toLocaleString()} · {currentCycle.backup.courses} courses · {currentCycle.backup.sections} sections · {currentCycle.backup.lessons} lessons. Restoring applies the course, timetable and availability data recorded in that snapshot.
                     </p>
                     <div className="mt-4 grid gap-3 text-sm text-amber-950">
                       <label className="flex items-start gap-2">
                         <input name="understandRestore" type="checkbox" className="mt-1" />
-                        <span>I understand this replaces any course and timetable work currently in the active workspace.</span>
+                        <span>I understand this may replace the current course, timetable, teacher unavailable times and year blocked times with the contents recorded in the backup.</span>
                       </label>
                       <label className="font-semibold">
                         Type RESTORE LAST BACKUP

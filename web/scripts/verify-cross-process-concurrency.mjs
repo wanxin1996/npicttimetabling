@@ -399,7 +399,7 @@ async function runWhileBothWritersAreBlocked(description, serverA, serverB, left
 }
 
 function readCycleSnapshot() {
-  // 五张周期表在同一个只读事务中读取，避免断言把两个已提交版本拼在一起。
+  // 全部周期表在同一个只读事务中读取，避免断言把两个已提交版本拼在一起。
   const db = new Database(testDatabasePath, { readonly: true });
   try {
     const snapshot = db.transaction(() => ({
@@ -408,6 +408,8 @@ function readCycleSnapshot() {
       sections: db.prepare("SELECT * FROM course_sections ORDER BY id").all(),
       sectionGroups: db.prepare("SELECT * FROM section_student_groups ORDER BY section_id, student_group_id").all(),
       lessons: db.prepare("SELECT * FROM scheduled_lessons ORDER BY id").all(),
+      teacherUnavailableWindows: db.prepare("SELECT * FROM teacher_unavailable_windows ORDER BY id").all(),
+      yearBlockedWindows: db.prepare("SELECT * FROM year_blocked_windows ORDER BY id").all(),
     }));
     return snapshot.deferred();
   } finally {
@@ -424,8 +426,6 @@ function readRetainedSnapshot() {
       teachers: db.prepare("SELECT * FROM teachers ORDER BY id").all(),
       studentGroups: db.prepare("SELECT * FROM student_groups ORDER BY id").all(),
       rooms: db.prepare("SELECT * FROM rooms ORDER BY id").all(),
-      teacherWindows: db.prepare("SELECT * FROM teacher_unavailable_windows ORDER BY id").all(),
-      yearWindows: db.prepare("SELECT * FROM year_blocked_windows ORDER BY id").all(),
       rules: db.prepare("SELECT * FROM rule_settings ORDER BY rule_key").all(),
       users: db.prepare("SELECT * FROM app_users ORDER BY id").all(),
       sessions: db.prepare("SELECT * FROM auth_sessions ORDER BY token_hash").all(),
@@ -2260,8 +2260,40 @@ async function verifyConcurrentScheduledLessonUpdate(serverA, serverB, fixture) 
 }
 
 async function verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture) {
-  // Start 前保存五张周期表的完整资料；最后 Restore 必须逐字段回到同一版本。
+  // 显式建立两类周期窗口，避免用空数组真空验证备份、清空与恢复语义。
+  const existingWindows = (await requestApi(serverA, "/api/unavailability", { cookie: fixture.schedulerACookie })).body;
+  const unusedWindowInput = (kind, ownerId) => {
+    for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
+      for (let startHour = 8; startHour < 18; startHour += 1) {
+        const duplicate = existingWindows.some((window) => (
+          window.kind === kind
+          && window.ownerId === ownerId
+          && window.dayOfWeek === dayOfWeek
+          && window.startHour === startHour
+          && window.endHour === startHour + 1
+        ));
+        if (!duplicate) return { kind, ownerId, dayOfWeek, startHour, endHour: startHour + 1 };
+      }
+    }
+    throw new Error(`No unused ${kind} cycle window fixture was available.`);
+  };
+  const teacherWindow = (await requestApi(serverA, "/api/unavailability", {
+    method: "POST",
+    cookie: fixture.schedulerACookie,
+    expectedStatus: 201,
+    json: unusedWindowInput("Teacher", fixture.dataWorkspaceTeacher.id),
+  })).body;
+  const yearWindow = (await requestApi(serverB, "/api/unavailability", {
+    method: "POST",
+    cookie: fixture.schedulerBCookie,
+    expectedStatus: 201,
+    json: unusedWindowInput("Year", "3"),
+  })).body;
+
+  // Start 前保存全部周期表的完整资料；最后 Restore 必须逐字段回到同一版本。
   const snapshotBeforeStart = readCycleSnapshot();
+  assert(snapshotBeforeStart.teacherUnavailableWindows.some((window) => window.id === teacherWindow.id));
+  assert(snapshotBeforeStart.yearBlockedWindows.some((window) => window.id === yearWindow.id));
   const retainedBeforeStart = readRetainedSnapshot();
   const [statusA, statusB] = await Promise.all([
     requestApi(serverA, "/api/cycle", { cookie: fixture.schedulerACookie }),
@@ -2307,8 +2339,18 @@ async function verifyConcurrentCycleStartAndRestore(serverA, serverB, fixture) {
     (SELECT COUNT(*) FROM teaching_allocations) AS allocations,
     (SELECT COUNT(*) FROM course_sections) AS sections,
     (SELECT COUNT(*) FROM section_student_groups) AS section_groups,
-    (SELECT COUNT(*) FROM scheduled_lessons) AS lessons`);
-  assert.deepEqual(clearedCounts, { courses: 0, allocations: 0, sections: 0, section_groups: 0, lessons: 0 });
+    (SELECT COUNT(*) FROM scheduled_lessons) AS lessons,
+    (SELECT COUNT(*) FROM teacher_unavailable_windows) AS teacher_windows,
+    (SELECT COUNT(*) FROM year_blocked_windows) AS year_windows`);
+  assert.deepEqual(clearedCounts, {
+    courses: 0,
+    allocations: 0,
+    sections: 0,
+    section_groups: 0,
+    lessons: 0,
+    teacher_windows: 0,
+    year_windows: 0,
+  });
   assert.equal(readDatabaseValue("SELECT COUNT(*) AS count FROM schedule_backups").count, 1);
   assert.deepEqual(readRetainedSnapshot(), retainedBeforeStart);
 
